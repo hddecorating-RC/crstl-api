@@ -119,10 +119,7 @@
               <span x-show="!exporting">↓ Export</span>
               <span x-show="exporting">Exporting…</span>
             </button>
-            <button disabled class="bg-white border border-gray-200 text-gray-300 text-xs px-3 py-2 rounded-full cursor-not-allowed">
-              ⬡ NetSuite <span class="ml-1 bg-gray-100 text-gray-400 text-xs px-1.5 py-0.5 rounded">soon</span>
-            </button>
-            <button @click="selected = new Set()" class="text-xs text-gray-400 hover:text-gray-600 px-1">✕</button>
+<button @click="selected = new Set()" class="text-xs text-gray-400 hover:text-gray-600 px-1">✕</button>
           </div>
         </template>
       </div>
@@ -287,7 +284,7 @@ function dashboard() {
     lastSynced: null,
     lastExport: null,
     syncStatus: 'never',
-    netsuiteExport: { available: false, last_generated: null, count: 0, skipped: 0, error: null, generating: false },
+    netsuiteExport: { available: false, last_generated: null, count: 0, skipped: 0, error: null },
     generatingNetsuite: false,
 
     async init() {
@@ -328,18 +325,23 @@ function dashboard() {
       try {
         const res = await fetch('/api/netsuite-export/latest');
         this.netsuiteExport = await res.json();
-      } catch {}
+      } catch {
+        this.netsuiteExport = { ...this.netsuiteExport, error: 'Status unavailable' };
+      }
     },
 
     async generateNetsuite() {
       this.generatingNetsuite = true;
       try {
         const res = await fetch('/api/netsuite-export/generate', { method: 'POST' });
-        this.netsuiteExport = await res.json();
-        if (this.netsuiteExport.available) {
+        const data = await res.json();
+        this.netsuiteExport = data;
+        if (!res.ok) {
+          this.showToast('Export failed: ' + (data.message || 'Unknown error'));
+        } else if (data.available) {
           this.showToast('NetSuite export generated');
-        } else if (this.netsuiteExport.error) {
-          this.showToast('Export failed: ' + this.netsuiteExport.error);
+        } else if (data.error) {
+          this.showToast('Export failed: ' + data.error);
         }
       } catch {
         this.showToast('NetSuite export failed');
