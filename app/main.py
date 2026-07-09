@@ -209,7 +209,12 @@ def export(body: ExportRequest = ExportRequest()) -> Response:
     filename = f"invoices_{date.today().isoformat()}.csv"
     csv_bytes = build_csv(invoices, ids=body.ids)
 
-    exported_ids = body.ids if body.ids is not None else [inv["transaction_id"] for inv in invoices]
+    cache_ids = {inv["transaction_id"] for inv in invoices}
+    exported_ids = (
+        [i for i in body.ids if i in cache_ids]
+        if body.ids is not None
+        else [inv["transaction_id"] for inv in invoices]
+    )
     tracking.record_events(exported_ids, "exported")
 
     return Response(
