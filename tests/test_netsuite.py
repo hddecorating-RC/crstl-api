@@ -99,8 +99,7 @@ def test_netsuite_csv_has_correct_headers():
     from app.netsuite_csv import build_netsuite_csv, COLUMNS
     csv_bytes = build_netsuite_csv([])
     header = csv_bytes.decode().splitlines()[0]
-    for col in COLUMNS:
-        assert col in header
+    assert header.split(",") == COLUMNS
 
 
 def test_netsuite_csv_one_row_per_record():
@@ -111,13 +110,14 @@ def test_netsuite_csv_one_row_per_record():
 
 
 def test_netsuite_csv_row_values():
+    import csv as csv_mod
+    import io as io_mod
     from app.netsuite_csv import build_netsuite_csv
     csv_bytes = build_netsuite_csv([SAMPLE_RECORD])
-    lines = csv_bytes.decode().splitlines()
-    assert len(lines) == 2
-    row = lines[1]
-    assert "PO-12345" in row
-    assert "cust-vaughan" in row
-    assert "18000.0" in row
-    assert "HST-ON" in row
-    assert "CAD" in row
+    reader = csv_mod.DictReader(io_mod.StringIO(csv_bytes.decode()))
+    row = next(reader)
+    assert row["External ID"] == "PO-12345"
+    assert row["Customer"] == "cust-vaughan"
+    assert row["Rate"] == "18000.0"
+    assert row["Tax Code"] == "HST-ON"
+    assert row["Currency"] == "CAD"
