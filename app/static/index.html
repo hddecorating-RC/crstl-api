@@ -283,6 +283,7 @@ function dashboard() {
         a.click();
         setTimeout(() => URL.revokeObjectURL(url), 100);
         this.lastExport = new Date().toISOString();
+        await this.loadInvoices();
         this.showToast('CSV downloaded');
       } finally {
         this.exporting = false;
@@ -306,6 +307,7 @@ function dashboard() {
         a.click();
         setTimeout(() => URL.revokeObjectURL(url), 100);
         this.lastExport = new Date().toISOString();
+        await this.loadInvoices();
         this.showToast('CSV downloaded');
       } finally {
         this.exporting = false;
