@@ -57,8 +57,9 @@
       </div>
     </div>
 
-    <!-- Toolbar -->
+    <!-- Toolbar — search/filters left, selection actions right (no layout shift) -->
     <div class="flex flex-wrap items-center gap-3 mb-3">
+      <!-- Search -->
       <div class="flex-1 min-w-48 relative">
         <span class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm">🔍</span>
         <input type="text" x-model="search" @input="currentPage = 1" placeholder="Search invoice #, PO #..."
@@ -75,28 +76,32 @@
         <button x-show="dateFrom || dateTo" @click="dateFrom = ''; dateTo = ''; currentPage = 1"
                 class="text-xs text-gray-400 hover:text-gray-600 px-1">✕</button>
       </div>
-      <div class="flex gap-2">
-        <template x-for="f in ['All','Draft','Sent']" :key="f">
-          <button @click="activeFilter = f; currentPage = 1"
-                  :class="activeFilter === f ? 'bg-blue-600 text-white' : 'bg-white text-gray-500 border border-gray-200 hover:border-blue-400'"
-                  class="px-4 py-2 rounded-full text-xs font-medium transition" x-text="f"></button>
+      <!-- Status filters OR selection actions — same row, no shift -->
+      <div class="flex items-center gap-2">
+        <template x-if="selected.size === 0">
+          <div class="flex gap-2">
+            <template x-for="f in ['All','Draft','Sent']" :key="f">
+              <button @click="activeFilter = f; currentPage = 1"
+                      :class="activeFilter === f ? 'bg-blue-600 text-white' : 'bg-white text-gray-500 border border-gray-200 hover:border-blue-400'"
+                      class="px-4 py-2 rounded-full text-xs font-medium transition" x-text="f"></button>
+            </template>
+          </div>
+        </template>
+        <template x-if="selected.size > 0">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-medium text-blue-700" x-text="`${selected.size} selected`"></span>
+            <button @click="exportCsv()" :disabled="exporting"
+                    class="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-2 rounded-full disabled:opacity-50">
+              <span x-show="!exporting">↓ Export</span>
+              <span x-show="exporting">Exporting…</span>
+            </button>
+            <button disabled class="bg-white border border-gray-200 text-gray-300 text-xs px-3 py-2 rounded-full cursor-not-allowed">
+              ⬡ NetSuite <span class="ml-1 bg-gray-100 text-gray-400 text-xs px-1.5 py-0.5 rounded">soon</span>
+            </button>
+            <button @click="selected = new Set()" class="text-xs text-gray-400 hover:text-gray-600 px-1">✕</button>
+          </div>
         </template>
       </div>
-    </div>
-
-    <!-- Multi-select bar -->
-    <div x-show="selected.size > 0" x-transition
-         class="flex items-center gap-3 bg-blue-50 border border-blue-200 rounded-lg px-4 py-2 mb-3">
-      <span class="text-sm font-medium text-blue-700" x-text="`${selected.size} invoice${selected.size > 1 ? 's' : ''} selected`"></span>
-      <button @click="exportCsv()" :disabled="exporting"
-              class="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-1.5 rounded disabled:opacity-50">
-        <span x-show="!exporting">↓ Export Selected</span>
-        <span x-show="exporting">Exporting…</span>
-      </button>
-      <button disabled class="bg-white border border-blue-200 text-blue-300 text-xs px-3 py-1.5 rounded cursor-not-allowed">
-        ⬡ Push to NetSuite <span class="ml-1 bg-gray-100 text-gray-400 text-xs px-1.5 py-0.5 rounded">soon</span>
-      </button>
-      <button @click="selected = new Set()" class="ml-auto text-xs text-gray-400 hover:text-gray-600">✕ Clear</button>
     </div>
 
     <!-- Master / Detail -->
