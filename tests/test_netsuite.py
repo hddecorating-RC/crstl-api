@@ -121,3 +121,41 @@ def test_netsuite_csv_row_values():
     assert row["Rate"] == "18000.0"
     assert row["Tax Code"] == "HST-ON"
     assert row["Currency"] == "CAD"
+
+
+def test_fetch_po_provinces_extracts_store_and_province():
+    from unittest.mock import MagicMock, patch
+    from app.crstl import CrstlClient
+
+    client = CrstlClient(
+        base_url="https://api.crstl.ai/v2",
+        email="test@test.com",
+        password="pw",
+    )
+
+    mock_transactions = [
+        {"id": "850-001", "reference_id": "PO-40850625"},
+        {"id": "850-002", "reference_id": "PO-537608514"},
+    ]
+    mock_detail_vaughan = {
+        "transaction_data": {
+            "ship_to_party_state": "ON",
+            "ship_to_party_name": "VAUGHAN STOCK AND FLOW - 7275",
+        }
+    }
+    mock_detail_dropship = {
+        "transaction_data": {
+            "ship_to_party_state": "QC",
+            "ship_to_party_name": "GELINAS ANICK",
+        }
+    }
+
+    with patch.object(client, "get_access_token", return_value="tok"), \
+         patch.object(client, "_fetch_all_transactions", return_value=mock_transactions), \
+         patch.object(client, "_fetch_transaction_detail", side_effect=[mock_detail_vaughan, mock_detail_dropship]):
+        result = client.fetch_po_provinces()
+
+    assert result["PO-40850625"]["province"] == "ON"
+    assert result["PO-40850625"]["store"] == "VAUGHAN"
+    assert result["PO-537608514"]["province"] == "QC"
+    assert result["PO-537608514"]["store"] is None

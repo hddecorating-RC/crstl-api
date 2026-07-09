@@ -96,6 +96,50 @@ class CrstlClient:
                 print(f"  WARNING: failed to fetch detail for {tx_id}: {exc}")
         return invoices
 
+    def fetch_po_provinces(self) -> dict[str, dict]:
+        """
+        Fetch all 850 POs and return {po_number: {"province": "ON", "store": "VAUGHAN"|None}}.
+        store is set for wholesale orders (identified by ship-to name containing VAUGHAN or CALGARY).
+        province is the 2-letter Canadian province code from the ship-to address.
+        """
+        token = self.get_access_token()
+        pos = self._fetch_all_transactions(token, transaction_type="850")
+        result = {}
+        for po in pos:
+            po_id = po.get("id") or po.get("transaction_id")
+            po_number = str(po.get("reference_id") or "")
+            if not po_id or not po_number:
+                continue
+            try:
+                detail = self._fetch_transaction_detail(po_id, token)
+                tx_data = detail.get("transaction_data") or detail.get("document_data") or {}
+
+                province = str(
+                    tx_data.get("ship_to_party_state") or
+                    tx_data.get("ship_to_state") or
+                    detail.get("ship_to_state") or ""
+                ).upper().strip()
+
+                ship_to_name = str(
+                    tx_data.get("ship_to_party_name") or
+                    tx_data.get("ship_to_name") or
+                    detail.get("ship_to_name") or ""
+                ).upper()
+
+                if not province:
+                    continue
+
+                store = None
+                if "VAUGHAN" in ship_to_name:
+                    store = "VAUGHAN"
+                elif "CALGARY" in ship_to_name:
+                    store = "CALGARY"
+
+                result[po_number] = {"province": province, "store": store}
+            except Exception as exc:
+                print(f"WARNING: failed to fetch 850 detail for {po_number}: {exc}")
+        return result
+
     def _fetch_all_transactions(self, token: str, transaction_type: str = "810") -> list:
         results = []
         params = {"transaction_type": transaction_type, "limit": 100}
