@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import pathlib
 import threading
@@ -41,9 +42,6 @@ def _get_client() -> CrstlClient:
         org_id=os.environ.get("CRSTL_ORG_ID", ""),
     )
 
-app = FastAPI(title="HD Decorating Invoice Dashboard")
-
-
 def _refresh_cache() -> None:
     try:
         invoices = _get_client().fetch_invoices()
@@ -56,12 +54,17 @@ def _refresh_cache() -> None:
             _cache["status"] = f"error: {exc}"
 
 
-@app.on_event("startup")
-async def startup() -> None:
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
     await asyncio.to_thread(_refresh_cache)
     scheduler = AsyncIOScheduler()
     scheduler.add_job(_refresh_cache, "cron", hour=7, minute=0)
     scheduler.start()
+    yield
+    scheduler.shutdown()
+
+
+app = FastAPI(title="HD Decorating Invoice Dashboard", lifespan=lifespan)
 
 
 @app.get("/api/invoices")
