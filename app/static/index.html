@@ -30,7 +30,7 @@
   <div class="max-w-screen-xl mx-auto px-6 py-5">
 
     <!-- Stat cards -->
-    <div class="grid grid-cols-4 gap-4 mb-5">
+    <div class="grid grid-cols-5 gap-4 mb-5">
       <div class="bg-white rounded-lg border border-gray-200 p-4 cursor-pointer hover:border-amber-400 transition"
            :class="activeFilter === 'Draft' ? 'ring-2 ring-amber-400' : ''"
            @click="activeFilter = activeFilter === 'Draft' ? 'All' : 'Draft'">
@@ -54,6 +54,30 @@
         <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Last Export</div>
         <div class="text-sm font-semibold text-slate-800 mt-1" x-text="lastExport ? fmtTime(lastExport) : '—'"></div>
         <div class="text-xs text-green-500 mt-1" x-show="lastExport">✓ Success</div>
+      </div>
+      <!-- NetSuite Export -->
+      <div class="bg-white rounded-lg border border-gray-200 p-4">
+        <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">NetSuite Export</div>
+        <div class="text-sm font-semibold text-slate-800 mt-1"
+             x-text="netsuiteExport.last_generated ? fmtTime(netsuiteExport.last_generated) : '—'"></div>
+        <div class="text-xs text-gray-400 mt-1"
+             x-show="netsuiteExport.last_generated"
+             x-text="netsuiteExport.count + ' invoices'"></div>
+        <div class="text-xs text-red-500 mt-1"
+             x-show="netsuiteExport.error"
+             x-text="netsuiteExport.error"></div>
+        <div class="flex gap-2 mt-2">
+          <button @click="generateNetsuite()" :disabled="generatingNetsuite"
+                  class="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 font-medium px-2 py-1 rounded disabled:opacity-50">
+            <span x-show="!generatingNetsuite">⟳ Generate</span>
+            <span x-show="generatingNetsuite">Generating…</span>
+          </button>
+          <a x-show="netsuiteExport.available"
+             href="/api/netsuite-export/download"
+             class="text-xs bg-green-600 hover:bg-green-700 text-white font-medium px-2 py-1 rounded inline-block">
+            ↓ Download
+          </a>
+        </div>
       </div>
     </div>
 
@@ -263,9 +287,12 @@ function dashboard() {
     lastSynced: null,
     lastExport: null,
     syncStatus: 'never',
+    netsuiteExport: { available: false, last_generated: null, count: 0, skipped: 0, error: null, generating: false },
+    generatingNetsuite: false,
 
     async init() {
       await this.loadInvoices();
+      await this.loadNetsuiteStatus();
       setInterval(() => this.loadInvoices(), 60000);
     },
 
@@ -294,6 +321,30 @@ function dashboard() {
         this.showToast('Refresh failed');
       } finally {
         this.syncing = false;
+      }
+    },
+
+    async loadNetsuiteStatus() {
+      try {
+        const res = await fetch('/api/netsuite-export/latest');
+        this.netsuiteExport = await res.json();
+      } catch {}
+    },
+
+    async generateNetsuite() {
+      this.generatingNetsuite = true;
+      try {
+        const res = await fetch('/api/netsuite-export/generate', { method: 'POST' });
+        this.netsuiteExport = await res.json();
+        if (this.netsuiteExport.available) {
+          this.showToast('NetSuite export generated');
+        } else if (this.netsuiteExport.error) {
+          this.showToast('Export failed: ' + this.netsuiteExport.error);
+        }
+      } catch {
+        this.showToast('NetSuite export failed');
+      } finally {
+        this.generatingNetsuite = false;
       }
     },
 
