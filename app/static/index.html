@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HD Decorating · Invoice Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .row-selected { background-color: #eff6ff; }
+    .row-active { border-left: 3px solid #2563eb; }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-800 min-h-screen" x-data="dashboard()" x-init="init()" x-cloak>
+
+  <!-- Toast -->
+  <div x-show="toast" x-transition class="fixed top-4 right-4 bg-green-600 text-white px-4 py-2 rounded shadow-lg z-50 text-sm" x-text="toast"></div>
+
+  <!-- Top bar -->
+  <div class="bg-slate-900 text-slate-100 px-6 py-3 flex items-center justify-between">
+    <span class="font-semibold text-sm">HD Decorating &middot; Invoice Dashboard</span>
+    <div class="flex items-center gap-3 text-xs text-slate-400">
+      <span x-show="lastSynced">Last sync: <span x-text="fmtTime(lastSynced)"></span></span>
+      <span x-show="!lastSynced">Never synced</span>
+      <span :class="syncStatus === 'ok' ? 'text-green-400' : 'text-red-400'" x-text="syncStatus === 'ok' ? '● Live' : '● Error'"></span>
+    </div>
+  </div>
+
+  <div class="max-w-screen-xl mx-auto px-6 py-5">
+
+    <!-- Stat cards -->
+    <div class="grid grid-cols-4 gap-4 mb-5">
+      <div class="bg-white rounded-lg border border-gray-200 p-4 cursor-pointer hover:border-amber-400 transition"
+           :class="activeFilter === 'Draft' ? 'ring-2 ring-amber-400' : ''"
+           @click="activeFilter = activeFilter === 'Draft' ? 'All' : 'Draft'">
+        <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Draft</div>
+        <div class="text-3xl font-bold text-amber-500" x-text="counts.Draft"></div>
+        <div class="text-xs text-gray-400 mt-1">Not yet sent</div>
+      </div>
+      <div class="bg-white rounded-lg border border-gray-200 p-4 cursor-pointer hover:border-green-400 transition"
+           :class="activeFilter === 'Sent' ? 'ring-2 ring-green-400' : ''"
+           @click="activeFilter = activeFilter === 'Sent' ? 'All' : 'Sent'">
+        <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Sent</div>
+        <div class="text-3xl font-bold text-green-500" x-text="counts.Sent"></div>
+        <div class="text-xs text-gray-400 mt-1">Transmitted to HD</div>
+      </div>
+      <div class="bg-white rounded-lg border border-gray-200 p-4">
+        <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Total Value</div>
+        <div class="text-3xl font-bold text-slate-800" x-text="fmtMoney(totalValue)"></div>
+        <div class="text-xs text-gray-400 mt-1">All invoices</div>
+      </div>
+      <div class="bg-white rounded-lg border border-gray-200 p-4">
+        <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Last Export</div>
+        <div class="text-sm font-semibold text-slate-800 mt-1" x-text="lastExport ? fmtTime(lastExport) : '—'"></div>
+        <div class="text-xs text-green-500 mt-1" x-show="lastExport">✓ Success</div>
+      </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="flex items-center gap-3 mb-3">
+      <div class="flex-1 relative">
+        <span class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm">🔍</span>
+        <input type="text" x-model="search" placeholder="Search invoice #, PO #..."
+               class="w-full pl-9 pr-4 py-2 text-sm border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+      <div class="flex gap-2">
+        <template x-for="f in ['All','Draft','Sent']" :key="f">
+          <button @click="activeFilter = f"
+                  :class="activeFilter === f ? 'bg-blue-600 text-white' : 'bg-white text-gray-500 border border-gray-200 hover:border-blue-400'"
+                  class="px-4 py-2 rounded-full text-xs font-medium transition" x-text="f"></button>
+        </template>
+      </div>
+    </div>
+
+    <!-- Multi-select bar -->
+    <div x-show="selected.size > 0" x-transition
+         class="flex items-center gap-3 bg-blue-50 border border-blue-200 rounded-lg px-4 py-2 mb-3">
+      <span class="text-sm font-medium text-blue-700" x-text="`${selected.size} invoice${selected.size > 1 ? 's' : ''} selected`"></span>
+      <button @click="exportCsv()" :disabled="exporting"
+              class="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-1.5 rounded disabled:opacity-50">
+        <span x-show="!exporting">↓ Export Selected</span>
+        <span x-show="exporting">Exporting…</span>
+      </button>
+      <button disabled class="bg-white border border-blue-200 text-blue-300 text-xs px-3 py-1.5 rounded cursor-not-allowed">
+        ⬡ Push to NetSuite <span class="ml-1 bg-gray-100 text-gray-400 text-xs px-1.5 py-0.5 rounded">soon</span>
+      </button>
+      <button @click="selected = new Set()" class="ml-auto text-xs text-gray-400 hover:text-gray-600">✕ Clear</button>
+    </div>
+
+    <!-- Master / Detail -->
+    <div class="flex gap-4" style="height: calc(100vh - 320px); min-height: 400px;">
+
+      <!-- Master list -->
+      <div class="flex-1 bg-white border border-gray-200 rounded-lg overflow-hidden flex flex-col">
+        <!-- Table header -->
+        <div class="grid text-xs font-semibold text-gray-400 uppercase tracking-wide px-4 py-2 border-b border-gray-100 bg-gray-50"
+             style="grid-template-columns: 32px 1fr 1fr 100px 80px 90px">
+          <span><input type="checkbox" @change="toggleAll($event)" class="w-3.5 h-3.5"></span>
+          <span>Invoice #</span>
+          <span>PO #</span>
+          <span>Date</span>
+          <span>Total</span>
+          <span>Status</span>
+        </div>
+        <!-- Rows -->
+        <div class="overflow-y-auto flex-1">
+          <template x-if="loading">
+            <div class="flex items-center justify-center h-32 text-gray-400 text-sm">Loading invoices…</div>
+          </template>
+          <template x-if="!loading && filteredInvoices.length === 0">
+            <div class="flex items-center justify-center h-32 text-gray-400 text-sm">No invoices found</div>
+          </template>
+          <template x-for="inv in filteredInvoices" :key="inv.transaction_id">
+            <div class="grid items-center px-4 py-2.5 border-b border-gray-50 cursor-pointer hover:bg-gray-50 text-sm transition"
+                 style="grid-template-columns: 32px 1fr 1fr 100px 80px 90px"
+                 :class="{'row-selected': selected.has(inv.transaction_id), 'row-active border-l-2 border-l-blue-500': activeInvoice?.transaction_id === inv.transaction_id}"
+                 @click.self="selectInvoice(inv)">
+              <span><input type="checkbox" :checked="selected.has(inv.transaction_id)"
+                           @click.stop @change="toggleSelect(inv.transaction_id)" class="w-3.5 h-3.5"></span>
+              <span class="font-medium text-slate-700 truncate" @click="selectInvoice(inv)" x-text="inv.invoice_number || inv.transaction_id"></span>
+              <span class="text-gray-400 truncate" @click="selectInvoice(inv)" x-text="inv.po_number || '—'"></span>
+              <span class="text-gray-400" @click="selectInvoice(inv)" x-text="inv.invoice_date || '—'"></span>
+              <span class="font-medium" @click="selectInvoice(inv)" x-text="fmtMoney(inv.total_amount)"></span>
+              <span @click="selectInvoice(inv)">
+                <span :class="statusClass(inv.status)" class="px-2 py-0.5 rounded-full text-xs font-medium" x-text="inv.status || '—'"></span>
+              </span>
+            </div>
+          </template>
+        </div>
+        <div class="px-4 py-2 border-t border-gray-100 text-xs text-gray-400 bg-gray-50">
+          <span x-text="`Showing ${filteredInvoices.length} of ${invoices.length} invoices`"></span>
+        </div>
+      </div>
+
+      <!-- Detail panel -->
+      <div class="w-80 bg-white border border-gray-200 rounded-lg overflow-y-auto flex-shrink-0">
+        <template x-if="!activeInvoice">
+          <div class="flex items-center justify-center h-full text-gray-300 text-sm">Select an invoice</div>
+        </template>
+        <template x-if="activeInvoice">
+          <div class="p-5">
+            <div class="flex items-center gap-2 mb-3">
+              <h2 class="font-bold text-slate-800 text-base" x-text="activeInvoice.invoice_number || activeInvoice.transaction_id"></h2>
+              <span :class="statusClass(activeInvoice.status)" class="px-2 py-0.5 rounded-full text-xs font-medium" x-text="activeInvoice.status"></span>
+            </div>
+            <dl class="grid grid-cols-2 gap-x-4 gap-y-3 text-sm mb-4">
+              <div><dt class="text-xs text-gray-400">PO #</dt><dd class="font-medium mt-0.5" x-text="activeInvoice.po_number || '—'"></dd></div>
+              <div><dt class="text-xs text-gray-400">Trading Partner</dt><dd class="font-medium mt-0.5" x-text="activeInvoice.trading_partner || '—'"></dd></div>
+              <div><dt class="text-xs text-gray-400">Invoice Date</dt><dd class="font-medium mt-0.5" x-text="activeInvoice.invoice_date || '—'"></dd></div>
+              <div><dt class="text-xs text-gray-400">Due Date</dt><dd class="font-medium mt-0.5" x-text="activeInvoice.due_date || '—'"></dd></div>
+              <div><dt class="text-xs text-gray-400">Subtotal</dt><dd class="font-medium mt-0.5" x-text="fmtMoney(activeInvoice.subtotal)"></dd></div>
+              <div><dt class="text-xs text-gray-400">Tax</dt><dd class="font-medium mt-0.5" x-text="fmtMoney(activeInvoice.tax_amount)"></dd></div>
+              <div class="col-span-2 border-t pt-3">
+                <dt class="text-xs text-gray-400">Total</dt>
+                <dd class="text-xl font-bold text-slate-800 mt-0.5" x-text="fmtMoney(activeInvoice.total_amount)"></dd>
+              </div>
+              <div class="col-span-2"><dt class="text-xs text-gray-400">Transaction ID</dt><dd class="font-mono text-xs text-gray-500 mt-0.5" x-text="activeInvoice.transaction_id"></dd></div>
+            </dl>
+            <!-- Line items -->
+            <template x-if="activeInvoice.invoice_lines && activeInvoice.invoice_lines.length > 0">
+              <div>
+                <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2">Line Items</h3>
+                <div class="bg-gray-50 rounded-lg overflow-hidden">
+                  <div class="grid text-xs text-gray-400 px-3 py-1.5 border-b border-gray-200" style="grid-template-columns: 2fr 1fr 1fr">
+                    <span>Item</span><span>Qty</span><span class="text-right">Amount</span>
+                  </div>
+                  <template x-for="(line, i) in activeInvoice.invoice_lines" :key="i">
+                    <div class="grid text-xs px-3 py-1.5 border-b border-gray-100 last:border-0" style="grid-template-columns: 2fr 1fr 1fr">
+                      <span class="truncate" x-text="line.description || line.item || '—'"></span>
+                      <span x-text="line.quantity || '—'"></span>
+                      <span class="text-right" x-text="fmtMoney(line.line_amount || line.amount || 0)"></span>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Footer actions -->
+    <div class="flex gap-3 mt-4">
+      <button @click="exportAll()" :disabled="exporting || invoices.length === 0"
+              class="bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-2 rounded-lg disabled:opacity-50 transition">
+        <span x-show="!exporting">↓ Export All &amp; Download CSV</span>
+        <span x-show="exporting">Exporting…</span>
+      </button>
+      <button @click="syncNow()" :disabled="syncing"
+              class="bg-white border border-gray-200 hover:border-gray-300 text-gray-600 text-sm px-4 py-2 rounded-lg disabled:opacity-50 transition">
+        <span x-show="!syncing">↻ Refresh</span>
+        <span x-show="syncing">Refreshing…</span>
+      </button>
+      <button disabled class="bg-white border border-dashed border-gray-300 text-gray-300 text-sm px-4 py-2 rounded-lg cursor-not-allowed">
+        ⬡ Push All to NetSuite
+        <span class="ml-1 bg-gray-100 text-gray-400 text-xs px-1.5 py-0.5 rounded">coming soon</span>
+      </button>
+    </div>
+
+  </div>
+
+<script>
+function dashboard() {
+  return {
+    invoices: [],
+    activeInvoice: null,
+    selected: new Set(),
+    activeFilter: 'All',
+    search: '',
+    loading: true,
+    syncing: false,
+    exporting: false,
+    toast: '',
+    lastSynced: null,
+    lastExport: null,
+    syncStatus: 'never',
+
+    async init() {
+      await this.loadInvoices();
+      setInterval(() => this.loadInvoices(), 60000);
+    },
+
+    async loadInvoices() {
+      try {
+        const res = await fetch('/api/invoices');
+        const data = await res.json();
+        this.invoices = data.invoices || [];
+        this.lastSynced = data.last_synced;
+        this.syncStatus = data.status === 'ok' ? 'ok' : 'error';
+      } catch {
+        this.syncStatus = 'error';
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    async syncNow() {
+      this.syncing = true;
+      try {
+        await fetch('/api/sync', { method: 'POST' });
+        await this.loadInvoices();
+        this.showToast('Invoices refreshed');
+      } catch {
+        this.syncStatus = 'error';
+        this.showToast('Refresh failed');
+      } finally {
+        this.syncing = false;
+      }
+    },
+
+    async exportCsv() {
+      this.exporting = true;
+      try {
+        const body = this.selected.size > 0 ? { ids: [...this.selected] } : {};
+        const res = await fetch('/api/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          this.showToast('Export failed — try refreshing first');
+          return;
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `invoices_${new Date().toISOString().slice(0,10)}.csv`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 100);
+        this.lastExport = new Date().toISOString();
+        this.showToast('CSV downloaded');
+      } finally {
+        this.exporting = false;
+      }
+    },
+
+    async exportAll() {
+      this.exporting = true;
+      try {
+        const res = await fetch('/api/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        if (!res.ok) { this.showToast('Export failed — try refreshing first'); return; }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `invoices_${new Date().toISOString().slice(0,10)}.csv`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 100);
+        this.lastExport = new Date().toISOString();
+        this.showToast('CSV downloaded');
+      } finally {
+        this.exporting = false;
+      }
+    },
+
+    selectInvoice(inv) {
+      this.activeInvoice = inv;
+    },
+
+    toggleSelect(id) {
+      const next = new Set(this.selected);
+      next.has(id) ? next.delete(id) : next.add(id);
+      this.selected = next;
+    },
+
+    toggleAll(event) {
+      if (event.target.checked) {
+        this.selected = new Set(this.filteredInvoices.map(i => i.transaction_id));
+      } else {
+        this.selected = new Set();
+      }
+    },
+
+    get filteredInvoices() {
+      return this.invoices.filter(inv => {
+        const s = (inv.status || '').toLowerCase();
+        const matchFilter = this.activeFilter === 'All' ||
+          (this.activeFilter === 'Draft' && (s === 'draft' || s === 'open')) ||
+          (this.activeFilter === 'Sent' && (s === 'sent' || s === 'completed'));
+        const q = this.search.toLowerCase();
+        const matchSearch = !q ||
+          (inv.invoice_number || '').toLowerCase().includes(q) ||
+          (inv.po_number || '').toLowerCase().includes(q);
+        return matchFilter && matchSearch;
+      });
+    },
+
+    get counts() {
+      return {
+        Draft: this.invoices.filter(i => { const s = (i.status||'').toLowerCase(); return s === 'draft' || s === 'open'; }).length,
+        Sent:  this.invoices.filter(i => { const s = (i.status||'').toLowerCase(); return s === 'sent' || s === 'completed'; }).length,
+      };
+    },
+
+    get totalValue() {
+      return this.invoices.reduce((sum, i) => sum + (i.total_amount || 0), 0);
+    },
+
+    statusClass(status) {
+      const s = (status || '').toLowerCase();
+      if (s === 'draft' || s === 'open') return 'bg-amber-100 text-amber-800';
+      if (s === 'sent' || s === 'completed') return 'bg-green-100 text-green-800';
+      return 'bg-gray-100 text-gray-600';
+    },
+
+    fmtMoney(val) {
+      if (!val && val !== 0) return '—';
+      return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(val);
+    },
+
+    fmtTime(iso) {
+      if (!iso) return '—';
+      return new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    },
+
+    showToast(msg) {
+      this.toast = msg;
+      setTimeout(() => this.toast = '', 3000);
+    },
+  };
+}
+</script>
+</body>
+</html>
