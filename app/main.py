@@ -42,7 +42,105 @@ def _get_client() -> CrstlClient:
         org_id=os.environ.get("CRSTL_ORG_ID", ""),
     )
 
+_MOCK_INVOICES = [
+    {
+        "transaction_id": "mock-001",
+        "invoice_number": "INV-2025-041",
+        "po_number": "PO-98801",
+        "trading_partner": "Home Depot",
+        "invoice_date": "2026-07-08",
+        "due_date": "2026-08-07",
+        "status": "Open",
+        "subtotal": 4180.00,
+        "tax_amount": 320.00,
+        "total_amount": 4500.00,
+        "currency": "USD",
+        "created_at": "2026-07-08T10:00:00Z",
+        "invoice_lines": [
+            {"description": "Window Treatment Installation", "quantity": 10, "line_amount": 3500.00},
+            {"description": "Hardware / Materials", "quantity": 1, "line_amount": 680.00},
+        ],
+    },
+    {
+        "transaction_id": "mock-002",
+        "invoice_number": "INV-2025-040",
+        "po_number": "PO-98756",
+        "trading_partner": "Home Depot",
+        "invoice_date": "2026-07-07",
+        "due_date": "2026-08-06",
+        "status": "Completed",
+        "subtotal": 1950.00,
+        "tax_amount": 150.00,
+        "total_amount": 2100.00,
+        "currency": "USD",
+        "created_at": "2026-07-07T09:30:00Z",
+        "invoice_lines": [
+            {"description": "Drapery Installation", "quantity": 6, "line_amount": 1950.00},
+        ],
+    },
+    {
+        "transaction_id": "mock-003",
+        "invoice_number": "INV-2025-039",
+        "po_number": "PO-98734",
+        "trading_partner": "Home Depot",
+        "invoice_date": "2026-07-06",
+        "due_date": "2026-08-05",
+        "status": "Open",
+        "subtotal": 6320.00,
+        "tax_amount": 480.00,
+        "total_amount": 6800.00,
+        "currency": "USD",
+        "created_at": "2026-07-06T14:15:00Z",
+        "invoice_lines": [
+            {"description": "Motorized Blinds Installation", "quantity": 8, "line_amount": 4800.00},
+            {"description": "Control System Setup", "quantity": 1, "line_amount": 1520.00},
+        ],
+    },
+    {
+        "transaction_id": "mock-004",
+        "invoice_number": "INV-2025-038",
+        "po_number": "PO-98712",
+        "trading_partner": "Home Depot",
+        "invoice_date": "2026-07-03",
+        "due_date": "2026-08-02",
+        "status": "Completed",
+        "subtotal": 2800.00,
+        "tax_amount": 200.00,
+        "total_amount": 3000.00,
+        "currency": "USD",
+        "created_at": "2026-07-03T08:00:00Z",
+        "invoice_lines": [
+            {"description": "Sheer Curtain Installation", "quantity": 14, "line_amount": 2800.00},
+        ],
+    },
+    {
+        "transaction_id": "mock-005",
+        "invoice_number": "INV-2025-037",
+        "po_number": "PO-98690",
+        "trading_partner": "Home Depot",
+        "invoice_date": "2026-07-01",
+        "due_date": "2026-07-31",
+        "status": "Open",
+        "subtotal": 9100.00,
+        "tax_amount": 700.00,
+        "total_amount": 9800.00,
+        "currency": "USD",
+        "created_at": "2026-07-01T11:00:00Z",
+        "invoice_lines": [
+            {"description": "Custom Roller Shades", "quantity": 20, "line_amount": 7000.00},
+            {"description": "Fascia / Valance Trim", "quantity": 20, "line_amount": 2100.00},
+        ],
+    },
+]
+
+
 def _refresh_cache() -> None:
+    if os.environ.get("MOCK_DATA", "").lower() in ("1", "true", "yes"):
+        with _cache_lock:
+            _cache["invoices"] = _MOCK_INVOICES
+            _cache["last_synced"] = datetime.now(timezone.utc).isoformat()
+            _cache["status"] = "ok (mock)"
+        return
     try:
         invoices = _get_client().fetch_invoices()
         with _cache_lock:
