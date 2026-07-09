@@ -3,7 +3,7 @@ import contextlib
 import os
 import pathlib
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI
@@ -43,96 +43,64 @@ def _get_client() -> CrstlClient:
         org_id=os.environ.get("CRSTL_ORG_ID", ""),
     )
 
-_MOCK_INVOICES = [
-    {
-        "transaction_id": "mock-001",
-        "invoice_number": "INV-2025-041",
-        "po_number": "PO-98801",
-        "trading_partner": "Home Depot",
-        "invoice_date": "2026-07-08",
-        "due_date": "2026-08-07",
-        "status": "Open",
-        "subtotal": 4180.00,
-        "tax_amount": 320.00,
-        "total_amount": 4500.00,
-        "currency": "USD",
-        "created_at": "2026-07-08T10:00:00Z",
-        "invoice_lines": [
-            {"description": "Window Treatment Installation", "quantity": 10, "line_amount": 3500.00},
-            {"description": "Hardware / Materials", "quantity": 1, "line_amount": 680.00},
-        ],
-    },
-    {
-        "transaction_id": "mock-002",
-        "invoice_number": "INV-2025-040",
-        "po_number": "PO-98756",
-        "trading_partner": "Home Depot",
-        "invoice_date": "2026-07-07",
-        "due_date": "2026-08-06",
-        "status": "Completed",
-        "subtotal": 1950.00,
-        "tax_amount": 150.00,
-        "total_amount": 2100.00,
-        "currency": "USD",
-        "created_at": "2026-07-07T09:30:00Z",
-        "invoice_lines": [
-            {"description": "Drapery Installation", "quantity": 6, "line_amount": 1950.00},
-        ],
-    },
-    {
-        "transaction_id": "mock-003",
-        "invoice_number": "INV-2025-039",
-        "po_number": "PO-98734",
-        "trading_partner": "Home Depot",
-        "invoice_date": "2026-07-06",
-        "due_date": "2026-08-05",
-        "status": "Open",
-        "subtotal": 6320.00,
-        "tax_amount": 480.00,
-        "total_amount": 6800.00,
-        "currency": "USD",
-        "created_at": "2026-07-06T14:15:00Z",
-        "invoice_lines": [
-            {"description": "Motorized Blinds Installation", "quantity": 8, "line_amount": 4800.00},
-            {"description": "Control System Setup", "quantity": 1, "line_amount": 1520.00},
-        ],
-    },
-    {
-        "transaction_id": "mock-004",
-        "invoice_number": "INV-2025-038",
-        "po_number": "PO-98712",
-        "trading_partner": "Home Depot",
-        "invoice_date": "2026-07-03",
-        "due_date": "2026-08-02",
-        "status": "Completed",
-        "subtotal": 2800.00,
-        "tax_amount": 200.00,
-        "total_amount": 3000.00,
-        "currency": "USD",
-        "created_at": "2026-07-03T08:00:00Z",
-        "invoice_lines": [
-            {"description": "Sheer Curtain Installation", "quantity": 14, "line_amount": 2800.00},
-        ],
-    },
-    {
-        "transaction_id": "mock-005",
-        "invoice_number": "INV-2025-037",
-        "po_number": "PO-98690",
-        "trading_partner": "Home Depot",
-        "invoice_date": "2026-07-01",
-        "due_date": "2026-07-31",
-        "status": "Open",
-        "subtotal": 9100.00,
-        "tax_amount": 700.00,
-        "total_amount": 9800.00,
-        "currency": "USD",
-        "created_at": "2026-07-01T11:00:00Z",
-        "invoice_lines": [
-            {"description": "Custom Roller Shades", "quantity": 20, "line_amount": 7000.00},
-            {"description": "Fascia / Valance Trim", "quantity": 20, "line_amount": 2100.00},
-        ],
-    },
-]
+def _generate_mock_invoices(count: int = 50) -> list[dict]:
+    _SERVICES = [
+        ("Window Treatment Installation", 350.00),
+        ("Drapery Installation", 325.00),
+        ("Motorized Blinds Installation", 600.00),
+        ("Sheer Curtain Installation", 200.00),
+        ("Custom Roller Shades", 350.00),
+        ("Roman Shade Installation", 275.00),
+        ("Vertical Blind Installation", 180.00),
+        ("Cornice Board Installation", 420.00),
+        ("Plantation Shutter Installation", 550.00),
+        ("Solar Screen Installation", 230.00),
+    ]
+    _PARTNERS = ["Home Depot", "Lowe's", "Costco"]
+    _STATUSES = ["Open", "Open", "Open", "Completed"]  # 3:1 open:completed ratio
+    _HARDWARE = ("Hardware / Materials", 1, 85.00)
+
+    invoices = []
+    base_inv = 2025_041
+    base_po = 98_801
+    # Spread invoices over the past ~10 weeks (one roughly every 1.5 days)
+    base_day = date(2026, 7, 8)
+
+    for i in range(count):
+        idx = i + 1
+        inv_date = base_day - timedelta(days=i + (i // 7))  # small gaps weekends
+        due_date = inv_date + timedelta(days=30)
+        created_hour = 8 + (idx % 10)
+        service_idx = i % len(_SERVICES)
+        svc_name, unit_price = _SERVICES[service_idx]
+        qty = 2 + (i % 18)
+        line_amount = round(unit_price * qty, 2)
+        hw_amount = round(_HARDWARE[2] * (1 + i % 3), 2)
+        subtotal = round(line_amount + hw_amount, 2)
+        tax = round(subtotal * 0.075, 2)
+        total = round(subtotal + tax, 2)
+        invoices.append({
+            "transaction_id": f"mock-{idx:03d}",
+            "invoice_number": f"INV-2025-{base_inv - i:03d}",
+            "po_number": f"PO-{base_po - i * 3}",
+            "trading_partner": _PARTNERS[i % len(_PARTNERS)],
+            "invoice_date": inv_date.isoformat(),
+            "due_date": due_date.isoformat(),
+            "status": _STATUSES[i % len(_STATUSES)],
+            "subtotal": subtotal,
+            "tax_amount": tax,
+            "total_amount": total,
+            "currency": "USD",
+            "created_at": f"{inv_date.isoformat()}T{created_hour:02d}:00:00Z",
+            "invoice_lines": [
+                {"description": svc_name, "quantity": qty, "line_amount": line_amount},
+                {"description": _HARDWARE[0], "quantity": _HARDWARE[1], "line_amount": hw_amount},
+            ],
+        })
+    return invoices
+
+
+_MOCK_INVOICES = _generate_mock_invoices(50)
 
 
 def _refresh_cache() -> None:
