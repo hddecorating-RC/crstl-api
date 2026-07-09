@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from app.crstl import CrstlClient
 from app.export import build_csv
+from app import tracking
 
 
 def load_env(path: str = ".env") -> None:
@@ -154,6 +155,7 @@ def _refresh_cache() -> None:
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
+    tracking.init_db()
     await asyncio.to_thread(_refresh_cache)
     scheduler = AsyncIOScheduler()
     scheduler.add_job(_refresh_cache, "cron", hour=7, minute=0)
@@ -168,7 +170,19 @@ app = FastAPI(title="HD Decorating Invoice Dashboard", lifespan=lifespan)
 @app.get("/api/invoices")
 def get_invoices() -> dict:
     with _cache_lock:
-        return {**_cache}
+        invoices = list(_cache["invoices"])
+        last_synced = _cache["last_synced"]
+        status = _cache["status"]
+
+    if invoices:
+        tx_ids = [inv["transaction_id"] for inv in invoices]
+        events = tracking.get_latest_events(tx_ids)
+        invoices = [
+            {**inv, **events.get(inv["transaction_id"], {"exported_at": None, "netsuite_at": None})}
+            for inv in invoices
+        ]
+
+    return {"invoices": invoices, "last_synced": last_synced, "status": status}
 
 
 @app.post("/api/sync")
@@ -194,6 +208,10 @@ def export(body: ExportRequest = ExportRequest()) -> Response:
         )
     filename = f"invoices_{date.today().isoformat()}.csv"
     csv_bytes = build_csv(invoices, ids=body.ids)
+
+    exported_ids = body.ids if body.ids is not None else [inv["transaction_id"] for inv in invoices]
+    tracking.record_events(exported_ids, "exported")
+
     return Response(
         content=csv_bytes,
         media_type="text/csv",

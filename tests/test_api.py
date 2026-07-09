@@ -22,7 +22,9 @@ MOCK_INVOICES = [
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    # Prevent .env MOCK_DATA=true from bypassing the patched CrstlClient
+    monkeypatch.delenv("MOCK_DATA", raising=False)
     with patch("app.main.CrstlClient") as MockClient:
         mock_instance = MagicMock()
         mock_instance.fetch_invoices.return_value = MOCK_INVOICES
@@ -82,3 +84,18 @@ def test_netsuite_returns_501(client):
     resp = client.post("/api/netsuite")
     assert resp.status_code == 501
     assert "not yet configured" in resp.json()["message"]
+
+
+def test_export_sets_exported_at(client, monkeypatch, tmp_path):
+    import app.tracking as tracking
+    monkeypatch.setenv("TRACKING_DB", str(tmp_path / "tracking.db"))
+    tracking.init_db()
+
+    client.post("/api/sync")
+    client.post("/api/export", json={})
+
+    resp = client.get("/api/invoices")
+    invoices = resp.json()["invoices"]
+    assert len(invoices) > 0
+    assert invoices[0]["exported_at"] is not None
+    assert invoices[0]["netsuite_at"] is None
