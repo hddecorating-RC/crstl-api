@@ -3,7 +3,8 @@ import pathlib
 
 
 def _load_config() -> dict:
-    return json.loads(pathlib.Path("config/netsuite_customers.json").read_text())
+    path = pathlib.Path(__file__).parent.parent / "config" / "netsuite_customers.json"
+    return json.loads(path.read_text())
 
 
 def transform_invoice(invoice: dict, province: str | None, store: str | None) -> dict | None:
@@ -16,9 +17,9 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
     """
     config = _load_config()
 
-    if store:
+    if store is not None:
         mapping = config["wholesale_stores"].get(store.upper())
-    elif province:
+    elif province is not None:
         mapping = config["dropship_provinces"].get(province.upper())
     else:
         return None
