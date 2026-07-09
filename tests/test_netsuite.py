@@ -75,3 +75,49 @@ def test_transform_unknown_store_returns_none(mock_config):
     from app.netsuite import transform_invoice
     result = transform_invoice(SAMPLE_INVOICE, province="ON", store="TORONTO")
     assert result is None
+
+
+SAMPLE_RECORD = {
+    "external_id":   "PO-12345",
+    "customer_id":   "cust-vaughan",
+    "tran_date":     "2026-07-07",
+    "due_date":      "2026-08-06",
+    "memo":          "PO-12345",
+    "other_ref_num": "PO-12345",
+    "item":          "Merchandise Sales",
+    "quantity":      1,
+    "rate":          18000.00,
+    "amount":        18000.00,
+    "tax_code":      "HST-ON",
+    "tax_amount":    2340.00,
+    "total_amount":  20340.00,
+    "currency":      "CAD",
+}
+
+
+def test_netsuite_csv_has_correct_headers():
+    from app.netsuite_csv import build_netsuite_csv, COLUMNS
+    csv_bytes = build_netsuite_csv([])
+    header = csv_bytes.decode().splitlines()[0]
+    for col in COLUMNS:
+        assert col in header
+
+
+def test_netsuite_csv_one_row_per_record():
+    from app.netsuite_csv import build_netsuite_csv
+    csv_bytes = build_netsuite_csv([SAMPLE_RECORD, SAMPLE_RECORD])
+    lines = csv_bytes.decode().splitlines()
+    assert len(lines) == 3  # header + 2 rows
+
+
+def test_netsuite_csv_row_values():
+    from app.netsuite_csv import build_netsuite_csv
+    csv_bytes = build_netsuite_csv([SAMPLE_RECORD])
+    lines = csv_bytes.decode().splitlines()
+    assert len(lines) == 2
+    row = lines[1]
+    assert "PO-12345" in row
+    assert "cust-vaughan" in row
+    assert "18000.0" in row
+    assert "HST-ON" in row
+    assert "CAD" in row
