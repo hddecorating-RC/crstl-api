@@ -137,6 +137,9 @@ class CrstlClient:
 
                 result[po_number] = {"province": province, "store": store}
             except Exception as exc:
+                # Broad catch intentional: detail fetches can fail for structural reasons
+                # (malformed JSON, unexpected schema) beyond HTTP errors. Best-effort bulk fetch
+                # should skip bad records rather than abort the whole job.
                 print(f"WARNING: failed to fetch 850 detail for {po_number}: {exc}")
         return result
 

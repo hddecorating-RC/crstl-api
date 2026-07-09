@@ -124,7 +124,7 @@ def test_netsuite_csv_row_values():
 
 
 def test_fetch_po_provinces_extracts_store_and_province():
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
     from app.crstl import CrstlClient
 
     client = CrstlClient(
