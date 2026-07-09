@@ -15,6 +15,8 @@ from pydantic import BaseModel
 from app.crstl import CrstlClient
 from app.export import build_csv
 from app import tracking
+from app.netsuite import transform_invoice
+from app.netsuite_csv import build_netsuite_csv
 
 
 def load_env(path: str = ".env") -> None:
@@ -33,6 +35,20 @@ load_env()
 
 _cache: dict = {"invoices": [], "last_synced": None, "status": "never"}
 _cache_lock = threading.Lock()
+_netsuite_state: dict = {"last_generated": None, "path": None, "count": 0, "skipped": 0}
+_netsuite_lock = threading.Lock()
+
+# Province map for MOCK_DATA mode (cycles through stores + provinces for 50 mock invoices)
+_MOCK_PO_PROVINCES: dict[str, dict] = {}
+for _i in range(50):
+    _po = f"PO-{98801 - _i * 3}"
+    if _i % 10 < 2:
+        _MOCK_PO_PROVINCES[_po] = {"province": "ON", "store": "VAUGHAN"}
+    elif _i % 10 < 4:
+        _MOCK_PO_PROVINCES[_po] = {"province": "AB", "store": "CALGARY"}
+    else:
+        _provinces = ["ON", "BC", "QC", "AB", "SK", "MB", "NS", "NB", "NL", "PE", "NT", "YT", "NU"]
+        _MOCK_PO_PROVINCES[_po] = {"province": _provinces[_i % len(_provinces)], "store": None}
 
 
 def _get_client() -> CrstlClient:
@@ -121,12 +137,56 @@ def _refresh_cache() -> None:
             _cache["status"] = f"error: {exc}"
 
 
+def _generate_netsuite_export() -> None:
+    with _cache_lock:
+        invoices = list(_cache["invoices"])
+
+    if not invoices:
+        print("NetSuite export: cache empty, skipping")
+        return
+
+    if os.environ.get("MOCK_DATA", "").lower() in ("1", "true", "yes"):
+        po_provinces = _MOCK_PO_PROVINCES
+    else:
+        try:
+            po_provinces = _get_client().fetch_po_provinces()
+        except Exception as exc:
+            print(f"WARNING: NetSuite export — failed to fetch PO provinces: {exc}")
+            po_provinces = {}
+
+    records, skipped = [], []
+    for inv in invoices:
+        loc = po_provinces.get(inv.get("po_number", ""), {})
+        record = transform_invoice(inv, province=loc.get("province"), store=loc.get("store"))
+        if record is None:
+            skipped.append(inv.get("po_number", "?"))
+        else:
+            records.append(record)
+
+    if skipped:
+        print(f"WARNING: NetSuite export skipped {len(skipped)} invoices (no province mapping): {skipped}")
+
+    csv_bytes = build_netsuite_csv(records)
+    out_path = pathlib.Path(".tmp") / f"netsuite_export_{date.today().isoformat()}.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(csv_bytes)
+
+    with _netsuite_lock:
+        _netsuite_state["last_generated"] = datetime.now(timezone.utc).isoformat()
+        _netsuite_state["path"] = str(out_path)
+        _netsuite_state["count"] = len(records)
+        _netsuite_state["skipped"] = len(skipped)
+
+    print(f"NetSuite export: {len(records)} invoices → {out_path} ({len(skipped)} skipped)")
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     tracking.init_db()
     await asyncio.to_thread(_refresh_cache)
     scheduler = AsyncIOScheduler()
     scheduler.add_job(_refresh_cache, "cron", hour=7, minute=0)
+    scheduler.add_job(_generate_netsuite_export, "cron", hour=4, minute=0, timezone="America/Toronto")
     scheduler.start()
     yield
     scheduler.shutdown()
@@ -196,8 +256,47 @@ def export(body: ExportRequest = ExportRequest()) -> Response:
 def netsuite() -> JSONResponse:
     return JSONResponse(
         status_code=501,
-        content={"message": "NetSuite connector not yet configured"},
+        content={"message": "NetSuite REST connector not yet configured. Use CSV export path."},
     )
+
+
+@app.get("/api/netsuite-export/latest")
+def netsuite_export_latest() -> dict:
+    with _netsuite_lock:
+        state = {**_netsuite_state}
+    path = state.get("path")
+    state["available"] = bool(path and pathlib.Path(path).exists())
+    return state
+
+
+@app.get("/api/netsuite-export/download")
+def netsuite_export_download() -> Response:
+    with _netsuite_lock:
+        path = _netsuite_state.get("path")
+    if not path or not pathlib.Path(path).exists():
+        return JSONResponse(
+            status_code=404,
+            content={"message": "No NetSuite export file available. Generate one first."},
+        )
+    filename = pathlib.Path(path).name
+    return Response(
+        content=pathlib.Path(path).read_bytes(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/netsuite-export/generate")
+async def netsuite_export_generate() -> dict:
+    try:
+        await asyncio.to_thread(_generate_netsuite_export)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"message": str(exc)})
+    with _netsuite_lock:
+        state = {**_netsuite_state}
+    path = state.get("path")
+    state["available"] = bool(path and pathlib.Path(path).exists())
+    return state
 
 
 app.mount("/", StaticFiles(directory="app/static", html=True), name="static")

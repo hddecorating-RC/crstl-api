@@ -32,12 +32,16 @@ def client(monkeypatch, tmp_path):
         mock_instance.fetch_invoices.return_value = MOCK_INVOICES
         MockClient.return_value = mock_instance
 
-        from app.main import app, _cache
+        from app.main import app, _cache, _netsuite_state
         with TestClient(app) as c:
             # Reset cache after startup so each test controls its own state
             _cache["invoices"] = []
             _cache["last_synced"] = None
             _cache["status"] = "never"
+            _netsuite_state["last_generated"] = None
+            _netsuite_state["path"] = None
+            _netsuite_state["count"] = 0
+            _netsuite_state["skipped"] = 0
             yield c
 
 
@@ -97,3 +101,30 @@ def test_export_sets_exported_at(client):
     assert len(invoices) > 0
     assert invoices[0]["exported_at"] is not None
     assert invoices[0]["netsuite_at"] is None
+
+
+def test_netsuite_export_latest_initially_unavailable(client):
+    resp = client.get("/api/netsuite-export/latest")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["available"] is False
+    assert data["last_generated"] is None
+    assert data["count"] == 0
+
+
+def test_netsuite_export_download_no_file_returns_404(client):
+    resp = client.get("/api/netsuite-export/download")
+    assert resp.status_code == 404
+
+
+def test_netsuite_generate_and_download(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("MOCK_DATA", "true")
+    client.post("/api/sync")
+    resp = client.post("/api/netsuite-export/generate")
+    assert resp.status_code == 200
+    assert resp.json()["available"] is True
+
+    download = client.get("/api/netsuite-export/download")
+    assert download.status_code == 200
+    assert "text/csv" in download.headers["content-type"]
+    assert "netsuite_export" in download.headers["content-disposition"]
