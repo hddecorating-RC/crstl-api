@@ -58,15 +58,26 @@
     </div>
 
     <!-- Toolbar -->
-    <div class="flex items-center gap-3 mb-3">
-      <div class="flex-1 relative">
+    <div class="flex flex-wrap items-center gap-3 mb-3">
+      <div class="flex-1 min-w-48 relative">
         <span class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm">🔍</span>
-        <input type="text" x-model="search" placeholder="Search invoice #, PO #..."
+        <input type="text" x-model="search" @input="currentPage = 1" placeholder="Search invoice #, PO #..."
                class="w-full pl-9 pr-4 py-2 text-sm border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+      <!-- Date range -->
+      <div class="flex items-center gap-1.5 text-sm">
+        <label class="text-xs text-gray-400 font-medium">From</label>
+        <input type="date" x-model="dateFrom" @change="currentPage = 1"
+               class="px-2 py-1.5 text-sm border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+        <label class="text-xs text-gray-400 font-medium">To</label>
+        <input type="date" x-model="dateTo" @change="currentPage = 1"
+               class="px-2 py-1.5 text-sm border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+        <button x-show="dateFrom || dateTo" @click="dateFrom = ''; dateTo = ''; currentPage = 1"
+                class="text-xs text-gray-400 hover:text-gray-600 px-1">✕</button>
       </div>
       <div class="flex gap-2">
         <template x-for="f in ['All','Draft','Sent']" :key="f">
-          <button @click="activeFilter = f"
+          <button @click="activeFilter = f; currentPage = 1"
                   :class="activeFilter === f ? 'bg-blue-600 text-white' : 'bg-white text-gray-500 border border-gray-200 hover:border-blue-400'"
                   class="px-4 py-2 rounded-full text-xs font-medium transition" x-text="f"></button>
         </template>
@@ -112,7 +123,7 @@
           <template x-if="!loading && filteredInvoices.length === 0">
             <div class="flex items-center justify-center h-32 text-gray-400 text-sm">No invoices found</div>
           </template>
-          <template x-for="inv in filteredInvoices" :key="inv.transaction_id">
+          <template x-for="inv in pagedInvoices" :key="inv.transaction_id">
             <div class="grid items-center px-4 py-2.5 border-b border-gray-50 cursor-pointer hover:bg-gray-50 text-sm transition"
                  style="grid-template-columns: 32px 1fr 1fr 100px 80px 90px 70px"
                  :class="{'row-selected': selected.has(inv.transaction_id), 'row-active border-l-2 border-l-blue-500': activeInvoice?.transaction_id === inv.transaction_id}"
@@ -134,8 +145,23 @@
             </div>
           </template>
         </div>
-        <div class="px-4 py-2 border-t border-gray-100 text-xs text-gray-400 bg-gray-50">
-          <span x-text="`Showing ${filteredInvoices.length} of ${invoices.length} invoices`"></span>
+        <!-- Pagination footer -->
+        <div class="px-4 py-2 border-t border-gray-100 bg-gray-50 flex items-center justify-between gap-3 text-xs text-gray-400">
+          <span x-text="`${filteredInvoices.length} of ${invoices.length} invoices`"></span>
+          <div class="flex items-center gap-2">
+            <label class="text-gray-400">Per page</label>
+            <select x-model.number="pageSize" @change="currentPage = 1"
+                    class="border border-gray-200 rounded px-1.5 py-0.5 text-xs bg-white focus:outline-none">
+              <option value="10">10</option>
+              <option value="25">25</option>
+              <option value="50">50</option>
+            </select>
+            <button @click="currentPage = Math.max(1, currentPage - 1)" :disabled="currentPage === 1"
+                    class="px-2 py-0.5 rounded border border-gray-200 bg-white hover:bg-gray-100 disabled:opacity-40">‹</button>
+            <span x-text="`${currentPage} / ${totalPages}`"></span>
+            <button @click="currentPage = Math.min(totalPages, currentPage + 1)" :disabled="currentPage === totalPages"
+                    class="px-2 py-0.5 rounded border border-gray-200 bg-white hover:bg-gray-100 disabled:opacity-40">›</button>
+          </div>
         </div>
       </div>
 
@@ -221,6 +247,10 @@ function dashboard() {
     selected: new Set(),
     activeFilter: 'All',
     search: '',
+    dateFrom: '',
+    dateTo: '',
+    currentPage: 1,
+    pageSize: 25,
     loading: true,
     syncing: false,
     exporting: false,
@@ -326,7 +356,7 @@ function dashboard() {
 
     toggleAll(event) {
       if (event.target.checked) {
-        this.selected = new Set(this.filteredInvoices.map(i => i.transaction_id));
+        this.selected = new Set(this.pagedInvoices.map(i => i.transaction_id));
       } else {
         this.selected = new Set();
       }
@@ -341,9 +371,22 @@ function dashboard() {
         const q = this.search.toLowerCase();
         const matchSearch = !q ||
           (inv.invoice_number || '').toLowerCase().includes(q) ||
-          (inv.po_number || '').toLowerCase().includes(q);
-        return matchFilter && matchSearch;
+          (inv.po_number || '').toLowerCase().includes(q) ||
+          (inv.trading_partner || '').toLowerCase().includes(q);
+        const d = inv.invoice_date || '';
+        const matchDate = (!this.dateFrom || d >= this.dateFrom) &&
+                          (!this.dateTo   || d <= this.dateTo);
+        return matchFilter && matchSearch && matchDate;
       });
+    },
+
+    get totalPages() {
+      return Math.max(1, Math.ceil(this.filteredInvoices.length / this.pageSize));
+    },
+
+    get pagedInvoices() {
+      const start = (this.currentPage - 1) * this.pageSize;
+      return this.filteredInvoices.slice(start, start + this.pageSize);
     },
 
     get counts() {
