@@ -42,6 +42,8 @@ def client(monkeypatch, tmp_path):
             _netsuite_state["path"] = None
             _netsuite_state["count"] = 0
             _netsuite_state["skipped"] = 0
+            _netsuite_state["error"] = None
+            _netsuite_state["generating"] = False
             yield c
 
 

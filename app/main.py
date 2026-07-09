@@ -35,20 +35,26 @@ load_env()
 
 _cache: dict = {"invoices": [], "last_synced": None, "status": "never"}
 _cache_lock = threading.Lock()
-_netsuite_state: dict = {"last_generated": None, "path": None, "count": 0, "skipped": 0}
+_netsuite_state: dict = {"last_generated": None, "path": None, "count": 0, "skipped": 0, "error": None, "generating": False}
 _netsuite_lock = threading.Lock()
 
+
+def _build_mock_po_provinces() -> dict[str, dict]:
+    provinces = ["ON", "BC", "QC", "AB", "SK", "MB", "NS", "NB", "NL", "PE", "NT", "YT", "NU"]
+    result = {}
+    for i in range(50):
+        po = f"PO-{98801 - i * 3}"
+        if i % 10 < 2:
+            result[po] = {"province": "ON", "store": "VAUGHAN"}
+        elif i % 10 < 4:
+            result[po] = {"province": "AB", "store": "CALGARY"}
+        else:
+            result[po] = {"province": provinces[i % len(provinces)], "store": None}
+    return result
+
+
 # Province map for MOCK_DATA mode (cycles through stores + provinces for 50 mock invoices)
-_MOCK_PO_PROVINCES: dict[str, dict] = {}
-for _i in range(50):
-    _po = f"PO-{98801 - _i * 3}"
-    if _i % 10 < 2:
-        _MOCK_PO_PROVINCES[_po] = {"province": "ON", "store": "VAUGHAN"}
-    elif _i % 10 < 4:
-        _MOCK_PO_PROVINCES[_po] = {"province": "AB", "store": "CALGARY"}
-    else:
-        _provinces = ["ON", "BC", "QC", "AB", "SK", "MB", "NS", "NB", "NL", "PE", "NT", "YT", "NU"]
-        _MOCK_PO_PROVINCES[_po] = {"province": _provinces[_i % len(_provinces)], "store": None}
+_MOCK_PO_PROVINCES = _build_mock_po_provinces()
 
 
 def _get_client() -> CrstlClient:
@@ -151,8 +157,11 @@ def _generate_netsuite_export() -> None:
         try:
             po_provinces = _get_client().fetch_po_provinces()
         except Exception as exc:
-            print(f"WARNING: NetSuite export — failed to fetch PO provinces: {exc}")
-            po_provinces = {}
+            msg = f"Failed to fetch PO provinces: {exc}"
+            print(f"WARNING: NetSuite export — {msg}")
+            with _netsuite_lock:
+                _netsuite_state["error"] = msg
+            return
 
     records, skipped = [], []
     for inv in invoices:
@@ -167,7 +176,7 @@ def _generate_netsuite_export() -> None:
         print(f"WARNING: NetSuite export skipped {len(skipped)} invoices (no province mapping): {skipped}")
 
     csv_bytes = build_netsuite_csv(records)
-    out_path = pathlib.Path(".tmp") / f"netsuite_export_{date.today().isoformat()}.csv"
+    out_path = pathlib.Path(__file__).parent.parent / ".tmp" / f"netsuite_export_{date.today().isoformat()}.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(csv_bytes)
 
@@ -176,6 +185,7 @@ def _generate_netsuite_export() -> None:
         _netsuite_state["path"] = str(out_path)
         _netsuite_state["count"] = len(records)
         _netsuite_state["skipped"] = len(skipped)
+        _netsuite_state["error"] = None
 
     print(f"NetSuite export: {len(records)} invoices → {out_path} ({len(skipped)} skipped)")
 
@@ -288,10 +298,17 @@ def netsuite_export_download() -> Response:
 
 @app.post("/api/netsuite-export/generate")
 async def netsuite_export_generate() -> dict:
+    with _netsuite_lock:
+        if _netsuite_state.get("generating"):
+            return JSONResponse(status_code=409, content={"message": "Export already in progress"})
+        _netsuite_state["generating"] = True
     try:
         await asyncio.to_thread(_generate_netsuite_export)
     except Exception as exc:
         return JSONResponse(status_code=500, content={"message": str(exc)})
+    finally:
+        with _netsuite_lock:
+            _netsuite_state["generating"] = False
     with _netsuite_lock:
         state = {**_netsuite_state}
     path = state.get("path")
