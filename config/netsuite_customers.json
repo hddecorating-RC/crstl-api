@@ -1,31 +1,31 @@
 {
   "wholesale_stores": {
     "VAUGHAN": {
-      "customer_id": "PLACEHOLDER_VAUGHAN",
+      "customer_id": "4115",
       "province": "ON",
       "tax_code": "HST-ON",
       "tax_rate": 0.13
     },
     "CALGARY": {
-      "customer_id": "PLACEHOLDER_CALGARY",
+      "customer_id": "4116",
       "province": "AB",
       "tax_code": "GST",
       "tax_rate": 0.05
     }
   },
   "dropship_provinces": {
-    "AB": {"customer_id": "PLACEHOLDER_DS_AB", "tax_code": "GST", "tax_rate": 0.05},
-    "BC": {"customer_id": "PLACEHOLDER_DS_BC", "tax_code": "GST+PST", "tax_rate": 0.12},
-    "MB": {"customer_id": "PLACEHOLDER_DS_MB", "tax_code": "GST+PST", "tax_rate": 0.12},
-    "NB": {"customer_id": "PLACEHOLDER_DS_NB", "tax_code": "HST", "tax_rate": 0.15},
+    "AB": {"customer_id": "4145", "tax_code": "GST", "tax_rate": 0.05},
+    "BC": {"customer_id": "4150", "tax_code": "GST+PST", "tax_rate": 0.12},
+    "MB": {"customer_id": "4165", "tax_code": "GST+PST", "tax_rate": 0.12},
+    "NB": {"customer_id": "4152", "tax_code": "HST", "tax_rate": 0.15},
     "NL": {"customer_id": "PLACEHOLDER_DS_NL", "tax_code": "HST", "tax_rate": 0.15},
     "NT": {"customer_id": "PLACEHOLDER_DS_NT", "tax_code": "GST", "tax_rate": 0.05},
-    "NS": {"customer_id": "PLACEHOLDER_DS_NS", "tax_code": "HST", "tax_rate": 0.14},
+    "NS": {"customer_id": "4151", "tax_code": "HST", "tax_rate": 0.14},
     "NU": {"customer_id": "PLACEHOLDER_DS_NU", "tax_code": "GST", "tax_rate": 0.05},
-    "ON": {"customer_id": "PLACEHOLDER_DS_ON", "tax_code": "HST-ON", "tax_rate": 0.13},
-    "PE": {"customer_id": "PLACEHOLDER_DS_PE", "tax_code": "HST", "tax_rate": 0.15},
-    "QC": {"customer_id": "PLACEHOLDER_DS_QC", "tax_code": "GST+QST", "tax_rate": 0.14975},
-    "SK": {"customer_id": "PLACEHOLDER_DS_SK", "tax_code": "GST+PST", "tax_rate": 0.11},
+    "ON": {"customer_id": "4147", "tax_code": "HST-ON", "tax_rate": 0.13},
+    "PE": {"customer_id": "4153", "tax_code": "HST", "tax_rate": 0.15},
+    "QC": {"customer_id": "4146", "tax_code": "GST+QST", "tax_rate": 0.14975},
+    "SK": {"customer_id": "4149", "tax_code": "GST+PST", "tax_rate": 0.11},
     "YT": {"customer_id": "PLACEHOLDER_DS_YT", "tax_code": "GST", "tax_rate": 0.05}
   },
   "item": "Merchandise Sales",
