@@ -19,14 +19,11 @@
     "MB": {"customer_id": "4165", "tax_code": "CA-GST 5%", "tax_rate": 0.05},
     "NB": {"customer_id": "4152", "tax_code": "CA-HST Maritimes", "tax_rate": 0.15},
     "NL": {"customer_id": "4166", "tax_code": "CA-HST Maritimes", "tax_rate": 0.15},
-    "NT": {"customer_id": "PLACEHOLDER_DS_NT", "tax_code": "CA-GST 5%", "tax_rate": 0.05},
     "NS": {"customer_id": "4151", "tax_code": "HST NS", "tax_rate": 0.14},
-    "NU": {"customer_id": "PLACEHOLDER_DS_NU", "tax_code": "CA-GST 5%", "tax_rate": 0.05},
     "ON": {"customer_id": "4147", "tax_code": "CA-HST ONT", "tax_rate": 0.13},
     "PE": {"customer_id": "4153", "tax_code": "CA-HST Maritimes", "tax_rate": 0.15},
     "QC": {"customer_id": "4146", "tax_code": "CA-S-QST", "tax_rate": 0.14975},
-    "SK": {"customer_id": "4149", "tax_code": "CA-GST 5%", "tax_rate": 0.05},
-    "YT": {"customer_id": "PLACEHOLDER_DS_YT", "tax_code": "CA-GST 5%", "tax_rate": 0.05}
+    "SK": {"customer_id": "4149", "tax_code": "CA-GST 5%", "tax_rate": 0.05}
   },
   "item": "Merchandise Sales",
   "currency": "CAD"
