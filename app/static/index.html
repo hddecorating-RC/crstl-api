@@ -140,7 +140,12 @@
               <span x-show="!exporting">↓ Export</span>
               <span x-show="exporting">Exporting…</span>
             </button>
-<button @click="selected = new Set()" class="text-xs text-gray-400 hover:text-gray-600 px-1">✕</button>
+            <button @click="emailSelected()" :disabled="sendingDigest"
+                    class="bg-slate-700 hover:bg-slate-800 text-white text-xs font-medium px-3 py-2 rounded-full disabled:opacity-50">
+              <span x-show="!sendingDigest">✉ Email Selected</span>
+              <span x-show="sendingDigest">Sending…</span>
+            </button>
+            <button @click="selected = new Set()" class="text-xs text-gray-400 hover:text-gray-600 px-1">✕</button>
           </div>
         </template>
       </div>
@@ -415,19 +420,38 @@ function dashboard() {
     },
 
     async sendDigest() {
+      await this._sendEmail(null);
+    },
+
+    async emailSelected() {
+      if (this.selected.size === 0) return;
+      await this._sendEmail([...this.selected]);
+    },
+
+    async _sendEmail(ids) {
       this.sendingDigest = true;
       try {
-        const res = await fetch('/api/email/send-digest', { method: 'POST' });
+        const res = await fetch('/api/email/send-digest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(ids === null ? {} : { ids }),
+        });
         const data = await res.json();
         if (!res.ok) {
-          this.showToast('Digest failed: ' + (data.message || 'Unknown error'));
-        } else {
-          const label = data.count === 0 ? 'Sent (0 new invoices)' : `Sent ${data.count} invoice${data.count === 1 ? '' : 's'}`;
-          this.showToast(label);
-          await this.loadDigestStatus();
+          this.showToast('Email failed: ' + (data.message || 'Unknown error'));
+          return;
         }
+        const label = data.count === 0
+          ? 'Sent (0 new invoices)'
+          : `Sent ${data.count} invoice${data.count === 1 ? '' : 's'}`;
+        this.showToast(label);
+        if (ids !== null) {
+          this.selected = new Set();
+          await this.loadInvoices();  // refresh emailed_at markers
+        }
+        await this.loadDigestStatus();
       } catch {
-        this.showToast('Digest send failed');
+        this.showToast('Email send failed');
       } finally {
         this.sendingDigest = false;
       }

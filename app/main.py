@@ -193,13 +193,21 @@ def _generate_netsuite_export() -> None:
     print(f"NetSuite export: {len(records)} invoices → {out_path} ({len(skipped)} skipped)")
 
 
-def _send_daily_digest() -> dict:
-    """Send accounting a daily digest of invoices not yet emailed. Always sends,
-    even on zero new invoices — accounting uses receipt as proof the pipeline
-    is alive. Marks sent invoices with an 'emailed' tracking event so they
-    don't appear in future digests.
+def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
+    """Send an invoice email.
 
-    Returns a summary dict. Raises MailConfigError if env vars missing."""
+    Two modes:
+    - Digest (selected_ids is None): pull invoices not yet emailed. Always
+      sends, even on zero new invoices — accounting uses receipt as proof
+      the pipeline is alive.
+    - Selection (selected_ids provided): send exactly those invoices,
+      regardless of whether they've been emailed before.
+
+    In both modes, sent invoices are marked with an 'emailed' tracking event
+    so they don't appear in future digests.
+
+    Returns a summary dict. Raises MailConfigError if env vars missing.
+    """
     recipients_raw = os.environ.get("MAIL_RECIPIENTS", "")
     recipients = [r.strip() for r in recipients_raw.split(",") if r.strip()]
     if not recipients:
@@ -207,21 +215,35 @@ def _send_daily_digest() -> dict:
 
     with _cache_lock:
         invoices = list(_cache["invoices"])
-    all_ids = [inv["transaction_id"] for inv in invoices]
-    new_ids = set(tracking.get_unemailed_ids(all_ids))
-    new_invoices = [inv for inv in invoices if inv["transaction_id"] in new_ids]
+
+    if selected_ids is not None:
+        selected_set = set(selected_ids)
+        to_send = [inv for inv in invoices if inv["transaction_id"] in selected_set]
+        mode = "selection"
+    else:
+        all_ids = [inv["transaction_id"] for inv in invoices]
+        new_ids = set(tracking.get_unemailed_ids(all_ids))
+        to_send = [inv for inv in invoices if inv["transaction_id"] in new_ids]
+        mode = "digest"
 
     today = date.today().isoformat()
-    if new_invoices:
-        total = sum(inv.get("total_amount", 0) for inv in new_invoices)
+    if to_send:
+        total = sum(inv.get("total_amount", 0) for inv in to_send)
         by_province: dict[str, int] = {}
-        for inv in new_invoices:
+        for inv in to_send:
             p = inv.get("province") or "—"
             by_province[p] = by_province.get(p, 0) + 1
         prov_rows = "".join(f"<tr><td>{p}</td><td style='text-align:right'>{c}</td></tr>" for p, c in sorted(by_province.items()))
-        subject = f"HD Invoice Digest — {today} — {len(new_invoices)} new"
+
+        if mode == "selection":
+            subject = f"HD Invoices — {today} — {len(to_send)} selected"
+            intro = f"<p>{len(to_send)} invoice(s) sent manually from the dashboard.</p>"
+        else:
+            subject = f"HD Invoice Digest — {today} — {len(to_send)} new"
+            intro = f"<p>{len(to_send)} new invoice(s) since the last digest.</p>"
+
         body_html = f"""
-            <p>{len(new_invoices)} new invoice(s) since the last digest.</p>
+            {intro}
             <p><strong>Total value:</strong> ${total:,.2f} CAD</p>
             <table cellpadding="4" cellspacing="0" border="1" style="border-collapse:collapse">
               <tr><th align="left">Province</th><th align="right">Count</th></tr>
@@ -229,19 +251,20 @@ def _send_daily_digest() -> dict:
             </table>
             <p>Full details attached as CSV.</p>
         """
-        csv_bytes = build_csv(new_invoices)
+        csv_bytes = build_csv(to_send)
         attachments = [(f"hd_invoices_{today}.csv", csv_bytes, "text/csv")]
     else:
+        # Only reachable in digest mode — selection mode with 0 matches is a caller bug
         subject = f"HD Invoice Digest — {today} — 0 new"
         body_html = "<p>No new invoices since the last digest. Pipeline is healthy.</p>"
         attachments = None
 
     send_mail(subject=subject, body_html=body_html, recipients=recipients, attachments=attachments)
 
-    if new_invoices:
-        tracking.record_events([inv["transaction_id"] for inv in new_invoices], "emailed")
+    if to_send:
+        tracking.record_events([inv["transaction_id"] for inv in to_send], "emailed")
 
-    return {"sent_to": recipients, "count": len(new_invoices), "subject": subject}
+    return {"sent_to": recipients, "count": len(to_send), "subject": subject, "mode": mode}
 
 
 def _run_daily_digest_job() -> None:
@@ -394,11 +417,18 @@ async def netsuite_export_generate() -> dict:
     return state
 
 
+class EmailRequest(BaseModel):
+    ids: Optional[list[str]] = None
+
+
 @app.post("/api/email/send-digest")
-async def send_digest_now() -> JSONResponse:
-    """Manually trigger the digest email. Same behavior as the scheduled job."""
+async def send_digest_now(body: EmailRequest = EmailRequest()) -> JSONResponse:
+    """Send an email of invoices. Without `ids`: unemailed digest (same as
+    scheduled job). With `ids`: send exactly those invoices."""
+    if body.ids is not None and not body.ids:
+        return JSONResponse(status_code=400, content={"message": "ids is empty"})
     try:
-        result = await asyncio.to_thread(_send_daily_digest)
+        result = await asyncio.to_thread(_send_daily_digest, body.ids)
     except MailConfigError as exc:
         return JSONResponse(status_code=400, content={"message": str(exc)})
     except Exception as exc:
