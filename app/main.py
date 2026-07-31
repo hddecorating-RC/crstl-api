@@ -59,10 +59,8 @@ _MOCK_PO_PROVINCES = _build_mock_po_provinces()
 
 def _get_client() -> CrstlClient:
     return CrstlClient(
-        base_url=os.environ.get("CRSTL_BASE_URL", "https://api.crstl.ai/v2"),
-        email=os.environ.get("CRSTL_EMAIL", ""),
-        password=os.environ.get("CRSTL_PASSWORD", ""),
-        org_id=os.environ.get("CRSTL_ORG_ID", ""),
+        base_url=os.environ.get("CRSTL_BASE_URL", "https://api.crstl.so/v2"),
+        api_key=os.environ.get("CRSTL_API_KEY", ""),
     )
 
 def _generate_mock_invoices(count: int = 50) -> list[dict]:
@@ -125,15 +123,28 @@ def _generate_mock_invoices(count: int = 50) -> list[dict]:
 _MOCK_INVOICES = _generate_mock_invoices(50)
 
 
+def _attach_provinces(invoices: list[dict], po_provinces: dict[str, dict]) -> None:
+    """Attach ship-to province + store from the source 850 to each invoice (factual, no rate math)."""
+    for inv in invoices:
+        loc = po_provinces.get(inv.get("po_number", ""), {})
+        inv["province"] = loc.get("province")
+        inv["store"] = loc.get("store")
+
+
 def _refresh_cache() -> None:
     if os.environ.get("MOCK_DATA", "").lower() in ("1", "true", "yes"):
+        invoices = list(_MOCK_INVOICES)
+        _attach_provinces(invoices, _MOCK_PO_PROVINCES)
         with _cache_lock:
-            _cache["invoices"] = _MOCK_INVOICES
+            _cache["invoices"] = invoices
             _cache["last_synced"] = datetime.now(timezone.utc).isoformat()
             _cache["status"] = "ok (mock)"
         return
     try:
-        invoices = _get_client().fetch_invoices()
+        client = _get_client()
+        invoices = client.fetch_invoices()
+        po_provinces = client.fetch_po_provinces()
+        _attach_provinces(invoices, po_provinces)
         with _cache_lock:
             _cache["invoices"] = invoices
             _cache["last_synced"] = datetime.now(timezone.utc).isoformat()
@@ -144,6 +155,8 @@ def _refresh_cache() -> None:
 
 
 def _generate_netsuite_export() -> None:
+    """Build NetSuite CSV from the cached invoices. Province/store are already
+    attached to each invoice by `_refresh_cache` — no extra API round-trips."""
     with _cache_lock:
         invoices = list(_cache["invoices"])
 
@@ -151,22 +164,9 @@ def _generate_netsuite_export() -> None:
         print("NetSuite export: cache empty, skipping")
         return
 
-    if os.environ.get("MOCK_DATA", "").lower() in ("1", "true", "yes"):
-        po_provinces = _MOCK_PO_PROVINCES
-    else:
-        try:
-            po_provinces = _get_client().fetch_po_provinces()
-        except Exception as exc:
-            msg = f"Failed to fetch PO provinces: {exc}"
-            print(f"WARNING: NetSuite export — {msg}")
-            with _netsuite_lock:
-                _netsuite_state["error"] = msg
-            return
-
     records, skipped = [], []
     for inv in invoices:
-        loc = po_provinces.get(inv.get("po_number", ""), {})
-        record = transform_invoice(inv, province=loc.get("province"), store=loc.get("store"))
+        record = transform_invoice(inv, province=inv.get("province"), store=inv.get("store"))
         if record is None:
             skipped.append(inv.get("po_number", "?"))
         else:

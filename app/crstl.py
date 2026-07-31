@@ -1,99 +1,45 @@
-import json
-import os
-import pathlib
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
 
 
 class CrstlClient:
-    def __init__(self, base_url: str, email: str, password: str, org_id: str = "", token_cache_path: str = ".tmp/crstl_tokens.json"):
+    # Server enforces a 20-row page cap regardless of the `limit` param;
+    # pagination is offset-based (no cursor). Keep PAGE_SIZE aligned with
+    # the server's actual page size so the "short page = last page" heuristic works.
+    PAGE_SIZE = 20
+    MAX_WORKERS = 8  # empirically optimal — more workers get rate-limited by the server
+
+    def __init__(self, base_url: str, api_key: str):
+        if not api_key:
+            raise ValueError("CRSTL_API_KEY is required")
         self.base_url = base_url.rstrip("/")
-        self.email = email
-        self.password = password
-        self.org_id = org_id
-        self.token_cache_path = pathlib.Path(token_cache_path)
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.headers.update({"x-crstl-api-key": api_key, "Accept": "application/json"})
+        adapter = HTTPAdapter(pool_connections=self.MAX_WORKERS, pool_maxsize=self.MAX_WORKERS)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
-    # ------------------------------------------------------------------
-    # Auth
-    # ------------------------------------------------------------------
-
-    def get_access_token(self) -> str:
-        tokens = self._load_cached_tokens()
-        if self._token_is_valid(tokens):
-            return tokens["access_token"]
-
-        if tokens.get("refresh_token"):
-            refreshed = self._refresh(tokens["refresh_token"])
-            if refreshed:
-                return refreshed
-
-        return self._login()
-
-    def _load_cached_tokens(self) -> dict:
-        if self.token_cache_path.exists():
-            try:
-                return json.loads(self.token_cache_path.read_text())
-            except Exception:
-                pass
-        return {}
-
-    def _save_tokens(self, tokens: dict) -> None:
-        self.token_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.token_cache_path, "w", opener=lambda p, f: os.open(p, f, 0o600)) as fh:
-            fh.write(json.dumps(tokens, indent=2))
-
-    def _token_is_valid(self, tokens: dict) -> bool:
-        expires_at = tokens.get("access_token_expires_at")
-        if not expires_at or not tokens.get("access_token"):
-            return False
-        try:
-            exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            return exp > datetime.now(timezone.utc)
-        except Exception:
-            return False
-
-    def _refresh(self, refresh_token: str) -> str | None:
-        resp = requests.post(
-            f"{self.base_url}/auth/refresh",
-            json={"refresh_token": refresh_token},
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            tokens = resp.json()
-            self._save_tokens(tokens)
-            return tokens["access_token"]
-        # Clear stale cache so next call goes straight to login
-        self._save_tokens({})
-        return None
-
-    def _login(self) -> str:
-        payload = {"email": self.email, "password": self.password}
-        if self.org_id:
-            payload["organization_id"] = self.org_id
-        resp = requests.post(f"{self.base_url}/auth/token", json=payload, timeout=30)
+    def ping(self) -> dict:
+        resp = self.session.get(f"{self.base_url}/ping", timeout=15)
         resp.raise_for_status()
-        tokens = resp.json()
-        self._save_tokens(tokens)
-        return tokens["access_token"]
-
-    # ------------------------------------------------------------------
-    # Fetch
-    # ------------------------------------------------------------------
+        return resp.json()
 
     def fetch_invoices(self) -> list[dict]:
-        token = self.get_access_token()
-        transactions = self._fetch_all_transactions(token)
+        transactions = self._fetch_all_transactions()
+        tx_ids = [tx.get("id") or tx.get("transaction_id") for tx in transactions]
+        tx_ids = [tid for tid in tx_ids if tid]
         invoices = []
-        for tx in transactions:
-            tx_id = tx.get("id") or tx.get("transaction_id")
-            if not tx_id:
-                continue
-            try:
-                detail = self._fetch_transaction_detail(tx_id, token)
-                invoices.append(self._extract_invoice_fields(detail))
-            except requests.exceptions.HTTPError as exc:
-                print(f"  WARNING: failed to fetch detail for {tx_id}: {exc}")
+        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as pool:
+            futures = {pool.submit(self._fetch_transaction_detail, tid): tid for tid in tx_ids}
+            for future in as_completed(futures):
+                tid = futures[future]
+                try:
+                    invoices.append(self._extract_invoice_fields(future.result()))
+                except requests.exceptions.HTTPError as exc:
+                    print(f"  WARNING: failed to fetch detail for {tid}: {exc}")
         return invoices
 
     def fetch_po_provinces(self) -> dict[str, dict]:
@@ -102,74 +48,68 @@ class CrstlClient:
         store is set for wholesale orders (identified by ship-to name containing VAUGHAN or CALGARY).
         province is the 2-letter Canadian province code from the ship-to address.
         """
-        token = self.get_access_token()
-        pos = self._fetch_all_transactions(token, transaction_type="850")
+        pos = self._fetch_all_transactions(transaction_type="850")
+        # (po_id, po_number) pairs — skip anything missing either
+        to_fetch = [
+            (po.get("id") or po.get("metadata", {}).get("id"),
+             str(po.get("reference_id") or po.get("metadata", {}).get("reference_id") or ""))
+            for po in pos
+        ]
+        to_fetch = [(pid, pnum) for pid, pnum in to_fetch if pid and pnum]
+
         result = {}
-        for po in pos:
-            po_id = po.get("id") or po.get("transaction_id")
-            po_number = str(po.get("reference_id") or "")
-            if not po_id or not po_number:
-                continue
-            try:
-                detail = self._fetch_transaction_detail(po_id, token)
-                tx_data = detail.get("transaction_data") or detail.get("document_data") or {}
+        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as pool:
+            futures = {pool.submit(self._fetch_transaction_detail, pid): (pid, pnum) for pid, pnum in to_fetch}
+            for future in as_completed(futures):
+                pid, pnum = futures[future]
+                try:
+                    detail = future.result()
+                    ship_to = (
+                        detail.get("file", {})
+                              .get("generic_json_edi", {})
+                              .get("heading", {})
+                              .get("ship_to", {})
+                    )
+                    province = str(ship_to.get("state_province") or "").upper().strip()
+                    if not province:
+                        continue
 
-                province = str(
-                    tx_data.get("ship_to_party_state") or
-                    tx_data.get("ship_to_state") or
-                    detail.get("ship_to_state") or ""
-                ).upper().strip()
+                    ship_to_name = str(ship_to.get("name") or "").upper()
+                    store = None
+                    if "VAUGHAN" in ship_to_name:
+                        store = "VAUGHAN"
+                    elif "CALGARY" in ship_to_name:
+                        store = "CALGARY"
 
-                ship_to_name = str(
-                    tx_data.get("ship_to_party_name") or
-                    tx_data.get("ship_to_name") or
-                    detail.get("ship_to_name") or ""
-                ).upper()
-
-                if not province:
-                    continue
-
-                store = None
-                if "VAUGHAN" in ship_to_name:
-                    store = "VAUGHAN"
-                elif "CALGARY" in ship_to_name:
-                    store = "CALGARY"
-
-                result[po_number] = {"province": province, "store": store}
-            except Exception as exc:
-                # Broad catch intentional: detail fetches can fail for structural reasons
-                # (malformed JSON, unexpected schema) beyond HTTP errors. Best-effort bulk fetch
-                # should skip bad records rather than abort the whole job.
-                print(f"WARNING: failed to fetch 850 detail for {po_number}: {exc}")
+                    result[pnum] = {"province": province, "store": store}
+                except Exception as exc:
+                    # Broad catch intentional: detail fetches can fail for structural reasons
+                    # (malformed JSON, unexpected schema) beyond HTTP errors. Best-effort bulk fetch
+                    # should skip bad records rather than abort the whole job.
+                    print(f"WARNING: failed to fetch 850 detail for {pnum}: {exc}")
         return result
 
-    def _fetch_all_transactions(self, token: str, transaction_type: str = "810") -> list:
+    def _fetch_all_transactions(self, transaction_type: str = "810") -> list:
         results = []
-        params = {"transaction_type": transaction_type, "limit": 100}
-        cursor = None
+        offset = 0
         while True:
-            if cursor:
-                params["cursor"] = cursor
-            resp = requests.get(
+            resp = self.session.get(
                 f"{self.base_url}/transaction",
-                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-                params=params,
+                params={"transaction_type": transaction_type, "limit": self.PAGE_SIZE, "offset": offset},
                 timeout=30,
             )
             resp.raise_for_status()
-            data = resp.json()
-            inner = data.get("data", data)
-            records = inner.get("transactions") or inner.get("results") or inner.get("items") or []
+            inner = resp.json().get("data", {})
+            records = inner.get("transactions") or []
             results.extend(records)
-            cursor = inner.get("next_cursor")
-            if not cursor or len(records) < 100:
+            if len(records) < self.PAGE_SIZE:
                 break
+            offset += self.PAGE_SIZE
         return results
 
-    def _fetch_transaction_detail(self, transaction_id: str, token: str) -> dict:
-        resp = requests.get(
+    def _fetch_transaction_detail(self, transaction_id: str) -> dict:
+        resp = self.session.get(
             f"{self.base_url}/transaction/{transaction_id}",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
             timeout=30,
         )
         resp.raise_for_status()
@@ -177,45 +117,87 @@ class CrstlClient:
         return data.get("data", data)
 
     def _extract_invoice_fields(self, detail: dict) -> dict:
-        tx_data = detail.get("transaction_data") or detail.get("document_data") or {}
+        """
+        Extract invoice fields from the v2 detail response.
+        Response shape: {metadata: {...}, file: {generic_json_edi: {heading, detail, summary}}}
+        """
+        meta = detail.get("metadata", {})
+        gje = detail.get("file", {}).get("generic_json_edi", {})
+        heading = gje.get("heading", {})
+        summary = gje.get("summary", {})
+        detail_body = gje.get("detail", {})
 
-        def first(*keys):
-            for k in keys:
-                for src in (tx_data, detail):
-                    v = src.get(k)
-                    if v is not None and v != "":
-                        return v
-            return None
+        raw_lines = detail_body.get("baseline_item_data_invoice_loop", []) or []
+        lines = []
+        subtotal = 0.0
+        for entry in raw_lines:
+            item = entry.get("baseline_item_data_invoice", {}) or {}
+            qty = self._parse_float(item.get("quantity_invoiced"))
+            unit_price = self._parse_float(item.get("unit_price"))
+            amount = round(qty * unit_price, 2)
+            subtotal += amount
+            lines.append({
+                "description": item.get("vendors_part_number") or f"Line {item.get('line_item_number', '')}",
+                "quantity": qty,
+                "unit_price": unit_price,
+                "line_amount": amount,
+                "uom": item.get("quantity_unit_code") or "EA",
+            })
 
-        total_amount = self._parse_float(first("total_amount", "invoice_amount", "amount"))
-
-        lines = tx_data.get("invoice_lines") or tx_data.get("line_items") or []
-        subtotal = sum(
-            self._parse_float(line.get("line_amount") or line.get("amount") or line.get("extended_amount"))
-            for line in lines
+        # metadata.value is Crstl's canonical total; fall back to summary if absent
+        total_amount = self._parse_float(
+            meta.get("value") or summary.get("total_monetary_value_summary", {}).get("total_amount")
         )
 
-        tax_raw = first("tax_amount", "tax_total", "total_tax")
-        tax_amount = self._parse_float(tax_raw)
+        # Summary-level allowances (indicator "A", reduces net) and charges (indicator "C", adds to net).
+        # EDI 810 does not carry a tax segment for HD Canada; tax is derived:
+        #   net_before_tax = subtotal - allowances + charges
+        #   tax_amount     = total - net_before_tax
+        allowance_amount = 0.0
+        charge_amount = 0.0
+        allowances_charges = []
+        for entry in summary.get("service_promotion_allowance_or_charge_information_loop", []) or []:
+            saci = entry.get("service_promotion_allowance_or_charge_information", {}) or {}
+            amt = self._parse_float(saci.get("amount"))
+            indicator = saci.get("allowance_or_charge_indicator")
+            code = saci.get("service_promotion_allowance_or_charge_code") or ""
+            if indicator == "A":
+                allowance_amount += amt
+            elif indicator == "C":
+                charge_amount += amt
+            allowances_charges.append({
+                "type": "Allowance" if indicator == "A" else "Charge" if indicator == "C" else indicator,
+                "code": code,
+                "amount": round(amt, 2),
+            })
 
-        if tax_amount == 0.0 and subtotal > 0.0 and total_amount > subtotal:
-            tax_amount = round(total_amount - subtotal, 2)
         if subtotal == 0.0:
-            subtotal = round(total_amount - tax_amount, 2)
+            subtotal = total_amount
+
+        net_before_tax = subtotal - allowance_amount + charge_amount
+        tax_amount = max(0.0, round(total_amount - net_before_tax, 2))
+
+        state = meta.get("state") or {}
+        status = state.get("value") if isinstance(state, dict) else state
 
         return {
-            "transaction_id":  str(detail.get("id") or detail.get("transaction_id") or ""),
-            "invoice_number":  str(first("invoice_number", "document_number", "number") or ""),
-            "po_number":       str(detail.get("reference_id") or first("purchase_order_number", "po_number") or ""),
-            "trading_partner": str(detail.get("trading_partner_name") or first("trading_partner", "retailer") or ""),
-            "invoice_date":    str(first("invoice_date", "issue_date", "date") or ""),
-            "due_date":        str(first("due_date", "payment_due_date") or ""),
-            "status":          str(detail.get("state") or detail.get("status") or first("status") or ""),
+            "transaction_id":  str(meta.get("id") or detail.get("id") or ""),
+            "source_document_id":   str(meta.get("source_document_id") or ""),
+            "source_document_type": str(meta.get("source_document_type") or ""),
+            "invoice_number":  str(meta.get("reference_id") or heading.get("invoice_number") or ""),
+            "po_number":       str(meta.get("source_document_reference_id") or heading.get("purchase_order_number") or ""),
+            "trading_partner": str(meta.get("trading_partner_name") or ""),
+            "invoice_date":    str(heading.get("invoice_date") or ""),
+            "due_date":        str(heading.get("terms_net_due_date") or ""),
+            "status":          str(status or ""),
             "subtotal":        round(subtotal, 2),
+            "allowance_amount": round(allowance_amount, 2),
+            "charge_amount":   round(charge_amount, 2),
+            "allowances_charges": allowances_charges,
             "tax_amount":      round(tax_amount, 2),
             "total_amount":    round(total_amount, 2),
-            "currency":        str(first("currency", "currency_code") or "USD"),
-            "created_at":      str(detail.get("created_at") or ""),
+            "currency":        str(heading.get("currency", {}).get("currency_code") if isinstance(heading.get("currency"), dict) else heading.get("currency") or "CAD"),
+            "created_at":      str(meta.get("created_at") or ""),
             "invoice_lines":   lines,
         }
 

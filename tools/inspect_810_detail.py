@@ -19,13 +19,10 @@ load_env()
 
 client = CrstlClient(
     base_url=os.environ.get("CRSTL_BASE_URL", "https://api.crstl.ai/v2"),
-    email=os.environ.get("CRSTL_EMAIL", ""),
-    password=os.environ.get("CRSTL_PASSWORD", ""),
-    org_id=os.environ.get("CRSTL_ORG_ID", ""),
+    api_key=os.environ.get("CRSTL_API_KEY", ""),
 )
 
-token = client.get_access_token()
-transactions = client._fetch_all_transactions(token)
+transactions = client._fetch_all_transactions()
 
 if not transactions:
     print("No 810 transactions found.")
@@ -33,7 +30,7 @@ if not transactions:
 
 print(f"Found {len(transactions)} transactions. Fetching detail for first one...\n")
 tx_id = transactions[0].get("id") or transactions[0].get("transaction_id")
-detail = client._fetch_transaction_detail(tx_id, token)
+detail = client._fetch_transaction_detail(tx_id)
 
 print("=== RAW DETAIL (top-level keys) ===")
 for k, v in detail.items():

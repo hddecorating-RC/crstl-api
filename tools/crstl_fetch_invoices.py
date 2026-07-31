@@ -8,7 +8,7 @@ Usage:
     python tools/crstl_fetch_invoices.py
 
 Prerequisites:
-    - Set CRSTL_EMAIL, CRSTL_PASSWORD, CRSTL_ORG_ID, CRSTL_BASE_URL in .env
+    - Set CRSTL_API_KEY and CRSTL_BASE_URL in .env
 
 Output:
     .tmp/invoices_raw.json  — list of normalized invoice dicts
@@ -41,92 +41,21 @@ def load_env(path=".env"):
 
 load_env()
 
-EMAIL      = os.environ.get("CRSTL_EMAIL", "")
-PASSWORD   = os.environ.get("CRSTL_PASSWORD", "")
-ORG_ID     = os.environ.get("CRSTL_ORG_ID", "")
+API_KEY    = os.environ.get("CRSTL_API_KEY", "")
 BASE_URL   = os.environ.get("CRSTL_BASE_URL", "https://api.crstl.ai/v2").rstrip("/")
 PAGE_SIZE  = int(os.environ.get("CRSTL_PAGE_SIZE", "100"))
 
-TOKEN_CACHE = pathlib.Path(".tmp/crstl_tokens.json")
 OUTPUT_PATH = pathlib.Path(".tmp/invoices_raw.json")
-
-
-# ---------------------------------------------------------------------------
-# Auth
-# ---------------------------------------------------------------------------
-
-def load_cached_tokens():
-    if TOKEN_CACHE.exists():
-        try:
-            return json.loads(TOKEN_CACHE.read_text())
-        except Exception:
-            pass
-    return {}
-
-
-def save_tokens(tokens):
-    TOKEN_CACHE.parent.mkdir(exist_ok=True)
-    TOKEN_CACHE.write_text(json.dumps(tokens, indent=2))
-
-
-def token_is_valid(tokens):
-    expires_at = tokens.get("access_token_expires_at")
-    if not expires_at or not tokens.get("access_token"):
-        return False
-    try:
-        exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-        # treat as expired 60s early to avoid edge cases
-        return exp > datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    except Exception:
-        return False
-
-
-def get_access_token():
-    tokens = load_cached_tokens()
-
-    if token_is_valid(tokens):
-        return tokens["access_token"]
-
-    # Try refresh first
-    if tokens.get("refresh_token"):
-        print("  Refreshing access token...")
-        resp = requests.post(
-            f"{BASE_URL}/auth/refresh",
-            json={"refresh_token": tokens["refresh_token"]},
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            new_tokens = resp.json()
-            save_tokens(new_tokens)
-            return new_tokens["access_token"]
-        else:
-            print(f"  Refresh failed ({resp.status_code}), re-authenticating...")
-
-    # Full login
-    print("  Authenticating with email/password...")
-    payload = {"email": EMAIL, "password": PASSWORD}
-    if ORG_ID:
-        payload["organization_id"] = ORG_ID
-
-    resp = requests.post(f"{BASE_URL}/auth/token", json=payload, timeout=30)
-    if resp.status_code != 200:
-        print(f"  ERROR: Auth failed ({resp.status_code}): {resp.text[:300]}")
-        sys.exit(1)
-
-    tokens = resp.json()
-    save_tokens(tokens)
-    print(f"  Authenticated. Token expires: {tokens.get('access_token_expires_at')}")
-    return tokens["access_token"]
 
 
 # ---------------------------------------------------------------------------
 # HTTP client
 # ---------------------------------------------------------------------------
 
-def api_get(path, params=None, token=None):
+def api_get(path, params=None):
     resp = requests.get(
         BASE_URL + path,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        headers={"x-crstl-api-key": API_KEY, "Accept": "application/json"},
         params=params,
         timeout=30,
     )
@@ -134,7 +63,7 @@ def api_get(path, params=None, token=None):
     return resp.json()
 
 
-def fetch_all_transactions(token, transaction_type="810"):
+def fetch_all_transactions(transaction_type="810"):
     """Paginate through all transactions of a given EDI type."""
     results = []
     params = {
@@ -147,7 +76,7 @@ def fetch_all_transactions(token, transaction_type="810"):
         if cursor:
             params["cursor"] = cursor
 
-        data = api_get("/transaction", params=params, token=token)
+        data = api_get("/transaction", params=params)
 
         # Unwrap envelope: {status, code, data: {count, transactions: [...]}}
         inner = data.get("data", data)
@@ -166,9 +95,9 @@ def fetch_all_transactions(token, transaction_type="810"):
     return results
 
 
-def fetch_transaction_detail(transaction_id, token):
+def fetch_transaction_detail(transaction_id):
     """Fetch full EDI document detail for a single transaction."""
-    data = api_get(f"/transaction/{transaction_id}", token=token)
+    data = api_get(f"/transaction/{transaction_id}")
     return data.get("data", data)
 
 
@@ -241,27 +170,23 @@ def extract_invoice_fields(detail):
 # ---------------------------------------------------------------------------
 
 def main():
-    missing = [k for k, v in [("CRSTL_EMAIL", EMAIL), ("CRSTL_PASSWORD", PASSWORD)] if not v]
-    if missing:
-        print(f"ERROR: Missing required env vars: {', '.join(missing)}")
-        print("Add them to .env and retry.")
+    if not API_KEY:
+        print("ERROR: Missing required env var: CRSTL_API_KEY")
+        print("Create a key at https://omnicrstl.web.app/api-keys and add to .env.")
         sys.exit(1)
 
     print(f"Base URL: {BASE_URL}")
     print()
 
-    print("Step 1: Authenticating...")
-    token = get_access_token()
-
-    print("\nStep 2: Fetching EDI 810 invoice transactions...")
-    transactions = fetch_all_transactions(token, transaction_type="810")
+    print("Step 1: Fetching EDI 810 invoice transactions...")
+    transactions = fetch_all_transactions(transaction_type="810")
     print(f"  Found {len(transactions)} invoice transactions")
 
     if not transactions:
-        print("No invoice transactions found. Check your credentials and org ID.")
+        print("No invoice transactions found. Check your API key scope.")
         sys.exit(0)
 
-    print("\nStep 3: Fetching full details per invoice...")
+    print("\nStep 2: Fetching full details per invoice...")
     invoices = []
     for i, tx in enumerate(transactions, 1):
         tx_id = tx.get("id") or tx.get("transaction_id")
@@ -271,7 +196,7 @@ def main():
 
         print(f"  [{i}/{len(transactions)}] {tx_id}  ref={tx.get('reference_id', '')}", end="  ")
         try:
-            detail = fetch_transaction_detail(tx_id, token)
+            detail = fetch_transaction_detail(tx_id)
             invoice = extract_invoice_fields(detail)
             invoices.append(invoice)
             print(f"total={invoice['total_amount']}  status={invoice['status']}")

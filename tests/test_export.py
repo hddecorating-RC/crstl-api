@@ -70,3 +70,47 @@ def test_build_csv_empty():
     reader = csv.reader(io.StringIO(result.decode("utf-8")))
     rows = list(reader)
     assert len(rows) == 1  # header only
+
+
+def test_build_csv_emits_per_code_columns():
+    invoices = [
+        {
+            "invoice_number": "INV1",
+            "province": "ON",
+            "subtotal": 48.0, "allowance_amount": 0.6, "charge_amount": 0.0,
+            "tax_amount": 6.16, "total_amount": 53.56,
+            "allowances_charges": [
+                {"type": "Allowance", "code": "C300", "amount": 0.60},
+            ],
+        },
+        {
+            "invoice_number": "INV2",
+            "province": "AB",
+            "subtotal": 10273.56, "allowance_amount": 590.73, "charge_amount": 484.14,
+            "tax_amount": 0.0, "total_amount": 10166.97,
+            "allowances_charges": [
+                {"type": "Allowance", "code": "E210", "amount": 359.57},
+                {"type": "Allowance", "code": "H090", "amount": 102.74},
+                {"type": "Allowance", "code": "H000", "amount": 128.42},
+                {"type": "Charge",    "code": "D360", "amount": 484.14},
+            ],
+        },
+    ]
+    rows = list(csv.DictReader(io.StringIO(build_csv(invoices).decode("utf-8"))))
+
+    # Union of codes present as columns, sorted alpha (no duplicates even if a
+    # code shows up as both allowance and charge across different invoices)
+    header_codes = [k for k in rows[0].keys() if k.startswith("Code ")]
+    assert header_codes == ["Code C300", "Code D360", "Code E210", "Code H000", "Code H090"]
+
+    # Row 1: only C300 has a value (negative), other code cells blank
+    assert rows[0]["Code C300"] == "-0.6"
+    assert rows[0]["Code E210"] == ""
+    assert rows[0]["Code D360"] == ""
+
+    # Row 2: allowances negative, charge positive
+    assert rows[1]["Code E210"] == "-359.57"
+    assert rows[1]["Code H090"] == "-102.74"
+    assert rows[1]["Code H000"] == "-128.42"
+    assert rows[1]["Code D360"] == "484.14"
+    assert rows[1]["Code C300"] == ""
