@@ -1,0 +1,30 @@
+[Unit]
+Description=CRSTL Invoice Dashboard (FastAPI + APScheduler)
+Documentation=https://github.com/hddecorating-RC/crstl-api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crstl
+Group=crstl
+WorkingDirectory=/opt/crstl-api
+EnvironmentFile=/opt/crstl-api/.env
+# APScheduler cron jobs run in this TZ (07:00 refresh, 07:15 digest, 04:00 NetSuite CSV).
+# Set here rather than relying on /etc/timezone so the service is self-contained.
+Environment="TZ=America/Toronto"
+ExecStart=/opt/crstl-api/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening — safe for a Python web service that only writes to .tmp/
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/crstl-api/.tmp
+
+[Install]
+WantedBy=multi-user.target

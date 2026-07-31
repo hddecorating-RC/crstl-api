@@ -1,72 +1,106 @@
-# Deploying to the in-office Docker host
+# Deploying to a Proxmox LXC container
 
-## Prereqs on the host
-- Docker Engine ≥ 24 and the Compose plugin (`docker compose version`)
-- Git (to clone the repo, or scp the source over)
-- Outbound HTTPS to `api.crstl.so`, `graph.microsoft.com`, and `login.microsoftonline.com`
+Native install with systemd. Simpler than Docker-in-LXC (no nesting=1
+requirement, no cgroup quirks, `journalctl` gives you logs directly).
 
-## First deploy
+## LXC provisioning (in Proxmox)
+
+Create an **unprivileged** LXC container:
+- Template: Debian 12 or Ubuntu 24.04 (both ship Python 3.12)
+- Resources: 1 vCPU, 512MB RAM, 2GB disk — plenty
+- Network: static IP on the office LAN, bridge to your LAN vmbr
+- Features: nesting off (not needed), keyctl off, fuse off
+- Start on boot: yes
+
+## Inside the LXC
 
 ```bash
+# 1. System packages
+apt update
+apt install -y python3 python3-venv git curl
+
+# 2. Dedicated system user (no login shell, no home)
+useradd --system --shell /usr/sbin/nologin --home-dir /opt/crstl-api crstl
+
+# 3. Clone into /opt/crstl-api (readable by root, owned by crstl for writes)
+cd /opt
 git clone https://github.com/hddecorating-RC/crstl-api.git
+chown -R crstl:crstl /opt/crstl-api
 cd crstl-api
 
-# Create .env from the template and fill in real values (do not commit)
+# 4. Python virtualenv
+sudo -u crstl python3 -m venv .venv
+sudo -u crstl .venv/bin/pip install -r requirements.txt
+
+# 5. Populate .env from the template
 cp .env.example .env
-$EDITOR .env
+chmod 600 .env
+chown crstl:crstl .env
+$EDITOR .env   # fill in CRSTL_API_KEY, GRAPH_*, MAIL_SENDER, MAIL_RECIPIENTS
 
-# Build the image and start the container in the background
-docker compose up -d --build
+# 6. Install the systemd unit and start
+cp deploy/crstl-api.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now crstl-api
 
-# Watch the logs — initial Crstl sync takes ~15–20s
-docker compose logs -f
+# 7. Verify
+systemctl status crstl-api
+journalctl -u crstl-api -f            # follow logs; initial Crstl sync takes ~15s
+curl http://127.0.0.1:8000/api/health
 ```
 
-Open http://<host-ip>:8000 in a browser to verify the dashboard loads.
+Open `http://<lxc-ip>:8000` from any LAN machine to load the dashboard.
 
-## What persists across restarts
+## What persists
 
-Everything in `.tmp/` (bind-mounted from the host):
+Everything the app writes lives under `/opt/crstl-api/.tmp/`:
 - `tracking.db` — emailed/exported/netsuite event history (drives digest dedup)
-- Daily generated NetSuite CSVs
+- Daily NetSuite CSVs (`netsuite_export_<date>.csv`)
 
-If you rebuild the image (`docker compose up -d --build`), state survives.
+The LXC's disk holds this — take a Proxmox snapshot before major changes.
 
-## Updating to a new version
-
-```bash
-cd /path/to/crstl-api
-git pull
-docker compose up -d --build
-```
-
-Compose rebuilds the image and restarts the container. Zero-downtime is out of scope; a brief interruption during restart is fine for a dashboard.
-
-## Timezone
-
-`docker-compose.yml` sets `TZ=America/Toronto` so APScheduler fires:
-- 04:00 — NetSuite CSV export
-- 07:00 — Crstl cache refresh
-- 07:15 — Daily accounting email digest
-
-## Health
+## Updating
 
 ```bash
-curl http://localhost:8000/api/health
-# {"status":"ok"}
-
-docker compose ps            # STATUS column shows "healthy" once probe passes
-docker inspect crstl-api --format='{{.State.Health.Status}}'
+cd /opt/crstl-api
+sudo -u crstl git pull
+sudo -u crstl .venv/bin/pip install -r requirements.txt   # if requirements.txt changed
+systemctl restart crstl-api
 ```
+
+## Backups
+
+The tracking DB is tiny (KB) but losing it means the next digest re-sends
+everything. Suggest a nightly cron on the LXC:
+
+```
+0 2 * * * cp /opt/crstl-api/.tmp/tracking.db /opt/crstl-api/.tmp/tracking.db.bak.$(date +\%F) && find /opt/crstl-api/.tmp/tracking.db.bak.* -mtime +14 -delete
+```
+
+Or rely on Proxmox scheduled snapshots of the LXC.
 
 ## Common problems
 
-**Container keeps restarting.** Check logs: `docker compose logs --tail=100`. Usually a bad `.env` — missing `CRSTL_API_KEY` or a Graph value.
+**`systemctl status` shows failed.** `journalctl -u crstl-api -n 50` — almost
+always a bad `.env` (missing `CRSTL_API_KEY`, misspelled `GRAPH_*`).
 
-**Digest emails not sending.** Curl the endpoint from inside the container to see the full error:
+**Digest emails not sending.** Curl the endpoint from inside the LXC:
 ```bash
-docker compose exec crstl-api curl -sS -X POST http://127.0.0.1:8000/api/email/send-digest
+curl -sS -X POST http://127.0.0.1:8000/api/email/send-digest
 ```
-`403 ErrorAccessDenied` = Application Access Policy blocked the sender (see main README).
+`403 ErrorAccessDenied` = Exchange Application Access Policy blocked the app.
 
-**Dashboard loads but shows "Never synced".** The initial sync happens at container startup and takes ~15s. Wait, refresh. If it stays "Never synced", check logs for auth errors against `api.crstl.so`.
+**Dashboard loads but "Never synced".** Initial sync happens at service start
+(~15s). If it stays stuck, check logs for auth errors against `api.crstl.so`.
+
+**Time zone drift.** The service file pins `TZ=America/Toronto`. Verify with
+`systemctl show crstl-api | grep TimezoneName` — should read `America/Toronto`.
+
+---
+
+## Docker fallback (kept, but not the primary path)
+
+`Dockerfile` and `docker-compose.yml` are in the repo if you ever want to
+run this as a container instead — `docker compose up -d --build`. Would
+require enabling `nesting=1` on the LXC config, which is why we don't
+default to it.
