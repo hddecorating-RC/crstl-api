@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from app.crstl import CrstlClient
 from app.export import build_csv
 from app import tracking
+from app.mail import send_mail, MailConfigError
 from app.netsuite import transform_invoice
 from app.netsuite_csv import build_netsuite_csv
 
@@ -37,6 +38,8 @@ _cache: dict = {"invoices": [], "last_synced": None, "status": "never"}
 _cache_lock = threading.Lock()
 _netsuite_state: dict = {"last_generated": None, "path": None, "count": 0, "skipped": 0, "error": None, "generating": False}
 _netsuite_lock = threading.Lock()
+_digest_state: dict = {"last_sent": None, "count": 0, "error": None, "sending": False}
+_digest_lock = threading.Lock()
 
 
 def _build_mock_po_provinces() -> dict[str, dict]:
@@ -166,11 +169,11 @@ def _generate_netsuite_export() -> None:
 
     records, skipped = [], []
     for inv in invoices:
-        record = transform_invoice(inv, province=inv.get("province"), store=inv.get("store"))
-        if record is None:
+        line_items = transform_invoice(inv, province=inv.get("province"), store=inv.get("store"))
+        if line_items is None:
             skipped.append(inv.get("po_number", "?"))
         else:
-            records.append(record)
+            records.extend(line_items)
 
     if skipped:
         print(f"WARNING: NetSuite export skipped {len(skipped)} invoices (no province mapping): {skipped}")
@@ -190,13 +193,88 @@ def _generate_netsuite_export() -> None:
     print(f"NetSuite export: {len(records)} invoices → {out_path} ({len(skipped)} skipped)")
 
 
+def _send_daily_digest() -> dict:
+    """Send accounting a daily digest of invoices not yet emailed. Always sends,
+    even on zero new invoices — accounting uses receipt as proof the pipeline
+    is alive. Marks sent invoices with an 'emailed' tracking event so they
+    don't appear in future digests.
+
+    Returns a summary dict. Raises MailConfigError if env vars missing."""
+    recipients_raw = os.environ.get("MAIL_RECIPIENTS", "")
+    recipients = [r.strip() for r in recipients_raw.split(",") if r.strip()]
+    if not recipients:
+        raise MailConfigError("MAIL_RECIPIENTS not set (comma-separated addresses)")
+
+    with _cache_lock:
+        invoices = list(_cache["invoices"])
+    all_ids = [inv["transaction_id"] for inv in invoices]
+    new_ids = set(tracking.get_unemailed_ids(all_ids))
+    new_invoices = [inv for inv in invoices if inv["transaction_id"] in new_ids]
+
+    today = date.today().isoformat()
+    if new_invoices:
+        total = sum(inv.get("total_amount", 0) for inv in new_invoices)
+        by_province: dict[str, int] = {}
+        for inv in new_invoices:
+            p = inv.get("province") or "—"
+            by_province[p] = by_province.get(p, 0) + 1
+        prov_rows = "".join(f"<tr><td>{p}</td><td style='text-align:right'>{c}</td></tr>" for p, c in sorted(by_province.items()))
+        subject = f"HD Invoice Digest — {today} — {len(new_invoices)} new"
+        body_html = f"""
+            <p>{len(new_invoices)} new invoice(s) since the last digest.</p>
+            <p><strong>Total value:</strong> ${total:,.2f} CAD</p>
+            <table cellpadding="4" cellspacing="0" border="1" style="border-collapse:collapse">
+              <tr><th align="left">Province</th><th align="right">Count</th></tr>
+              {prov_rows}
+            </table>
+            <p>Full details attached as CSV.</p>
+        """
+        csv_bytes = build_csv(new_invoices)
+        attachments = [(f"hd_invoices_{today}.csv", csv_bytes, "text/csv")]
+    else:
+        subject = f"HD Invoice Digest — {today} — 0 new"
+        body_html = "<p>No new invoices since the last digest. Pipeline is healthy.</p>"
+        attachments = None
+
+    send_mail(subject=subject, body_html=body_html, recipients=recipients, attachments=attachments)
+
+    if new_invoices:
+        tracking.record_events([inv["transaction_id"] for inv in new_invoices], "emailed")
+
+    return {"sent_to": recipients, "count": len(new_invoices), "subject": subject}
+
+
+def _run_daily_digest_job() -> None:
+    """Scheduler entry point — wraps _send_daily_digest with state tracking."""
+    with _digest_lock:
+        if _digest_state.get("sending"):
+            print("Digest: already running, skipping")
+            return
+        _digest_state["sending"] = True
+    try:
+        result = _send_daily_digest()
+        with _digest_lock:
+            _digest_state["last_sent"] = datetime.now(timezone.utc).isoformat()
+            _digest_state["count"] = result["count"]
+            _digest_state["error"] = None
+        print(f"Digest: sent {result['count']} invoices to {result['sent_to']}")
+    except Exception as exc:
+        with _digest_lock:
+            _digest_state["error"] = str(exc)
+        print(f"WARNING: digest send failed: {exc}")
+    finally:
+        with _digest_lock:
+            _digest_state["sending"] = False
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     tracking.init_db()
     await asyncio.to_thread(_refresh_cache)
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(_refresh_cache, "cron", hour=7, minute=0)
+    scheduler.add_job(_refresh_cache, "cron", hour=7, minute=0, timezone="America/Toronto")
     scheduler.add_job(_generate_netsuite_export, "cron", hour=4, minute=0, timezone="America/Toronto")
+    scheduler.add_job(_run_daily_digest_job, "cron", hour=7, minute=15, timezone="America/Toronto")
     scheduler.start()
     yield
     scheduler.shutdown()
@@ -314,6 +392,24 @@ async def netsuite_export_generate() -> dict:
     path = state.get("path")
     state["available"] = bool(path and pathlib.Path(path).exists())
     return state
+
+
+@app.post("/api/email/send-digest")
+async def send_digest_now() -> JSONResponse:
+    """Manually trigger the digest email. Same behavior as the scheduled job."""
+    try:
+        result = await asyncio.to_thread(_send_daily_digest)
+    except MailConfigError as exc:
+        return JSONResponse(status_code=400, content={"message": str(exc)})
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"message": str(exc)})
+    return JSONResponse(result)
+
+
+@app.get("/api/email/status")
+def email_status() -> dict:
+    with _digest_lock:
+        return {**_digest_state}
 
 
 app.mount("/", StaticFiles(directory="app/static", html=True), name="static")

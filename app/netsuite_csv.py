@@ -9,6 +9,7 @@ COLUMNS = [
     "Memo",
     "PO Number",
     "Item",
+    "Description",
     "Quantity",
     "Rate",
     "Tax Code",
@@ -18,7 +19,11 @@ COLUMNS = [
 
 
 def build_netsuite_csv(records: list[dict]) -> bytes:
-    """Render NetSuite invoice import CSV from transformed records."""
+    """Render NetSuite invoice import CSV from transformed records.
+
+    Each record is one line item. Records sharing an `external_id` are treated
+    by NetSuite as lines on the same invoice.
+    """
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=COLUMNS)
     writer.writeheader()
@@ -31,6 +36,7 @@ def build_netsuite_csv(records: list[dict]) -> bytes:
             "Memo":        r["memo"],
             "PO Number":   r["other_ref_num"],
             "Item":        r["item"],
+            "Description": r.get("description", ""),
             "Quantity":    r["quantity"],
             "Rate":        r["rate"],
             "Tax Code":    r["tax_code"],

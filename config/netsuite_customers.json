@@ -26,5 +26,7 @@
     "SK": {"customer_id": "4149", "tax_code": "CA-GST 5%", "tax_rate": 0.05}
   },
   "item": "Merchandise Sales",
+  "allowance_item": "Allowance",
+  "charge_item": "Charge",
   "currency": "CAD"
 }
