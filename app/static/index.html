@@ -30,7 +30,7 @@
   <div class="px-6 py-5">
 
     <!-- Stat cards -->
-    <div class="grid grid-cols-5 gap-4 mb-5">
+    <div class="grid grid-cols-6 gap-4 mb-5">
       <div class="bg-white rounded-lg border border-gray-200 p-4 cursor-pointer hover:border-amber-400 transition"
            :class="activeFilter === 'Draft' ? 'ring-2 ring-amber-400' : ''"
            @click="activeFilter = activeFilter === 'Draft' ? 'All' : 'Draft'">
@@ -77,6 +77,27 @@
              class="text-xs bg-green-600 hover:bg-green-700 text-white font-medium px-2 py-1 rounded inline-block">
             ↓ Download
           </a>
+        </div>
+      </div>
+      <!-- Email Digest -->
+      <div class="bg-white rounded-lg border border-gray-200 p-4">
+        <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Email Digest</div>
+        <div class="text-sm font-semibold text-slate-800 mt-1"
+             x-text="digest.last_sent ? fmtTime(digest.last_sent) : '—'"></div>
+        <div class="text-xs text-gray-400 mt-1"
+             x-show="digest.last_sent"
+             x-text="digest.count + ' invoice' + (digest.count === 1 ? '' : 's')"></div>
+        <div class="text-xs text-red-500 mt-1 truncate"
+             x-show="digest.error"
+             :title="digest.error"
+             x-text="digest.error"></div>
+        <div class="flex gap-2 mt-2">
+          <button @click="sendDigest()" :disabled="sendingDigest"
+                  class="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 font-medium px-2 py-1 rounded disabled:opacity-50"
+                  title="Send digest email of any invoices not yet emailed">
+            <span x-show="!sendingDigest">✉ Send Now</span>
+            <span x-show="sendingDigest">Sending…</span>
+          </button>
         </div>
       </div>
     </div>
@@ -337,10 +358,13 @@ function dashboard() {
     syncStatus: 'never',
     netsuiteExport: { available: false, last_generated: null, count: 0, skipped: 0, error: null },
     generatingNetsuite: false,
+    digest: { last_sent: null, count: 0, error: null, sending: false },
+    sendingDigest: false,
 
     async init() {
       await this.loadInvoices();
       await this.loadNetsuiteStatus();
+      await this.loadDigestStatus();
       setInterval(() => this.loadInvoices(), 60000);
     },
 
@@ -378,6 +402,34 @@ function dashboard() {
         this.netsuiteExport = await res.json();
       } catch {
         this.netsuiteExport = { ...this.netsuiteExport, error: 'Status unavailable' };
+      }
+    },
+
+    async loadDigestStatus() {
+      try {
+        const res = await fetch('/api/email/status');
+        this.digest = await res.json();
+      } catch {
+        this.digest = { ...this.digest, error: 'Status unavailable' };
+      }
+    },
+
+    async sendDigest() {
+      this.sendingDigest = true;
+      try {
+        const res = await fetch('/api/email/send-digest', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) {
+          this.showToast('Digest failed: ' + (data.message || 'Unknown error'));
+        } else {
+          const label = data.count === 0 ? 'Sent (0 new invoices)' : `Sent ${data.count} invoice${data.count === 1 ? '' : 's'}`;
+          this.showToast(label);
+          await this.loadDigestStatus();
+        }
+      } catch {
+        this.showToast('Digest send failed');
+      } finally {
+        this.sendingDigest = false;
       }
     },
 

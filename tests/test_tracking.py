@@ -72,6 +72,27 @@ def test_get_unemailed_ids_empty(db_path):
     assert get_unemailed_ids([]) == []
 
 
+def test_latest_event_time_returns_none_when_no_events(db_path):
+    from app.tracking import latest_event_time
+    assert latest_event_time("emailed") is None
+
+
+def test_latest_event_time_returns_most_recent(db_path):
+    from app.tracking import latest_event_time
+    record_events(["tx-001"], "emailed")
+    first = latest_event_time("emailed")
+    record_events(["tx-002"], "emailed")
+    second = latest_event_time("emailed")
+    assert first is not None
+    assert second >= first
+
+
+def test_latest_event_time_rejects_unknown_type(db_path):
+    from app.tracking import latest_event_time
+    with pytest.raises(ValueError):
+        latest_event_time("shipped")
+
+
 def test_migrates_old_schema_with_check_constraint(tmp_path, monkeypatch):
     """A pre-existing DB with the old CHECK(event_type IN ('exported', 'netsuite'))
     constraint must be migrated so 'emailed' events can be written."""

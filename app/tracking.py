@@ -108,6 +108,24 @@ def get_latest_events(transaction_ids: list[str]) -> dict[str, dict]:
     return result
 
 
+def latest_event_time(event_type: str) -> str | None:
+    """Return the most recent occurred_at (ISO string) for a given event_type,
+    or None if the DB has no events of that type. Used to give the UI a sensible
+    'last sent' fallback after in-memory state is lost on restart."""
+    if event_type not in EVENT_TYPES:
+        raise ValueError(f"unknown event_type {event_type!r}; expected one of {EVENT_TYPES}")
+    try:
+        with contextlib.closing(_connect()) as conn:
+            row = conn.execute(
+                "SELECT MAX(occurred_at) FROM invoice_events WHERE event_type = ?",
+                (event_type,),
+            ).fetchone()
+        return row[0] if row else None
+    except Exception as exc:
+        print(f"WARNING: tracking read failed: {exc}")
+        return None
+
+
 def get_unemailed_ids(candidate_ids: list[str]) -> list[str]:
     """Return the subset of `candidate_ids` that have no 'emailed' event yet.
     Order is preserved from the input list."""

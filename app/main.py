@@ -409,7 +409,13 @@ async def send_digest_now() -> JSONResponse:
 @app.get("/api/email/status")
 def email_status() -> dict:
     with _digest_lock:
-        return {**_digest_state}
+        state = {**_digest_state}
+    # Fall back to the tracking DB after a restart wipes in-memory state.
+    # Only surfaces sends that actually marked invoices — a 0-count heartbeat
+    # right before restart won't be recoverable.
+    if state.get("last_sent") is None:
+        state["last_sent"] = tracking.latest_event_time("emailed")
+    return state
 
 
 app.mount("/", StaticFiles(directory="app/static", html=True), name="static")
