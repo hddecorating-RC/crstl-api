@@ -1,8 +1,35 @@
-.env
-.tmp
-__pycache__
+# Version control
+.git/
+.gitignore
+
+# Local dev / editor
+.claude/
+.vscode/
+.idea/
+*.swp
+
+# Python caches
+__pycache__/
 *.pyc
 *.pyo
-.pytest_cache
-*.egg-info
-.git
+*.pyd
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Runtime state — mounted as a volume in compose, must not be baked in
+.tmp/
+
+# Secrets — passed at runtime via env_file, must not be in the image
+.env
+
+# Tests / docs / analysis artifacts not needed at runtime
+tests/
+docs/
+workflows/
+tools/
+*.md
+*.pdf
+*.xlsx
+*.csv
+openapi.json

@@ -306,6 +306,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="HD Decorating Invoice Dashboard", lifespan=lifespan)
 
 
+@app.get("/api/health")
+def health() -> dict:
+    """Lightweight liveness probe for container orchestrators. Does not touch
+    the cache lock or the Crstl API."""
+    return {"status": "ok"}
+
+
 @app.get("/api/invoices")
 def get_invoices() -> dict:
     with _cache_lock:
