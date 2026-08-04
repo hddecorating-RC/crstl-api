@@ -80,12 +80,22 @@ chmod 600 .env
 chown crstl:crstl .env
 $EDITOR .env   # fill in CRSTL_API_KEY, GRAPH_*, MAIL_SENDER, MAIL_RECIPIENTS
 
-# 6. Install the systemd unit and start
+# 6. Create the writable state directory.
+#    The systemd unit hardens the filesystem with ProtectSystem=strict and
+#    ReadWritePaths=/opt/crstl-api/.tmp. That bind-mount is set up during
+#    namespace init — BEFORE any ExecStartPre — so the directory must exist
+#    on disk before `systemctl start`. Otherwise systemd errors with
+#    "Failed to set up mount namespacing: .../.tmp: No such file or directory"
+#    and the service restart-loops.
+mkdir -p .tmp
+chown crstl:crstl .tmp
+
+# 7. Install the systemd unit and start
 cp deploy/crstl-api.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now crstl-api
 
-# 7. Verify
+# 8. Verify
 systemctl status crstl-api
 journalctl -u crstl-api -f            # follow logs; initial Crstl sync takes ~15s
 curl http://127.0.0.1:8000/api/health
