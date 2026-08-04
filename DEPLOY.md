@@ -3,6 +3,44 @@
 Native install with systemd. Simpler than Docker-in-LXC (no nesting=1
 requirement, no cgroup quirks, `journalctl` gives you logs directly).
 
+## Network model — Tailscale
+
+The LXC is not exposed to the LAN or the public internet. Access is over
+Tailscale (WireGuard-based zero-trust overlay). This provides:
+
+- Device-level auth via your Tailscale SSO (Google/MS/GitHub)
+- End-to-end encryption (WireGuard) — better than most HTTP+basic-auth setups
+- MagicDNS: reach the LXC as `http://crstl-api:8000` from any tailnet device
+- Optional ACLs to restrict which users/groups can hit port 8000 (e.g., only
+  the `accounting` group)
+
+**Install Tailscale in the LXC** (after step 3 of the install below, before
+step 6):
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up --hostname=crstl-api --ssh
+```
+
+Approve the machine in your Tailscale admin console. Note the machine's
+100.x.y.z address; MagicDNS `crstl-api` should also resolve.
+
+**Optional ACL** in Tailscale admin (locks down who can reach port 8000):
+
+```json
+{
+  "acls": [
+    {"action": "accept", "src": ["group:accounting", "group:admin"], "dst": ["tag:crstl-api:8000"]}
+  ],
+  "tagOwners": {"tag:crstl-api": ["autogroup:admin"]}
+}
+```
+
+Then tag the LXC in the admin console (Machines → crstl-api → Edit tags →
+add `tag:crstl-api`).
+
+Without an ACL, every device on your tailnet can reach the dashboard.
+
 ## LXC provisioning (in Proxmox)
 
 Create an **unprivileged** LXC container:
@@ -32,7 +70,11 @@ cd crstl-api
 sudo -u crstl python3 -m venv .venv
 sudo -u crstl .venv/bin/pip install -r requirements.txt
 
-# 5. Populate .env from the template
+# 5. Populate .env from the template — REQUIRED before starting the service.
+#    systemd fails loudly with "Failed to load environment file" if .env
+#    is missing. All values below must be set to real production values;
+#    empty CRSTL_API_KEY or GRAPH_* results in every scheduled run erroring
+#    into the /api/health endpoint.
 cp .env.example .env
 chmod 600 .env
 chown crstl:crstl .env
@@ -47,7 +89,13 @@ systemctl enable --now crstl-api
 systemctl status crstl-api
 journalctl -u crstl-api -f            # follow logs; initial Crstl sync takes ~15s
 curl http://127.0.0.1:8000/api/health
+# {"status":"ok","tracking":{"ok":true,"last_error":null,"last_error_at":null}}
 ```
+
+The `/api/health` payload includes `tracking.ok`. If it flips to `false`,
+the SQLite write path is broken (permission, disk full, corruption). Digest
+emails still send but won't be marked → the next digest re-sends them. Fix
+this before accounting notices duplicate emails.
 
 Open `http://<lxc-ip>:8000` from any LAN machine to load the dashboard.
 

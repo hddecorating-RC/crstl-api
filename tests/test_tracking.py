@@ -1,5 +1,16 @@
 import pytest
 from app.tracking import record_events, get_latest_events, init_db
+from app import tracking
+
+
+@pytest.fixture(autouse=True)
+def _reset_write_error_state():
+    """Module-level _last_write_error persists across tests; wipe it between runs."""
+    tracking._last_write_error = None
+    tracking._last_write_error_at = None
+    yield
+    tracking._last_write_error = None
+    tracking._last_write_error_at = None
 
 
 @pytest.fixture
@@ -91,6 +102,43 @@ def test_latest_event_time_rejects_unknown_type(db_path):
     from app.tracking import latest_event_time
     with pytest.raises(ValueError):
         latest_event_time("shipped")
+
+
+def test_write_health_clean_when_no_failure(db_path):
+    from app.tracking import write_health
+    record_events(["tx-001"], "emailed")
+    h = write_health()
+    assert h["ok"] is True
+    assert h["last_error"] is None
+    assert h["last_error_at"] is None
+
+
+def test_write_health_captures_failure_and_clears_on_recovery(db_path, monkeypatch):
+    """If the DB is unwritable, health reports the error. A subsequent successful
+    write clears it. Callers of record_events never see the exception — the
+    behavior is best-effort by design so CSV downloads and email sends aren't
+    aborted by a tracking hiccup."""
+    from app.tracking import write_health
+
+    # Simulate a write failure by patching _connect to raise.
+    def broken_connect():
+        raise sqlite3.OperationalError("disk I/O error")
+    import sqlite3
+    monkeypatch.setattr(tracking, "_connect", broken_connect)
+
+    record_events(["tx-001"], "emailed")  # must not raise
+    h = write_health()
+    assert h["ok"] is False
+    assert "disk I/O error" in h["last_error"]
+    assert h["last_error"].startswith("emailed:")
+    assert h["last_error_at"] is not None
+
+    # Recovery — undo the monkeypatch and write again
+    monkeypatch.undo()
+    record_events(["tx-002"], "emailed")
+    h = write_health()
+    assert h["ok"] is True
+    assert h["last_error"] is None
 
 
 def test_migrates_old_schema_with_check_constraint(tmp_path, monkeypatch):

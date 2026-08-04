@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import html
 import os
 import pathlib
 import threading
@@ -233,7 +234,13 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
         for inv in to_send:
             p = inv.get("province") or "—"
             by_province[p] = by_province.get(p, 0) + 1
-        prov_rows = "".join(f"<tr><td>{p}</td><td style='text-align:right'>{c}</td></tr>" for p, c in sorted(by_province.items()))
+        # HTML-escape every interpolated value — province today is a 2-letter code from Crstl
+        # so exploitability is nil, but Crstl-controlled strings drifting into email HTML is
+        # the exact class of injection that becomes a real bug the day they add a description field.
+        prov_rows = "".join(
+            f"<tr><td>{html.escape(p)}</td><td style='text-align:right'>{c}</td></tr>"
+            for p, c in sorted(by_province.items())
+        )
 
         if mode == "selection":
             subject = f"HD Invoices — {today} — {len(to_send)} selected"
@@ -294,10 +301,19 @@ def _run_daily_digest_job() -> None:
 async def lifespan(app: FastAPI):
     tracking.init_db()
     await asyncio.to_thread(_refresh_cache)
+    # misfire_grace_time=3600 lets a job run up to 1 hour late if the host was
+    # paused or the scheduler was down at fire time (LXC snapshots, restarts).
+    # Without this, a missed 07:00 refresh silently vanishes until the next day.
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(_refresh_cache, "cron", hour=7, minute=0, timezone="America/Toronto")
-    scheduler.add_job(_generate_netsuite_export, "cron", hour=4, minute=0, timezone="America/Toronto")
-    scheduler.add_job(_run_daily_digest_job, "cron", hour=7, minute=15, timezone="America/Toronto")
+    scheduler.add_job(_refresh_cache, "cron", id="daily_refresh",
+                      hour=7, minute=0, timezone="America/Toronto",
+                      misfire_grace_time=3600, coalesce=True)
+    scheduler.add_job(_generate_netsuite_export, "cron", id="netsuite_export",
+                      hour=4, minute=0, timezone="America/Toronto",
+                      misfire_grace_time=3600, coalesce=True)
+    scheduler.add_job(_run_daily_digest_job, "cron", id="daily_digest",
+                      hour=7, minute=15, timezone="America/Toronto",
+                      misfire_grace_time=3600, coalesce=True)
     scheduler.start()
     yield
     scheduler.shutdown()
@@ -309,8 +325,9 @@ app = FastAPI(title="HD Decorating Invoice Dashboard", lifespan=lifespan)
 @app.get("/api/health")
 def health() -> dict:
     """Lightweight liveness probe for container orchestrators. Does not touch
-    the cache lock or the Crstl API."""
-    return {"status": "ok"}
+    the cache lock or the Crstl API. Includes tracking-DB write health so
+    persistence failures surface before they produce duplicate digest emails."""
+    return {"status": "ok", "tracking": tracking.write_health()}
 
 
 @app.get("/api/invoices")

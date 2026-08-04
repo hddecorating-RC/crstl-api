@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 # app's event vocabulary made adding 'emailed' painful.
 EVENT_TYPES = ("exported", "netsuite", "emailed")
 
+# Last write failure — surfaced via `write_health()` so the /api/health endpoint
+# can report "digest ran but couldn't record — expect re-sends tomorrow".
+_last_write_error: str | None = None
+_last_write_error_at: str | None = None
+
 
 def _db_path() -> str:
     return os.environ.get("TRACKING_DB", ".tmp/tracking.db")
@@ -65,6 +70,7 @@ def _connect() -> sqlite3.Connection:
 
 
 def record_events(transaction_ids: list[str], event_type: str) -> None:
+    global _last_write_error, _last_write_error_at
     if not transaction_ids:
         return
     if event_type not in EVENT_TYPES:
@@ -78,8 +84,22 @@ def record_events(transaction_ids: list[str], event_type: str) -> None:
                     "INSERT INTO invoice_events (transaction_id, event_type, occurred_at) VALUES (?, ?, ?)",
                     rows,
                 )
+        _last_write_error = None
+        _last_write_error_at = None
     except Exception as exc:
-        print(f"WARNING: tracking write failed: {exc}")
+        # Best-effort: don't raise into callers (CSV export must still return the file,
+        # digest email must still be recorded as sent). But make the failure loud in
+        # journalctl AND surface it via write_health() so /api/health can report it.
+        _last_write_error = f"{event_type}: {exc}"
+        _last_write_error_at = now
+        print(f"ERROR: tracking write failed ({event_type}, {len(transaction_ids)} rows): {exc}")
+
+
+def write_health() -> dict:
+    """Report the most recent tracking write failure, if any. Health endpoint
+    exposes this so ops can spot silently-broken persistence (e.g. disk full,
+    permission loss) before it produces duplicate digest emails."""
+    return {"ok": _last_write_error is None, "last_error": _last_write_error, "last_error_at": _last_write_error_at}
 
 
 def get_latest_events(transaction_ids: list[str]) -> dict[str, dict]:
