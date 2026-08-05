@@ -1,6 +1,8 @@
 import csv
 import io
 
+from app.sac_codes import label as sac_label
+
 BASE_COLUMNS = [
     ("Invoice Number",   "invoice_number"),
     ("PO Number",        "po_number"),
@@ -10,13 +12,26 @@ BASE_COLUMNS = [
     ("Due Date",         "due_date"),
     ("Status",           "status"),
     ("Subtotal",         "subtotal"),
+    # Per-category summary totals. Each cell = sum of the SAC codes classified
+    # in that bucket (see app/sac_codes.py). "Charge Total" is retained for
+    # anyone still opening the old CSV shape; it equals Freight + Fee + Tax.
     ("Allowance Total",  "allowance_amount"),
-    ("Charge Total",     "charge_amount"),
+    ("Discount Total",   "discount_amount"),
+    ("Freight Total",    "freight_amount"),
+    ("Fee Total",        "fee_amount"),
 ]
 
 TAIL_COLUMNS = [
     ("Tax Amount",     "tax_amount"),
+    ("Tax GST",        "_tax_gst"),
+    ("Tax HST/QST",    "_tax_hst_qst"),
+    ("Tax Eco",        "_tax_eco"),
+    ("Charge Total",   "charge_amount"),  # legacy = freight+fee+tax
     ("Total Amount",   "total_amount"),
+    # Discrepancy = total − (subtotal − allowance − discount + freight + fee + tax).
+    # Zero on a clean invoice. Non-zero flags a data quality issue in HD's SAC —
+    # use this column to filter/sort for reconciliation review.
+    ("Discrepancy",    "discrepancy"),
     ("Currency",       "currency"),
     ("Transaction ID", "transaction_id"),
     ("Created At",     "created_at"),
@@ -46,7 +61,7 @@ def build_csv(invoices: list[dict], ids: list[str] | None = None) -> bytes:
         invoices = [inv for inv in invoices if inv.get("transaction_id") in ids]
 
     codes = _collect_codes(invoices)
-    code_columns = [(f"Code {c}", c) for c in codes]
+    code_columns = [(sac_label(c), c) for c in codes]
     fieldnames = [name for name, _ in BASE_COLUMNS] + [name for name, _ in code_columns] + [name for name, _ in TAIL_COLUMNS]
 
     buf = io.StringIO()
@@ -55,6 +70,12 @@ def build_csv(invoices: list[dict], ids: list[str] | None = None) -> bytes:
     for inv in invoices:
         row = {name: inv.get(key, "") for name, key in BASE_COLUMNS}
         row.update({name: inv.get(key, "") for name, key in TAIL_COLUMNS})
+        # Split the tax breakdown dict into its own columns so accounting can
+        # pivot by tax kind without post-processing the CSV.
+        tb = inv.get("tax_breakdown") or {}
+        row["Tax GST"]     = tb.get("GST", "")
+        row["Tax HST/QST"] = tb.get("HST_QST", "")
+        row["Tax Eco"]     = tb.get("ECO", "")
         code_amounts: dict[str, float] = {}
         for entry in inv.get("allowances_charges") or []:
             code = entry.get("code")

@@ -98,19 +98,24 @@ def test_build_csv_emits_per_code_columns():
     ]
     rows = list(csv.DictReader(io.StringIO(build_csv(invoices).decode("utf-8"))))
 
-    # Union of codes present as columns, sorted alpha (no duplicates even if a
-    # code shows up as both allowance and charge across different invoices)
-    header_codes = [k for k in rows[0].keys() if k.startswith("Code ")]
-    assert header_codes == ["Code C300", "Code D360", "Code E210", "Code H000", "Code H090"]
+    # Per-code columns use the label from app.sac_codes (HD spec names), or
+    # "Code XXX" fallback for anything not in the spec. Sorted alpha by code.
+    header_codes = [k for k, v in list(rows[0].items()) if "(" in k and ")" in k or k.startswith("Code ")]
+    # C300 → Discount, D360 → GST Tax, E210 → Labor Service, H000 → Special Allowance, H090 → DC Handling Allowance
+    assert "Discount (C300)" in header_codes
+    assert "GST Tax (D360)" in header_codes
+    assert "Labor Service (E210)" in header_codes
+    assert "Special Allowance (H000)" in header_codes
+    assert "DC Handling Allowance (H090)" in header_codes
 
     # Row 1: only C300 has a value (negative), other code cells blank
-    assert rows[0]["Code C300"] == "-0.6"
-    assert rows[0]["Code E210"] == ""
-    assert rows[0]["Code D360"] == ""
+    assert rows[0]["Discount (C300)"] == "-0.6"
+    assert rows[0]["Labor Service (E210)"] == ""
+    assert rows[0]["GST Tax (D360)"] == ""
 
     # Row 2: allowances negative, charge positive
-    assert rows[1]["Code E210"] == "-359.57"
-    assert rows[1]["Code H090"] == "-102.74"
-    assert rows[1]["Code H000"] == "-128.42"
-    assert rows[1]["Code D360"] == "484.14"
-    assert rows[1]["Code C300"] == ""
+    assert rows[1]["Labor Service (E210)"] == "-359.57"
+    assert rows[1]["DC Handling Allowance (H090)"] == "-102.74"
+    assert rows[1]["Special Allowance (H000)"] == "-128.42"
+    assert rows[1]["GST Tax (D360)"] == "484.14"
+    assert rows[1]["Discount (C300)"] == ""

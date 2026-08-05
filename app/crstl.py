@@ -3,6 +3,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
 
+from app.sac_codes import classify
+
 
 class CrstlClient:
     # Server enforces a 20-row page cap regardless of the `limit` param;
@@ -149,33 +151,58 @@ class CrstlClient:
             meta.get("value") or summary.get("total_monetary_value_summary", {}).get("total_amount")
         )
 
-        # Summary-level allowances (indicator "A", reduces net) and charges (indicator "C", adds to net).
-        # EDI 810 does not carry a tax segment for HD Canada; tax is derived:
-        #   net_before_tax = subtotal - allowances + charges
-        #   tax_amount     = total - net_before_tax
-        allowance_amount = 0.0
-        charge_amount = 0.0
+        # Summary-level SAC entries. Per the HD 810 spec (v6.10), each SAC code
+        # has a specific meaning — some indicator "C" codes are taxes (D360=GST,
+        # H680=HST/QST, H850/F240/G090/G100=BC Eco Tax), some are freight, some
+        # are fees. Classify each and sum into the appropriate bucket. tax_amount
+        # is the sum of tax-categorized entries — NOT derived from the total.
+        category_totals = {"allowance": 0.0, "discount": 0.0, "freight": 0.0, "fee": 0.0, "tax": 0.0}
+        tax_breakdown = {}  # {"GST": amount, "HST_QST": amount, "ECO": amount}
         allowances_charges = []
         for entry in summary.get("service_promotion_allowance_or_charge_information_loop", []) or []:
             saci = entry.get("service_promotion_allowance_or_charge_information", {}) or {}
             amt = self._parse_float(saci.get("amount"))
             indicator = saci.get("allowance_or_charge_indicator")
             code = saci.get("service_promotion_allowance_or_charge_code") or ""
-            if indicator == "A":
-                allowance_amount += amt
-            elif indicator == "C":
-                charge_amount += amt
+
+            meta = classify(code, indicator)
+            category = meta["category"]
+            category_totals[category] += amt
+            if category == "tax":
+                kind = meta.get("tax_kind", "OTHER")
+                tax_breakdown[kind] = round(tax_breakdown.get(kind, 0.0) + amt, 2)
+
             allowances_charges.append({
-                "type": "Allowance" if indicator == "A" else "Charge" if indicator == "C" else indicator,
-                "code": code,
-                "amount": round(amt, 2),
+                "type":     "Allowance" if indicator == "A" else "Charge" if indicator == "C" else indicator,
+                "code":     code,
+                "label":    meta["label"],
+                "category": category,
+                "amount":   round(amt, 2),
             })
 
         if subtotal == 0.0:
             subtotal = total_amount
 
-        net_before_tax = subtotal - allowance_amount + charge_amount
-        tax_amount = max(0.0, round(total_amount - net_before_tax, 2))
+        allowance_amount = round(category_totals["allowance"], 2)
+        discount_amount  = round(category_totals["discount"],  2)
+        freight_amount   = round(category_totals["freight"],   2)
+        fee_amount       = round(category_totals["fee"],       2)
+        # Tax is only ever what HD reports via SAC tax codes (D360/H680/H850/etc).
+        # We do NOT derive tax from total − net_taxable — that would silently
+        # hide invoices where HD's SAC data doesn't add up to the reported
+        # total. Reconciliation is the whole point of this dashboard.
+        tax_amount = round(category_totals["tax"], 2)
+
+        # Discrepancy = the amount unexplained by the SAC data. Zero means the
+        # invoice fully reconciles; non-zero flags a data quality issue
+        # (missing tax SAC, missing allowance, or an HD-side computation error).
+        # Positive = total exceeds what the SAC data explains (missing tax /
+        # missing charge). Negative = SAC data exceeds the total (extra
+        # deduction or double-counted allowance).
+        computed_total = subtotal - allowance_amount - discount_amount + freight_amount + fee_amount + tax_amount
+        discrepancy = round(total_amount - computed_total, 2)
+
+        charge_amount = round(freight_amount + fee_amount + tax_amount, 2)
 
         state = meta.get("state") or {}
         status = state.get("value") if isinstance(state, dict) else state
@@ -190,12 +217,17 @@ class CrstlClient:
             "invoice_date":    str(heading.get("invoice_date") or ""),
             "due_date":        str(heading.get("terms_net_due_date") or ""),
             "status":          str(status or ""),
-            "subtotal":        round(subtotal, 2),
-            "allowance_amount": round(allowance_amount, 2),
-            "charge_amount":   round(charge_amount, 2),
+            "subtotal":         round(subtotal, 2),
+            "allowance_amount": allowance_amount,
+            "discount_amount":  discount_amount,
+            "freight_amount":   freight_amount,
+            "fee_amount":       fee_amount,
+            "charge_amount":    charge_amount,   # freight + fee + tax (legacy)
             "allowances_charges": allowances_charges,
-            "tax_amount":      round(tax_amount, 2),
-            "total_amount":    round(total_amount, 2),
+            "tax_amount":       tax_amount,
+            "tax_breakdown":    tax_breakdown,
+            "discrepancy":      discrepancy,
+            "total_amount":     round(total_amount, 2),
             "currency":        str(heading.get("currency", {}).get("currency_code") if isinstance(heading.get("currency"), dict) else heading.get("currency") or "CAD"),
             "created_at":      str(meta.get("created_at") or ""),
             "invoice_lines":   lines,
