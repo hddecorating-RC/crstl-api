@@ -165,17 +165,17 @@ class CrstlClient:
             indicator = saci.get("allowance_or_charge_indicator")
             code = saci.get("service_promotion_allowance_or_charge_code") or ""
 
-            meta = classify(code, indicator)
-            category = meta["category"]
+            spec = classify(code, indicator)
+            category = spec["category"]
             category_totals[category] += amt
             if category == "tax":
-                kind = meta.get("tax_kind", "OTHER")
+                kind = spec.get("tax_kind", "OTHER")
                 tax_breakdown[kind] = round(tax_breakdown.get(kind, 0.0) + amt, 2)
 
             allowances_charges.append({
                 "type":     "Allowance" if indicator == "A" else "Charge" if indicator == "C" else indicator,
                 "code":     code,
-                "label":    meta["label"],
+                "label":    spec["label"],
                 "category": category,
                 "amount":   round(amt, 2),
             })
@@ -214,6 +214,12 @@ class CrstlClient:
             "invoice_number":  str(meta.get("reference_id") or heading.get("invoice_number") or ""),
             "po_number":       str(meta.get("source_document_reference_id") or heading.get("purchase_order_number") or ""),
             "trading_partner": str(meta.get("trading_partner_name") or ""),
+            # Flavor distinguishes "Wholesale" (delivered to VAUGHAN/CALGARY DC —
+            # HD emits full tax SAC codes) from "Dropship" (shipped direct to
+            # consumer — HD does NOT emit tax SAC, tax is baked into the total).
+            # Downstream tax attribution needs this to know when to derive tax
+            # from the residual vs. trust the raw SAC data.
+            "trading_partner_flavor": str(meta.get("trading_partner_flavor") or ""),
             "invoice_date":    str(heading.get("invoice_date") or ""),
             "due_date":        str(heading.get("terms_net_due_date") or ""),
             "status":          str(status or ""),

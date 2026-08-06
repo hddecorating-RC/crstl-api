@@ -33,14 +33,14 @@
     <div class="grid grid-cols-6 gap-4 mb-5">
       <div class="bg-white rounded-lg border border-gray-200 p-4 cursor-pointer hover:border-amber-400 transition"
            :class="activeFilter === 'Draft' ? 'ring-2 ring-amber-400' : ''"
-           @click="activeFilter = activeFilter === 'Draft' ? 'All' : 'Draft'">
+           @click="activeFilter = activeFilter === 'Draft' ? 'All' : 'Draft'; currentPage = 1">
         <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Draft</div>
         <div class="text-3xl font-bold text-amber-500" x-text="counts.Draft"></div>
         <div class="text-xs text-gray-400 mt-1">Not yet sent</div>
       </div>
       <div class="bg-white rounded-lg border border-gray-200 p-4 cursor-pointer hover:border-green-400 transition"
            :class="activeFilter === 'Sent' ? 'ring-2 ring-green-400' : ''"
-           @click="activeFilter = activeFilter === 'Sent' ? 'All' : 'Sent'">
+           @click="activeFilter = activeFilter === 'Sent' ? 'All' : 'Sent'; currentPage = 1">
         <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Sent</div>
         <div class="text-3xl font-bold text-green-500" x-text="counts.Sent"></div>
         <div class="text-xs text-gray-400 mt-1">Transmitted to HD</div>
@@ -136,12 +136,24 @@
       <!-- Status filters OR selection actions — same row, no shift -->
       <div class="flex items-center gap-2">
         <template x-if="selected.size === 0">
-          <div class="flex gap-2">
+          <div class="flex items-center gap-2">
             <template x-for="f in ['All','Draft','Sent']" :key="f">
               <button @click="activeFilter = f; currentPage = 1"
                       :class="activeFilter === f ? 'bg-blue-600 text-white' : 'bg-white text-gray-500 border border-gray-200 hover:border-blue-400'"
                       class="px-4 py-2 rounded-full text-xs font-medium transition" x-text="f"></button>
             </template>
+            <!-- Export state filter — independent of status. Lets you see
+                 "invoices I already emailed", "invoices I haven't downloaded",
+                 etc., without losing the Draft/Sent status filter. -->
+            <select x-model="exportStateFilter" @change="currentPage = 1"
+                    class="px-3 py-1.5 text-xs border border-gray-200 rounded-full bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-600"
+                    title="Filter by CSV download / email digest history">
+              <option value="Any">All export states</option>
+              <option value="Emailed">Emailed ✉</option>
+              <option value="NotEmailed">Not emailed</option>
+              <option value="Exported">CSV exported ↓</option>
+              <option value="NotExported">Not CSV exported</option>
+            </select>
           </div>
         </template>
         <template x-if="selected.size > 0">
@@ -198,7 +210,12 @@
           <template x-if="!loading && filteredInvoices.length === 0">
             <div class="flex items-center justify-center h-32 text-gray-400 text-sm">No invoices found</div>
           </template>
-          <template x-for="inv in pagedInvoices" :key="inv.transaction_id">
+          <!-- Prefer transaction_id (stable across sort/refresh so Alpine can
+               reuse DOM nodes), fall back to index if Crstl ever emits an
+               empty id again — the extraction shadowing bug that collapsed
+               ~two-thirds of rows to a single key was fixed in crstl.py, but
+               the fallback is cheap insurance. -->
+          <template x-for="(inv, i) in pagedInvoices" :key="inv.transaction_id || i">
             <div class="grid items-center px-4 py-2.5 border-b border-gray-50 cursor-pointer hover:bg-gray-50 text-sm transition"
                  style="grid-template-columns: 32px 1fr 1fr 100px 80px 90px 70px"
                  :class="{'row-selected': selected.has(inv.transaction_id), 'row-active border-l-2 border-l-blue-500': activeInvoice?.transaction_id === inv.transaction_id}"
@@ -274,7 +291,16 @@
           <div class="p-6">
             <dl class="grid grid-cols-2 gap-x-6 gap-y-4 text-sm mb-6">
               <div><dt class="text-xs text-gray-400">PO #</dt><dd class="font-medium mt-0.5" x-text="activeInvoice.po_number || '—'"></dd></div>
-              <div><dt class="text-xs text-gray-400">Trading Partner</dt><dd class="font-medium mt-0.5" x-text="activeInvoice.trading_partner || '—'"></dd></div>
+              <div>
+                <dt class="text-xs text-gray-400">Trading Partner</dt>
+                <dd class="font-medium mt-0.5" x-text="activeInvoice.trading_partner || '—'"></dd>
+                <!-- Flavor (Wholesale / Dropship / DSD / etc.) — matters because HD's
+                     EDI emission differs by channel: Wholesale carries full tax SACs,
+                     Dropship and DSD typically omit them (so a discrepancy is expected). -->
+                <template x-if="activeInvoice.trading_partner_flavor">
+                  <dd class="text-xs text-gray-500 mt-0.5" x-text="activeInvoice.trading_partner_flavor"></dd>
+                </template>
+              </div>
               <div><dt class="text-xs text-gray-400">Invoice Date</dt><dd class="font-medium mt-0.5" x-text="activeInvoice.invoice_date || '—'"></dd></div>
               <div><dt class="text-xs text-gray-400">Due Date</dt><dd class="font-medium mt-0.5" x-text="activeInvoice.due_date || '—'"></dd></div>
               <div><dt class="text-xs text-gray-400">Subtotal</dt><dd class="font-medium mt-0.5" x-text="fmtMoney(activeInvoice.subtotal)"></dd></div>
@@ -327,6 +353,15 @@
                     unexplained by SAC data.
                     <span x-show="activeInvoice.discrepancy > 0">Likely missing tax or charge code.</span>
                     <span x-show="activeInvoice.discrepancy < 0">Likely double-counted allowance or extra deduction.</span>
+                    <!-- HD's Dropship and DSD channels routinely omit the tax SAC on the
+                         810 (tax gets baked into the total instead). A positive residual
+                         on these flavors is expected but should still be verified against
+                         the value Crstl computes and displays. -->
+                    <template x-if="activeInvoice.discrepancy > 0 && /dropship|dsd|direct store/i.test(activeInvoice.trading_partner_flavor || '')">
+                      <div class="text-xs text-amber-800 mt-1">
+                        Note: HD's <span x-text="activeInvoice.trading_partner_flavor"></span> channel commonly omits the tax SAC — cross-check the residual against the Tax Information section on Crstl before treating it as an error.
+                      </div>
+                    </template>
                   </dd>
                 </div>
               </template>
@@ -414,6 +449,9 @@ function dashboard() {
     activeInvoice: null,
     selected: new Set(),
     activeFilter: 'All',
+    // Export-state dimension, independent of status filter above.
+    // 'Any' | 'Emailed' | 'NotEmailed' | 'Exported' | 'NotExported'
+    exportStateFilter: 'Any',
     search: '',
     dateFrom: '',
     dateTo: '',
@@ -435,6 +473,13 @@ function dashboard() {
     sortDir: 'desc',
 
     async init() {
+      // Keep currentPage in range when filters/search/pageSize shrink the
+      // dataset. Without this, x-model changes to pageSize or a filter that
+      // reduces filteredInvoices can leave currentPage past the last page,
+      // producing an empty or 1-row table even though invoices exist.
+      this.$watch('totalPages', tp => {
+        if (this.currentPage > tp) this.currentPage = tp;
+      });
       await this.loadInvoices();
       await this.loadNetsuiteStatus();
       await this.loadDigestStatus();
@@ -640,9 +685,22 @@ function dashboard() {
     get filteredInvoices() {
       return this.invoices.filter(inv => {
         const s = (inv.status || '').toLowerCase();
-        const matchFilter = this.activeFilter === 'All' ||
+        // HD Canada sends "Draft" (unsent) and "Accepted" (received & accepted).
+        // Kept "sent"/"completed"/"open" as legacy fallbacks in case another
+        // trading partner uses different vocab later.
+        const matchStatus = this.activeFilter === 'All' ||
           (this.activeFilter === 'Draft' && (s === 'draft' || s === 'open')) ||
-          (this.activeFilter === 'Sent' && (s === 'sent' || s === 'completed'));
+          (this.activeFilter === 'Sent'  && (s === 'sent' || s === 'accepted' || s === 'completed'));
+        // Export state filter (independent of status). Any = don't filter,
+        // Emailed / NotEmailed / Exported / NotExported = filter by presence
+        // of the respective timestamp on the invoice.
+        const es = this.exportStateFilter;
+        const matchExport =
+          es === 'Any' ||
+          (es === 'Emailed'      && !!inv.emailed_at) ||
+          (es === 'NotEmailed'   && !inv.emailed_at) ||
+          (es === 'Exported'     && !!inv.exported_at) ||
+          (es === 'NotExported'  && !inv.exported_at);
         const q = this.search.toLowerCase();
         const matchSearch = !q ||
           (inv.invoice_number || '').toLowerCase().includes(q) ||
@@ -651,7 +709,7 @@ function dashboard() {
         const d = inv.invoice_date || '';
         const matchDate = (!this.dateFrom || d >= this.dateFrom) &&
                           (!this.dateTo   || d <= this.dateTo);
-        return matchFilter && matchSearch && matchDate;
+        return matchStatus && matchExport && matchSearch && matchDate;
       });
     },
 
@@ -695,14 +753,20 @@ function dashboard() {
     },
 
     get pagedInvoices() {
-      const start = (this.currentPage - 1) * this.pageSize;
+      // Clamp currentPage so a stale value (e.g. user was on page 5 of a
+      // filtered view, then widened the filter or changed pageSize) can't
+      // strand the table on a nearly-empty page.
+      const page = Math.min(Math.max(1, this.currentPage), this.totalPages);
+      const start = (page - 1) * this.pageSize;
       return this.sortedInvoices.slice(start, start + this.pageSize);
     },
 
     get counts() {
       return {
         Draft: this.invoices.filter(i => { const s = (i.status||'').toLowerCase(); return s === 'draft' || s === 'open'; }).length,
-        Sent:  this.invoices.filter(i => { const s = (i.status||'').toLowerCase(); return s === 'sent' || s === 'completed'; }).length,
+        // Sent count now includes 'accepted' (HD's actual status after they
+        // receive our 810). Without this the top card underreported by ~2/3.
+        Sent:  this.invoices.filter(i => { const s = (i.status||'').toLowerCase(); return s === 'sent' || s === 'accepted' || s === 'completed'; }).length,
       };
     },
 
@@ -713,7 +777,9 @@ function dashboard() {
     statusClass(status) {
       const s = (status || '').toLowerCase();
       if (s === 'draft' || s === 'open') return 'bg-amber-100 text-amber-800';
-      if (s === 'sent' || s === 'completed') return 'bg-green-100 text-green-800';
+      // Keep this in sync with counts.Sent and the filteredInvoices matcher —
+      // HD's 810 pipeline reports "Accepted" once they receive the invoice.
+      if (s === 'sent' || s === 'accepted' || s === 'completed') return 'bg-green-100 text-green-800';
       return 'bg-gray-100 text-gray-600';
     },
 
