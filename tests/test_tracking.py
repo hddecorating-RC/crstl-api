@@ -104,6 +104,46 @@ def test_latest_event_time_rejects_unknown_type(db_path):
         latest_event_time("shipped")
 
 
+def test_settings_default_when_missing(db_path):
+    from app.tracking import get_setting
+    assert get_setting("nonexistent") is None
+    assert get_setting("nonexistent", "fallback") == "fallback"
+
+
+def test_settings_roundtrip_and_upsert(db_path):
+    from app.tracking import get_setting, set_setting
+    set_setting("auto_digest_enabled", "false")
+    assert get_setting("auto_digest_enabled") == "false"
+    # Upsert: second write updates the value
+    set_setting("auto_digest_enabled", "true")
+    assert get_setting("auto_digest_enabled") == "true"
+
+
+def test_settings_survive_migration_of_events_table(tmp_path, monkeypatch):
+    """The settings table must be created even when the events table already
+    exists from a pre-settings deployment — otherwise the toggle endpoint
+    would 500 on the first request after upgrading."""
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE invoice_events (
+            transaction_id TEXT NOT NULL,
+            event_type     TEXT NOT NULL,
+            occurred_at    TEXT NOT NULL
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("TRACKING_DB", path)
+    init_db()
+
+    from app.tracking import set_setting, get_setting
+    set_setting("hello", "world")
+    assert get_setting("hello") == "world"
+
+
 def test_write_health_clean_when_no_failure(db_path):
     from app.tracking import write_health
     record_events(["tx-001"], "emailed")

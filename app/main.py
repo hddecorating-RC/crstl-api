@@ -274,8 +274,22 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
     return {"sent_to": recipients, "count": len(to_send), "subject": subject, "mode": mode}
 
 
+AUTO_DIGEST_SETTING = "auto_digest_enabled"
+
+
+def _auto_digest_enabled() -> bool:
+    """Runtime toggle read from the settings table. Defaults to enabled if the
+    setting has never been set — production LXC just works after deploy."""
+    return tracking.get_setting(AUTO_DIGEST_SETTING, "true").lower() != "false"
+
+
 def _run_daily_digest_job() -> None:
-    """Scheduler entry point — wraps _send_daily_digest with state tracking."""
+    """Scheduler entry point — wraps _send_daily_digest with state tracking.
+    Honors the runtime auto-digest toggle: if disabled, the job logs and
+    exits without sending. Manual /api/email/send-digest is unaffected."""
+    if not _auto_digest_enabled():
+        print("Digest: auto-send disabled via settings, skipping scheduled run")
+        return
     with _digest_lock:
         if _digest_state.get("sending"):
             print("Digest: already running, skipping")
@@ -497,7 +511,20 @@ def email_status() -> dict:
     # right before restart won't be recoverable.
     if state.get("last_sent") is None:
         state["last_sent"] = tracking.latest_event_time("emailed")
+    state["auto_enabled"] = _auto_digest_enabled()
     return state
+
+
+class AutoDigestToggle(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/email/auto-digest")
+def set_auto_digest(body: AutoDigestToggle) -> dict:
+    """Enable or disable the scheduled daily digest. Persisted in tracking.db
+    so the setting survives restarts. Manual sends are always available."""
+    tracking.set_setting(AUTO_DIGEST_SETTING, "true" if body.enabled else "false")
+    return {"auto_enabled": body.enabled}
 
 
 app.mount("/", StaticFiles(directory="app/static", html=True), name="static")

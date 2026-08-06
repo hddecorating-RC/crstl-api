@@ -34,6 +34,16 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='invoice_events'"
     ).fetchone()
 
+    # Always ensure the settings table exists — used for runtime toggles like
+    # auto-digest enable/disable. Cheap CREATE IF NOT EXISTS on every start.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+    """)
+
     if row is None:
         conn.executescript("""
             CREATE TABLE invoice_events (
@@ -93,6 +103,33 @@ def record_events(transaction_ids: list[str], event_type: str) -> None:
         _last_write_error = f"{event_type}: {exc}"
         _last_write_error_at = now
         print(f"ERROR: tracking write failed ({event_type}, {len(transaction_ids)} rows): {exc}")
+
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    """Read a setting value. Returns default if the key is missing or the read fails."""
+    try:
+        with contextlib.closing(_connect()) as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+    except Exception as exc:
+        print(f"WARNING: settings read failed for {key!r}: {exc}")
+        return default
+
+
+def set_setting(key: str, value: str) -> None:
+    """Upsert a setting value. Best-effort — errors are logged but not raised
+    (callers are UI toggles; a persistence failure shouldn't 500 the request)."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with contextlib.closing(_connect()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                    (key, value, now),
+                )
+    except Exception as exc:
+        print(f"ERROR: settings write failed for {key!r}: {exc}")
 
 
 def write_health() -> dict:

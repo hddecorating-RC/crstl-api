@@ -81,12 +81,24 @@
       </div>
       <!-- Email Digest -->
       <div class="bg-white rounded-lg border border-gray-200 p-4">
-        <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Email Digest</div>
+        <div class="flex items-start justify-between mb-1">
+          <div class="text-xs uppercase tracking-wide text-gray-400">Email Digest</div>
+          <!-- Auto-send toggle — persists in tracking.db, survives restarts.
+               When off, the scheduled 07:15 job skips sending. Manual sends
+               below still work. -->
+          <button @click="toggleAutoDigest()" :disabled="togglingAutoDigest"
+                  :class="digest.auto_enabled ? 'bg-green-500' : 'bg-gray-300'"
+                  class="relative inline-flex h-4 w-8 items-center rounded-full transition disabled:opacity-50"
+                  :title="digest.auto_enabled ? 'Auto-send ON — click to disable scheduled digest' : 'Auto-send OFF — scheduled digest will not fire'">
+            <span :class="digest.auto_enabled ? 'translate-x-4' : 'translate-x-0.5'"
+                  class="inline-block h-3 w-3 transform rounded-full bg-white transition"></span>
+          </button>
+        </div>
         <div class="text-sm font-semibold text-slate-800 mt-1"
              x-text="digest.last_sent ? fmtTime(digest.last_sent) : '—'"></div>
-        <div class="text-xs text-gray-400 mt-1"
-             x-show="digest.last_sent"
-             x-text="digest.count + ' invoice' + (digest.count === 1 ? '' : 's')"></div>
+        <div class="text-xs mt-1"
+             :class="digest.auto_enabled ? 'text-gray-400' : 'text-amber-600 font-medium'"
+             x-text="digest.auto_enabled ? ((digest.count || 0) + ' invoice' + (digest.count === 1 ? '' : 's') + ' · Auto: on') : 'Auto: OFF (07:15 job disabled)'"></div>
         <div class="text-xs text-red-500 mt-1 truncate"
              x-show="digest.error"
              :title="digest.error"
@@ -416,8 +428,9 @@ function dashboard() {
     syncStatus: 'never',
     netsuiteExport: { available: false, last_generated: null, count: 0, skipped: 0, error: null },
     generatingNetsuite: false,
-    digest: { last_sent: null, count: 0, error: null, sending: false },
+    digest: { last_sent: null, count: 0, error: null, sending: false, auto_enabled: true },
     sendingDigest: false,
+    togglingAutoDigest: false,
     sortKey: 'invoice_date',   // default: most recent first (matches prior implicit order)
     sortDir: 'desc',
 
@@ -471,6 +484,28 @@ function dashboard() {
         this.digest = await res.json();
       } catch {
         this.digest = { ...this.digest, error: 'Status unavailable' };
+      }
+    },
+
+    async toggleAutoDigest() {
+      this.togglingAutoDigest = true;
+      const newState = !this.digest.auto_enabled;
+      try {
+        const res = await fetch('/api/email/auto-digest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: newState }),
+        });
+        if (!res.ok) {
+          this.showToast('Toggle failed');
+          return;
+        }
+        this.digest.auto_enabled = newState;
+        this.showToast(newState ? 'Auto-digest enabled' : 'Auto-digest disabled — 07:15 job will skip');
+      } catch {
+        this.showToast('Toggle failed');
+      } finally {
+        this.togglingAutoDigest = false;
       }
     },
 
