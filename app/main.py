@@ -472,6 +472,22 @@ async def send_digest_now(body: EmailRequest = EmailRequest()) -> JSONResponse:
     return JSONResponse(result)
 
 
+@app.post("/api/email/mark-all-emailed")
+def mark_all_emailed() -> dict:
+    """Baseline-reset the digest: mark every currently-cached invoice as
+    already emailed WITHOUT sending anything. Use after a dev/prod tracking
+    DB split or when you want to reset the "unemailed" state. Tomorrow's
+    scheduled digest will only pick up invoices Crstl adds after this call."""
+    with _cache_lock:
+        tx_ids = [inv["transaction_id"] for inv in _cache["invoices"] if inv.get("transaction_id")]
+    if not tx_ids:
+        return {"marked": 0, "message": "cache is empty"}
+    # Only mark ones not already marked, so we don't inflate the event log
+    unemailed = tracking.get_unemailed_ids(tx_ids)
+    tracking.record_events(unemailed, "emailed")
+    return {"marked": len(unemailed), "already_emailed": len(tx_ids) - len(unemailed), "total_cached": len(tx_ids)}
+
+
 @app.get("/api/email/status")
 def email_status() -> dict:
     with _digest_lock:
