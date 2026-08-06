@@ -242,3 +242,57 @@ def test_extract_falls_back_to_total_when_no_lines():
     result = client._extract_invoice_fields(detail)
     assert result["subtotal"] == 500.0
     assert result["total_amount"] == 500.0
+
+
+def test_extract_preserves_metadata_fields_when_sac_loop_present():
+    """Regression guard: a loop-local variable named `meta` (or any other name
+    matching an outer binding — `heading`, `summary`, `detail_body`) inside the
+    SAC classification loop would silently shadow the metadata dict and cause
+    every metadata-sourced field on the return dict to fall to empty. That
+    was the actual production bug that left 69/105 invoices with empty
+    transaction_id and collapsed the frontend row list.
+
+    Any invoice with at least one SAC entry must still round-trip its
+    metadata fields intact."""
+    detail = {
+        "metadata": {
+            "id": "tx-abc-123",
+            "reference_id": "INV-9999",
+            "source_document_id": "src-777",
+            "source_document_type": "850",
+            "source_document_reference_id": "PO-9999",
+            "trading_partner_name": "Home Depot Canada",
+            "trading_partner_flavor": "Dropship",
+            "value": 100.0,
+            "state": {"value": "Accepted"},
+            "created_at": "2026-08-06T12:00:00Z",
+        },
+        "file": {"generic_json_edi": {
+            "heading": {"invoice_date": "2026-08-06"},
+            "detail": {"baseline_item_data_invoice_loop": [
+                {"baseline_item_data_invoice": {"line_item_number": "10", "quantity_invoiced": "2", "unit_price": "50"}},
+            ]},
+            "summary": {
+                "total_monetary_value_summary": {"total_amount": 100.0},
+                # At least one SAC entry — this is what triggers the loop that
+                # previously shadowed `meta`.
+                "service_promotion_allowance_or_charge_information_loop": [
+                    {"service_promotion_allowance_or_charge_information": {
+                        "allowance_or_charge_indicator": "A",
+                        "service_promotion_allowance_or_charge_code": "C300",
+                        "amount": 1.25}},
+                ],
+            },
+        }},
+    }
+    client = CrstlClient(base_url="https://api.crstl.so/v2", api_key="ct_live_test")
+    result = client._extract_invoice_fields(detail)
+    assert result["transaction_id"] == "tx-abc-123"
+    assert result["invoice_number"] == "INV-9999"
+    assert result["po_number"] == "PO-9999"
+    assert result["source_document_id"] == "src-777"
+    assert result["source_document_type"] == "850"
+    assert result["trading_partner"] == "Home Depot Canada"
+    assert result["trading_partner_flavor"] == "Dropship"
+    assert result["status"] == "Accepted"
+    assert result["created_at"] == "2026-08-06T12:00:00Z"

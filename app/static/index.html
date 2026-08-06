@@ -480,6 +480,19 @@ function dashboard() {
       this.$watch('totalPages', tp => {
         if (this.currentPage > tp) this.currentPage = tp;
       });
+      // Drop invisible ids from `selected` whenever a filter narrows the view.
+      // Without this, a user could select rows, toggle a filter, and then bulk-
+      // email invoices they can no longer see — a real accuracy risk with the
+      // digest going to accounting.
+      const pruneSelection = () => {
+        if (this.selected.size === 0) return;
+        const visible = new Set(this.filteredInvoices.map(i => i.transaction_id));
+        const kept = new Set([...this.selected].filter(id => visible.has(id)));
+        if (kept.size !== this.selected.size) this.selected = kept;
+      };
+      ['activeFilter', 'exportStateFilter', 'search', 'dateFrom', 'dateTo'].forEach(
+        prop => this.$watch(prop, pruneSelection)
+      );
       await this.loadInvoices();
       await this.loadNetsuiteStatus();
       await this.loadDigestStatus();
