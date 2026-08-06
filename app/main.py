@@ -301,6 +301,18 @@ def _run_daily_digest_job() -> None:
 async def lifespan(app: FastAPI):
     tracking.init_db()
     await asyncio.to_thread(_refresh_cache)
+
+    # Set SCHEDULER_ENABLED=false on a dev workstation so a local `uvicorn --reload`
+    # can't fire the daily digest / NetSuite export / Crstl refresh in parallel
+    # with the production LXC. Running two schedulers against the same Crstl
+    # tenant produced two digest emails at 07:15 and 07:19 with different
+    # counts because each instance has its own tracking.db. Defaults to enabled
+    # so the LXC just works after `systemctl restart`.
+    if os.environ.get("SCHEDULER_ENABLED", "true").lower() in ("0", "false", "no"):
+        print("Scheduler disabled via SCHEDULER_ENABLED — daily jobs will not run in this instance.")
+        yield
+        return
+
     # misfire_grace_time=3600 lets a job run up to 1 hour late if the host was
     # paused or the scheduler was down at fire time (LXC snapshots, restarts).
     # Without this, a missed 07:00 refresh silently vanishes until the next day.
