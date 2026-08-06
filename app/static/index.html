@@ -320,11 +320,23 @@
                 <div><dt class="text-xs text-gray-400">Fees</dt><dd class="font-medium mt-0.5" x-text="'+' + fmtMoney(activeInvoice.fee_amount)"></dd></div>
               </template>
 
-              <!-- Tax with per-kind breakdown -->
+              <!-- Tax: shows Crstl's reported tax when present. When it's zero
+                   AND a suggestion is available (province rate matches the
+                   residual), show the suggested value flagged as "suggested"
+                   so accounting has something actionable while Crstl's API
+                   still strips TXI segments from dropship 810s. -->
               <div class="col-span-2 border-t pt-3">
                 <div class="flex items-baseline justify-between mb-2">
                   <dt class="text-xs text-gray-400 uppercase tracking-wide">Tax</dt>
-                  <dd class="font-medium text-sm" x-text="fmtMoney(activeInvoice.tax_amount)"></dd>
+                  <template x-if="activeInvoice.tax_amount || !activeInvoice.tax_suggestion">
+                    <dd class="font-medium text-sm" x-text="fmtMoney(activeInvoice.tax_amount)"></dd>
+                  </template>
+                  <template x-if="!activeInvoice.tax_amount && activeInvoice.tax_suggestion">
+                    <dd class="font-medium text-sm text-amber-700">
+                      <span x-text="fmtMoney(activeInvoice.tax_suggestion.amount)"></span>
+                      <span class="ml-1 text-[10px] font-semibold uppercase tracking-wide bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded">suggested</span>
+                    </dd>
+                  </template>
                 </div>
                 <template x-if="taxBreakdownRows(activeInvoice).length > 0">
                   <div class="space-y-1 pl-3 border-l-2 border-gray-100">
@@ -334,6 +346,21 @@
                         <span class="font-mono text-gray-700" x-text="fmtMoney(row.amount)"></span>
                       </div>
                     </template>
+                  </div>
+                </template>
+                <template x-if="!activeInvoice.tax_amount && activeInvoice.tax_suggestion">
+                  <div class="pl-3 border-l-2 border-amber-200 mt-1">
+                    <div class="flex items-baseline justify-between text-xs">
+                      <span class="text-amber-800">
+                        <span x-text="activeInvoice.tax_suggestion.kind"></span>
+                        at <span x-text="(activeInvoice.tax_suggestion.rate * 100).toFixed(3).replace(/\.?0+$/, '') + '%'"></span>
+                        (<span x-text="activeInvoice.tax_suggestion.province"></span>)
+                      </span>
+                      <span class="font-mono text-amber-800" x-text="fmtMoney(activeInvoice.tax_suggestion.amount)"></span>
+                    </div>
+                    <div class="text-[10px] text-amber-700 mt-0.5 italic">
+                      Not from Crstl — derived from province rate. Verify on Crstl before recording.
+                    </div>
                   </div>
                 </template>
               </div>
@@ -351,29 +378,9 @@
                   <dd class="text-sm text-amber-900 mt-1">
                     <span class="font-mono font-semibold" x-text="(activeInvoice.discrepancy > 0 ? '+' : '') + fmtMoney(activeInvoice.discrepancy)"></span>
                     unexplained by SAC data.
-                    <span x-show="activeInvoice.discrepancy > 0">Likely missing tax or charge code.</span>
+                    <span x-show="activeInvoice.discrepancy > 0 && !activeInvoice.tax_suggestion">Likely missing tax or charge code.</span>
                     <span x-show="activeInvoice.discrepancy < 0">Likely double-counted allowance or extra deduction.</span>
-                    <!-- HD's Dropship and DSD channels routinely omit the tax SAC on the
-                         810 (tax gets baked into the total instead). A positive residual
-                         on these flavors is expected but should still be verified against
-                         the value Crstl computes and displays. -->
-                    <template x-if="activeInvoice.discrepancy > 0 && /dropship|dsd|direct store/i.test(activeInvoice.trading_partner_flavor || '')">
-                      <div class="text-xs text-amber-800 mt-1">
-                        Note: HD's <span x-text="activeInvoice.trading_partner_flavor"></span> channel commonly omits the tax SAC — cross-check the residual against the Tax Information section on Crstl before treating it as an error.
-                      </div>
-                    </template>
-                    <!-- Suggested tax match: computed from province × standard rate. Not
-                         from Crstl — it's a cross-check hint until Crstl exposes TXI. -->
-                    <template x-if="activeInvoice.tax_suggestion">
-                      <div class="text-xs text-amber-900 mt-2 pt-2 border-t border-amber-200">
-                        <span class="font-semibold">Suggested:</span>
-                        <span x-text="activeInvoice.tax_suggestion.kind"></span> at
-                        <span x-text="(activeInvoice.tax_suggestion.rate * 100).toFixed(3).replace(/\.?0+$/, '') + '%'"></span>
-                        (<span x-text="activeInvoice.tax_suggestion.province"></span>)
-                        → <span class="font-mono font-semibold" x-text="fmtMoney(activeInvoice.tax_suggestion.amount)"></span>
-                        matches the residual. Verify on Crstl before recording.
-                      </div>
-                    </template>
+                    <span x-show="activeInvoice.tax_suggestion">See suggested tax above.</span>
                   </dd>
                 </div>
               </template>
