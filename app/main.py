@@ -135,6 +135,60 @@ def _attach_provinces(invoices: list[dict], po_provinces: dict[str, dict]) -> No
         inv["store"] = loc.get("store")
 
 
+# Standard Canadian sales-tax rates per ship-to province, used ONLY to annotate
+# an unreconciled invoice with a "likely this tax at this rate" hint. This is
+# NOT a substitute for the actual tax value from HD; it's a cross-check helper
+# for accounting because Crstl's public API strips TXI segments from dropship
+# 810s (their UI shows the value; their JSON does not — support ticket filed).
+# Remove this once Crstl exposes TXI in generic_json_edi.
+_PROVINCE_TAX_RATES: dict[str, tuple[str, float]] = {
+    "AB": ("GST", 0.05),   "BC": ("GST", 0.05),   "MB": ("GST", 0.05),
+    "SK": ("GST", 0.05),   "YT": ("GST", 0.05),   "NT": ("GST", 0.05),
+    "NU": ("GST", 0.05),
+    "ON": ("HST", 0.13),
+    "NB": ("HST", 0.15),   "NL": ("HST", 0.15),   "PE": ("HST", 0.15),
+    "NS": ("HST", 0.14),   # config sets NS at 14% — trust the config
+    "QC": ("GST+QST", 0.14975),
+}
+
+
+def _annotate_tax_suggestion(invoices: list[dict]) -> None:
+    """For unreconciled invoices, add a `tax_suggestion` hint when the residual
+    matches the ship-to province's standard rate within tolerance. Does NOT
+    mutate `tax_amount`, `tax_breakdown`, or `discrepancy` — the raw Crstl
+    values remain untouched. Accounting uses the hint to decide "this residual
+    is expected tax per rate" vs "this is a real HD data error worth chasing"."""
+    for inv in invoices:
+        residual = round(inv.get("discrepancy") or 0.0, 2)
+        if residual <= 0.01:  # only positive residuals could be missing tax
+            continue
+        province = inv.get("province")
+        rate_info = _PROVINCE_TAX_RATES.get(province) if province else None
+        if not rate_info:
+            continue
+        kind, rate = rate_info
+        net_taxable = (
+            (inv.get("subtotal") or 0.0)
+            - (inv.get("allowance_amount") or 0.0)
+            - (inv.get("discount_amount") or 0.0)
+            + (inv.get("freight_amount") or 0.0)
+            + (inv.get("fee_amount") or 0.0)
+        )
+        if net_taxable <= 0:
+            continue
+        expected = round(net_taxable * rate, 2)
+        # Tolerance: 2 cents floor, 0.2% of net for larger invoices. Handles
+        # cent-rounding on individual line items without matching random noise.
+        tolerance = max(0.02, round(0.002 * net_taxable, 2))
+        if abs(expected - residual) <= tolerance:
+            inv["tax_suggestion"] = {
+                "kind": kind,
+                "rate": rate,
+                "amount": expected,
+                "province": province,
+            }
+
+
 def _refresh_cache() -> None:
     if os.environ.get("MOCK_DATA", "").lower() in ("1", "true", "yes"):
         invoices = list(_MOCK_INVOICES)
@@ -149,6 +203,7 @@ def _refresh_cache() -> None:
         invoices = client.fetch_invoices()
         po_provinces = client.fetch_po_provinces()
         _attach_provinces(invoices, po_provinces)
+        _annotate_tax_suggestion(invoices)
         with _cache_lock:
             _cache["invoices"] = invoices
             _cache["last_synced"] = datetime.now(timezone.utc).isoformat()

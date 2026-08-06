@@ -32,6 +32,16 @@ TAIL_COLUMNS = [
     # Zero on a clean invoice. Non-zero flags a data quality issue in HD's SAC —
     # use this column to filter/sort for reconciliation review.
     ("Discrepancy",    "discrepancy"),
+    # Suggested-tax columns: populated when a non-zero Discrepancy matches the
+    # ship-to province's standard tax rate within tolerance. NOT from Crstl —
+    # computed locally as a cross-check hint until Crstl exposes TXI segments
+    # in the API (their web UI shows the tax; their JSON strips it).
+    # Workflow: filter Discrepancy > 0; rows with Suggested Tax Amount populated
+    # are "residual matches province rate — verify on Crstl and record". Rows
+    # with Discrepancy > 0 and blank Suggested columns are real anomalies.
+    ("Suggested Tax Type",   "_suggested_tax_kind"),
+    ("Suggested Tax Rate",   "_suggested_tax_rate"),
+    ("Suggested Tax Amount", "_suggested_tax_amount"),
     ("Currency",       "currency"),
     ("Transaction ID", "transaction_id"),
     ("Created At",     "created_at"),
@@ -76,6 +86,11 @@ def build_csv(invoices: list[dict], ids: list[str] | None = None) -> bytes:
         row["Tax GST"]     = tb.get("GST", "")
         row["Tax HST/QST"] = tb.get("HST_QST", "")
         row["Tax Eco"]     = tb.get("ECO", "")
+        # Suggested-tax columns — blank unless the residual matched a province rate.
+        ts = inv.get("tax_suggestion")
+        row["Suggested Tax Type"]   = ts["kind"]   if ts else ""
+        row["Suggested Tax Rate"]   = ts["rate"]   if ts else ""
+        row["Suggested Tax Amount"] = ts["amount"] if ts else ""
         code_amounts: dict[str, float] = {}
         for entry in inv.get("allowances_charges") or []:
             code = entry.get("code")

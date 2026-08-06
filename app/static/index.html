@@ -362,6 +362,18 @@
                         Note: HD's <span x-text="activeInvoice.trading_partner_flavor"></span> channel commonly omits the tax SAC — cross-check the residual against the Tax Information section on Crstl before treating it as an error.
                       </div>
                     </template>
+                    <!-- Suggested tax match: computed from province × standard rate. Not
+                         from Crstl — it's a cross-check hint until Crstl exposes TXI. -->
+                    <template x-if="activeInvoice.tax_suggestion">
+                      <div class="text-xs text-amber-900 mt-2 pt-2 border-t border-amber-200">
+                        <span class="font-semibold">Suggested:</span>
+                        <span x-text="activeInvoice.tax_suggestion.kind"></span> at
+                        <span x-text="(activeInvoice.tax_suggestion.rate * 100).toFixed(3).replace(/\.?0+$/, '') + '%'"></span>
+                        (<span x-text="activeInvoice.tax_suggestion.province"></span>)
+                        → <span class="font-mono font-semibold" x-text="fmtMoney(activeInvoice.tax_suggestion.amount)"></span>
+                        matches the residual. Verify on Crstl before recording.
+                      </div>
+                    </template>
                   </dd>
                 </div>
               </template>
