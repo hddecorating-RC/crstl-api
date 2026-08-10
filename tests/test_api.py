@@ -130,3 +130,47 @@ def test_netsuite_generate_and_download(client, monkeypatch, tmp_path):
     assert download.status_code == 200
     assert "text/csv" in download.headers["content-type"]
     assert "netsuite_export" in download.headers["content-disposition"]
+
+
+def _scheduled_jobs(monkeypatch, tmp_path):
+    """Start the app lifespan with a stubbed scheduler and return the cron
+    kwargs each job registered with, keyed by job id."""
+    monkeypatch.delenv("MOCK_DATA", raising=False)
+    monkeypatch.setenv("TRACKING_DB", str(tmp_path / "tracking.db"))
+    monkeypatch.setenv("SCHEDULER_ENABLED", "true")
+    jobs: dict[str, dict] = {}
+
+    with patch("app.main.CrstlClient") as MockClient, \
+         patch("app.main.AsyncIOScheduler") as MockScheduler:
+        mock_instance = MagicMock()
+        mock_instance.fetch_invoices.return_value = MOCK_INVOICES
+        MockClient.return_value = mock_instance
+
+        def add_job(func, trigger, **kwargs):
+            jobs[kwargs["id"]] = {"trigger": trigger, **kwargs}
+
+        MockScheduler.return_value.add_job.side_effect = add_job
+
+        from app.main import app
+        with TestClient(app):
+            pass
+
+    return jobs
+
+
+def test_digest_scheduled_weekdays_only(monkeypatch, tmp_path):
+    """The digest must not fire Sat/Sun — Friday's late invoices ride along
+    with Monday's send because tracking.db still lists them as unemailed."""
+    jobs = _scheduled_jobs(monkeypatch, tmp_path)
+    digest = jobs["daily_digest"]
+    assert digest["day_of_week"] == "mon-fri"
+    assert (digest["hour"], digest["minute"]) == (7, 15)
+    assert digest["timezone"] == "America/Toronto"
+
+
+def test_refresh_and_export_still_run_every_day(monkeypatch, tmp_path):
+    """Only the email is weekday-gated; the cache refresh and NetSuite export
+    keep running on weekends so Monday's digest has current data."""
+    jobs = _scheduled_jobs(monkeypatch, tmp_path)
+    for job_id in ("daily_refresh", "netsuite_export"):
+        assert "day_of_week" not in jobs[job_id]

@@ -392,8 +392,13 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(_generate_netsuite_export, "cron", id="netsuite_export",
                       hour=4, minute=0, timezone="America/Toronto",
                       misfire_grace_time=3600, coalesce=True)
+    # Weekdays only — nobody works the digest queue on Sat/Sun, so a weekend
+    # send is just two emails to ignore. Skipping them loses nothing: the digest
+    # sends whatever tracking.db still has unemailed, so Monday 07:15 carries
+    # Friday's late invoices plus anything Crstl added over the weekend.
     scheduler.add_job(_run_daily_digest_job, "cron", id="daily_digest",
-                      hour=7, minute=15, timezone="America/Toronto",
+                      day_of_week="mon-fri", hour=7, minute=15,
+                      timezone="America/Toronto",
                       misfire_grace_time=3600, coalesce=True)
     scheduler.start()
     yield
@@ -576,8 +581,9 @@ class AutoDigestToggle(BaseModel):
 
 @app.post("/api/email/auto-digest")
 def set_auto_digest(body: AutoDigestToggle) -> dict:
-    """Enable or disable the scheduled daily digest. Persisted in tracking.db
-    so the setting survives restarts. Manual sends are always available."""
+    """Enable or disable the scheduled weekday digest (Mon–Fri 07:15 Toronto).
+    Persisted in tracking.db so the setting survives restarts. Manual sends are
+    always available, including on weekends."""
     tracking.set_setting(AUTO_DIGEST_SETTING, "true" if body.enabled else "false")
     return {"auto_enabled": body.enabled}
 

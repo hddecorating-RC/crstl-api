@@ -84,12 +84,12 @@
         <div class="flex items-start justify-between mb-1">
           <div class="text-xs uppercase tracking-wide text-gray-400">Email Digest</div>
           <!-- Auto-send toggle — persists in tracking.db, survives restarts.
-               When off, the scheduled 07:15 job skips sending. Manual sends
-               below still work. -->
+               When off, the scheduled Mon–Fri 07:15 job skips sending. Manual
+               sends below still work. -->
           <button @click="toggleAutoDigest()" :disabled="togglingAutoDigest"
                   :class="digest.auto_enabled ? 'bg-green-500' : 'bg-gray-300'"
                   class="relative inline-flex h-4 w-8 items-center rounded-full transition disabled:opacity-50"
-                  :title="digest.auto_enabled ? 'Auto-send ON — click to disable scheduled digest' : 'Auto-send OFF — scheduled digest will not fire'">
+                  :title="digest.auto_enabled ? 'Auto-send ON — weekdays 07:15, click to disable scheduled digest' : 'Auto-send OFF — scheduled digest will not fire'">
             <span :class="digest.auto_enabled ? 'translate-x-4' : 'translate-x-0.5'"
                   class="inline-block h-3 w-3 transform rounded-full bg-white transition"></span>
           </button>
@@ -98,7 +98,7 @@
              x-text="digest.last_sent ? fmtTime(digest.last_sent) : '—'"></div>
         <div class="text-xs mt-1"
              :class="digest.auto_enabled ? 'text-gray-400' : 'text-amber-600 font-medium'"
-             x-text="digest.auto_enabled ? ((digest.count || 0) + ' invoice' + (digest.count === 1 ? '' : 's') + ' · Auto: on') : 'Auto: OFF (07:15 job disabled)'"></div>
+             x-text="digest.auto_enabled ? ((digest.count || 0) + ' invoice' + (digest.count === 1 ? '' : 's') + ' · Auto: on (Mon–Fri 07:15)') : 'Auto: OFF (Mon–Fri 07:15 job disabled)'"></div>
         <div class="text-xs text-red-500 mt-1 truncate"
              x-show="digest.error"
              :title="digest.error"
@@ -578,7 +578,7 @@ function dashboard() {
           return;
         }
         this.digest.auto_enabled = newState;
-        this.showToast(newState ? 'Auto-digest enabled' : 'Auto-digest disabled — 07:15 job will skip');
+        this.showToast(newState ? 'Auto-digest enabled — Mon–Fri 07:15' : 'Auto-digest disabled — Mon–Fri 07:15 job will skip');
       } catch {
         this.showToast('Toggle failed');
       } finally {
