@@ -10,6 +10,18 @@ The governing principle is the one already stated at `app/crstl.py:190` — repo
 
 Secondary goal, and the reason this is worth doing carefully: the same wiring makes three classes of mistake visible — wrong tax mapping, wrong tax rate, and discounts reported but not applied.
 
+### System of record
+
+**Crstl is authoritative.** It is what is ultimately communicated to HD, so its numbers are the numbers, and this pipeline reports them rather than correcting them.
+
+The value of the cross-checks is therefore not to produce a better figure — it is to surface *where numbers differ*. Three kinds of divergence matter, in descending confidence:
+
+1. **Internally inconsistent within one Crstl invoice** — the `C300` discount applied to the tax base but not the total (§5). Provable from a single document.
+2. **Between two transmissions of the same invoice** — `INV537863522` arrived twice with different discount, tax, and total. Provable from Crstl alone.
+3. **Between Crstl and an off-platform source** — the sampled Rithum invoice computed GST on the gross subtotal where all 42 Crstl invoices use the net base. Cannot be adjudicated from Crstl data; flagged for the Rithum cycle.
+
+Where a cross-check and Crstl disagree, the cross-check is what yields — it annotates, never overwrites.
+
 ---
 
 ## What the API actually returns
@@ -170,4 +182,4 @@ Explicitly out of scope, each needing its own cycle:
 
 1. **Duplicate invoices** — 4 invoice numbers arrive under multiple transaction IDs (`INV40831749` ×4 at $5,317.43, `INV40825499` ×3, `INV40855360` ×2, `INV537863522` ×2 *with differing content*). Double-payment exposure.
 2. **Uninvoiced POs** — 107 Dropship POs ($6,288.60) and 18 DSD POs ($187,415.78) have no invoice in Crstl. The six known Rithum-billed POs are indistinguishable from never-billed ones in Crstl data.
-3. **Rithum ingestion** — invoices raised directly in Rithum bypass this pipeline entirely. Note that the sampled Rithum invoice computed GST on the **gross** subtotal (10.80 on 216.00) where Crstl invoices use the net base — a different rule off-platform, worth investigating with #2.
+3. **Rithum ingestion** — invoices raised directly in Rithum bypass this pipeline entirely. The sampled Rithum invoice computed GST on the **gross** subtotal (10.80 on 216.00) where all 42 Crstl invoices use the net base. Since Crstl is the system of record for what HD receives, this does not change the math here; it is a divergence to investigate alongside #2, and it can only be judged once Rithum data is available for comparison.
