@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily snapshot of crstl-api tracking.db
+
+[Timer]
+# The container's clock is UTC, so this is 02:00 America/Toronto in EDT.
+# Deliberately ahead of the 08:00 UTC NetSuite export and the 11:15 UTC
+# digest, so each snapshot captures the previous day's settled state.
+OnCalendar=*-*-* 06:00:00
+# Catch up on a run missed while the container was off or suspended.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

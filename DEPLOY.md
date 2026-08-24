@@ -5,12 +5,15 @@ requirement, no cgroup quirks, `journalctl` gives you logs directly).
 
 ## Network model — Tailscale
 
-The LXC is not exposed to the LAN or the public internet. Access is over
-Tailscale (WireGuard-based zero-trust overlay). This provides:
+The app binds `127.0.0.1:8000` only. Tailscale runs here in
+`userspace-networking` mode (no `tailscale0` interface), so tailnet traffic
+arrives through `tailscale serve`, which terminates HTTPS and proxies to
+loopback. Access is over Tailscale (WireGuard-based zero-trust overlay),
+which provides:
 
 - Device-level auth via your Tailscale SSO (Google/MS/GitHub)
 - End-to-end encryption (WireGuard) — better than most HTTP+basic-auth setups
-- MagicDNS: reach the LXC as `http://crstl-api:8000` from any tailnet device
+- MagicDNS + Serve: reach the dashboard at `https://crstl-api.<tailnet>.ts.net`
 - Optional ACLs to restrict which users/groups can hit port 8000 (e.g., only
   the `accounting` group)
 
@@ -67,8 +70,8 @@ chown -R crstl:crstl /opt/crstl-api
 cd crstl-api
 
 # 4. Python virtualenv
-sudo -u crstl python3 -m venv .venv
-sudo -u crstl .venv/bin/pip install -r requirements.txt
+runuser -u crstl -- python3 -m venv .venv
+runuser -u crstl -- .venv/bin/pip install -r requirements.txt
 
 # 5. Populate .env from the template — REQUIRED before starting the service.
 #    systemd fails loudly with "Failed to load environment file" if .env
@@ -92,8 +95,10 @@ chown crstl:crstl .tmp
 
 # 7. Install the systemd unit and start
 cp deploy/crstl-api.service /etc/systemd/system/
+cp deploy/crstl-api-backup.service deploy/crstl-api-backup.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now crstl-api
+systemctl enable --now crstl-api-backup.timer
 
 # 8. Verify
 systemctl status crstl-api
@@ -107,7 +112,17 @@ the SQLite write path is broken (permission, disk full, corruption). Digest
 emails still send but won't be marked → the next digest re-sends them. Fix
 this before accounting notices duplicate emails.
 
-Open `http://<lxc-ip>:8000` from any LAN machine to load the dashboard.
+Open `https://crstl-api.<tailnet>.ts.net` from any tailnet device to load
+the dashboard. It is **not** reachable over the office LAN: the app binds
+loopback, and the API has no authentication of its own, so a LAN-wide bind
+would expose unauthenticated `POST /api/email/*` to every device on the
+subnet.
+
+Note that `sshd` does still listen on `0.0.0.0:22` over the LAN. It is
+key-only for root (`PermitRootLogin without-password`) and no
+`/root/.ssh/authorized_keys` exists, so nothing can currently authenticate
+through it. Day-to-day SSH goes through Tailscale SSH instead. If Tailscale
+is unavailable, the way in is the Proxmox console.
 
 ## What persists
 
@@ -121,21 +136,39 @@ The LXC's disk holds this — take a Proxmox snapshot before major changes.
 
 ```bash
 cd /opt/crstl-api
-sudo -u crstl git pull
-sudo -u crstl .venv/bin/pip install -r requirements.txt   # if requirements.txt changed
+# NOTE: sudo is NOT installed on this container -- use runuser. Running git
+# as root would leave root-owned files in a tree the crstl user must write to.
+runuser -u crstl -- git pull --ff-only
+runuser -u crstl -- .venv/bin/pip install -r requirements.txt   # if requirements.txt changed
 systemctl restart crstl-api
+
+# Confirm what is actually running. A restart alone is NOT a deploy: the unit
+# has Restart=on-failure and starts on boot, so a reboot re-runs whatever is
+# already checked out. In Aug 2026 the box served a three-week-old commit this
+# way, still emailing the weekend digest that had been fixed on main.
+git -c safe.directory=/opt/crstl-api log -1 --oneline
 ```
 
 ## Backups
 
 The tracking DB is tiny (KB) but losing it means the next digest re-sends
-everything. Suggest a nightly cron on the LXC:
+everything to accounting. It is also the only state not reproducible from
+git, so it is what matters if the app is ever rebuilt elsewhere.
 
-```
-0 2 * * * cp /opt/crstl-api/.tmp/tracking.db /opt/crstl-api/.tmp/tracking.db.bak.$(date +\%F) && find /opt/crstl-api/.tmp/tracking.db.bak.* -mtime +14 -delete
+`crstl-api-backup.timer` snapshots it daily at 06:00 UTC into
+`.tmp/backups/`, keeping 14 days. It uses SQLite's online backup API rather
+than `cp` -- the database is live while the API serves, and a plain copy can
+capture a torn page mid-write -- then runs `PRAGMA integrity_check` on the
+snapshot before pruning anything older.
+
+```bash
+systemctl list-timers crstl-api-backup   # confirm it is scheduled
+systemctl start crstl-api-backup         # take one now
+journalctl -u crstl-api-backup -n 5      # see what it wrote
 ```
 
-Or rely on Proxmox scheduled snapshots of the LXC.
+Proxmox scheduled snapshots of the LXC cover disk loss, which same-disk
+backups do not.
 
 ## Common problems
 

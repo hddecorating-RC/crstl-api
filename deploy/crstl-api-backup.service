@@ -1,0 +1,18 @@
+[Unit]
+Description=Snapshot crstl-api tracking.db
+Documentation=https://github.com/hddecorating-RC/crstl-api
+
+[Service]
+Type=oneshot
+User=crstl
+Group=crstl
+WorkingDirectory=/opt/crstl-api
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/crstl-api/.venv/bin/python deploy/backup_tracking_db.py
+
+# Same hardening as the main service -- .tmp is the only writable path.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/crstl-api/.tmp

@@ -18,7 +18,12 @@ Environment="TZ=America/Toronto"
 # then landed in journalctl all at one timestamp. Unbuffered keeps the log
 # usable for the troubleshooting steps in DEPLOY.md.
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/opt/crstl-api/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Bind loopback only. Tailscale runs in userspace-networking mode here, so
+# there is no tailscale0 interface to bind to -- inbound tailnet traffic
+# arrives through `tailscale serve`, which proxies
+# https://crstl-api.<tailnet>.ts.net -> http://127.0.0.1:8000. Binding
+# 0.0.0.0 additionally exposed the unauthenticated API to the office LAN.
+ExecStart=/opt/crstl-api/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 Restart=on-failure
 RestartSec=10s
 StandardOutput=journal
