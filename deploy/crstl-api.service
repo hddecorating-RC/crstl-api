@@ -13,6 +13,11 @@ EnvironmentFile=/opt/crstl-api/.env
 # APScheduler cron jobs run in this TZ (07:00 refresh, 07:15 digest, 04:00 NetSuite CSV).
 # Set here rather than relying on /etc/timezone so the service is self-contained.
 Environment="TZ=America/Toronto"
+# Python block-buffers stdout when it is a pipe (the journal), so print()
+# diagnostics from the digest and NetSuite jobs sat unflushed for days and
+# then landed in journalctl all at one timestamp. Unbuffered keeps the log
+# usable for the troubleshooting steps in DEPLOY.md.
+Environment="PYTHONUNBUFFERED=1"
 ExecStart=/opt/crstl-api/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=10s
