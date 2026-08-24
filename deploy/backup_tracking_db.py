@@ -33,6 +33,13 @@ def main() -> int:
     with closing(sqlite3.connect(f"file:{SRC}?mode=ro", uri=True)) as src_conn:
         with closing(sqlite3.connect(dest)) as dest_conn:
             src_conn.backup(dest_conn)
+            # backup() carries the source's WAL journal mode across, which
+            # leaves -wal/-shm sidecars beside the snapshot. Fold them back in
+            # so each snapshot is one self-contained file that can be restored
+            # by copying it alone. This must run on the read-write connection:
+            # a read-only one cannot checkpoint, which is how the sidecars
+            # survived the first version of this script.
+            dest_conn.execute("PRAGMA journal_mode=DELETE")
 
     # Prove the snapshot is readable before pruning anything older.
     with closing(sqlite3.connect(f"file:{dest}?mode=ro", uri=True)) as check:
@@ -44,8 +51,11 @@ def main() -> int:
     cutoff = date.today() - timedelta(days=KEEP_DAYS)
     pruned = 0
     for old in DEST_DIR.glob("tracking.db.*"):
+        # Tolerate -wal/-shm suffixes so sidecars left by an older run get
+        # cleaned up with the snapshot they belong to rather than accumulating.
+        stamp_text = old.name[len("tracking.db."):].removesuffix("-wal").removesuffix("-shm")
         try:
-            stamp = date.fromisoformat(old.name.rsplit(".", 1)[-1])
+            stamp = date.fromisoformat(stamp_text)
         except ValueError:
             continue  # not one of ours -- leave it alone
         if stamp < cutoff:
