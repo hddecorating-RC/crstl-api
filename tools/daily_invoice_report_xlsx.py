@@ -154,7 +154,7 @@ def build_workbook(rows, out_path, window):
     ws = wb.active
     ws.title = "Invoices"
 
-    headers = ["Invoice", "Province", "Invoice Date", "Subtotal",
+    headers = ["Invoice", "Type", "Province", "Invoice Date", "Subtotal",
                "Discounts", "Tax", "Total"]
     ws.append(headers)
     for cell in ws[1]:
@@ -162,12 +162,12 @@ def build_workbook(rows, out_path, window):
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     for r in rows:
-        ws.append([r["invoice"], r["province"], r["date"], r["subtotal"],
+        ws.append([r["invoice"], r["flavor"], r["province"], r["date"], r["subtotal"],
                    -round(sum(r["deductions"].values()), 2) or 0,
                    round(sum(r["taxes"].values()), 2), r["stated"]])
 
     last = ws.max_row + 1
-    ws.append(["Total", "", "",
+    ws.append(["Total", "", "", "",
                round(sum(r["subtotal"] for r in rows), 2),
                -round(sum(sum(r["deductions"].values()) for r in rows), 2),
                round(sum(sum(r["taxes"].values()) for r in rows), 2),
@@ -176,14 +176,14 @@ def build_workbook(rows, out_path, window):
         cell.font = Font(bold=True)
         cell.border = Border(top=Side(style="thin"))
 
-    for row in ws.iter_rows(min_row=2, min_col=4):
+    for row in ws.iter_rows(min_row=2, min_col=5):
         for cell in row:
             if isinstance(cell.value, (int, float)):
                 cell.number_format = MONEY
-    for i, w in enumerate((18, 10, 14, 13, 12, 12, 13), start=1):
+    for i, w in enumerate((18, 11, 10, 14, 13, 12, 12, 13), start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:G{last - 1}"
+    ws.auto_filter.ref = f"A1:H{last - 1}"
 
     # Summary: the same money by flavor, plus anything that does not tie back
     # to HD's stated total. Kept off the main sheet so the report stays plain.
