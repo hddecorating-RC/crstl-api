@@ -1,23 +1,27 @@
 """Daily invoice report for accounting, as a .xlsx workbook.
 
-One row per invoice, showing subtotal, every deduction, tax by kind, and the
-invoice total -- with a reconciliation column proving each row ties back to the
-total HD stated. That reconciliation is the point: a row that does not balance
-is an invoice worth looking at before it is keyed.
+One row per invoice -- invoice, type, province, date, subtotal, discounts,
+charges, tax, total -- plus a total row. The Summary sheet carries the same
+money split by type and lists anything whose parts do not add up to the total
+HD stated, because an invoice that does not balance is worth seeing before it
+is keyed rather than after.
 
-Reads Crstl directly and parses the raw 810 payload, so it does not depend on
-which version of the app is deployed. Accepted invoices only -- Drafts are the
+Reads the raw 810 payload from Crstl rather than going through the app, so it
+runs regardless of which version is deployed. Accepted only: Drafts are the
 warehouse's superseded resubmissions and would duplicate rows.
 
-Tax reaches us by two different routes depending on the flavor, and the report
-has to read both:
+Tax reaches us by two routes depending on the flavor, and both are read:
 
-    Dropship  tax_information (TXI)  CG=GST  ST=QST  VA=HST
-    DSD       SAC codes              D360=GST  H680=QST  H770=HST  H850=ECO
+    Dropship / Wholesale   tax_information (TXI)   CG=GST  ST=QST  VA=HST
+    DSD                    SAC codes               D360=GST  H680=QST
+                                                   H770=HST  H850=ECO
+
+That SAC reading follows the HD revision confirmed with Crstl in Aug 2026 and
+HD's own rejection of INV40852200, not the v6.10 PDF in this repo, which
+predates H770 and routes HST to H680. See app/sac_codes.py on the tax branch.
 
 Dropship invoices carry no ship-to, so the province is recovered from the 850
-PO. That province picks the NetSuite customer and tax code; DSD picks them from
-the store on the PO instead.
+PO; DSD carries its own.
 
 Usage:
     python3 tools/daily_invoice_report_xlsx.py                  # yesterday
@@ -26,11 +30,11 @@ Usage:
     python3 tools/daily_invoice_report_xlsx.py --out /path/to/file.xlsx
 """
 import argparse
-import json
 import os
 import pathlib
 import sys
-from datetime import date, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -39,73 +43,68 @@ from openpyxl.utils import get_column_letter
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-# Tax vocabularies. Crstl spells CG out as "Federal Value Added Tax GST On
-# Goods" in its own UI, which is where these readings come from -- not from
-# matching amounts against province rates.
+from app.crstl import CrstlClient          # noqa: E402
+from app.main import load_env              # noqa: E402
+
+num = CrstlClient._parse_float             # strips thousands separators
+
+# Tax vocabularies. Crstl's own UI spells CG out as "Federal Value Added Tax
+# GST On Goods"; these readings come from Crstl and from HD, not from matching
+# amounts against province rates.
 TXI_KIND = {"CG": "GST", "ST": "QST", "VA": "HST"}
 SAC_KIND = {"D360": "GST", "H680": "QST", "H770": "HST",
             "H850": "ECO", "F240": "ECO", "G090": "ECO", "G100": "ECO"}
+
+# Matches app/main.py's rate-check convention: a 2-cent floor, widening to 0.2%
+# on larger invoices. HD rounds each line to the cent, so summing lines can
+# drift a cent or two from the stated total without anything being wrong.
+def tolerance_for(amount):
+    return max(0.02, round(0.002 * abs(amount), 2))
+
 
 MONEY = "#,##0.00"
 HDR_FILL = PatternFill("solid", fgColor="1F3864")
 HDR_FONT = Font(bold=True, color="FFFFFF", size=10)
 BAD_FILL = PatternFill("solid", fgColor="FFC7CE")
-THIN = Side(style="thin", color="BFBFBF")
-BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 
-def _num(x):
-    try:
-        return round(float(x or 0), 2)
-    except (TypeError, ValueError):
-        return 0.0
+def flavor_of(meta):
+    """Crstl sends three flavors. Wholesale is rare but real, and collapsing it
+    into Dropship would mislabel the column accounting reads to tell the
+    channels apart."""
+    raw = str(meta.get("trading_partner_flavor") or "")
+    if "DSD" in raw or "Direct Store" in raw:
+        return "DSD"
+    if "Wholesale" in raw:
+        return "Wholesale"
+    if "Dropship" in raw:
+        return "Dropship"
+    return raw or "Unknown"
 
 
-def _load_env():
-    env = pathlib.Path(REPO) / ".env"
-    if not env.exists():
-        return
-    for line in env.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-
-
-def extract(detail, po_index, config):
+def extract(detail, po_index):
     """Flatten one 810 payload into the row accounting needs."""
     meta = detail.get("metadata", {}) or {}
     edi = (detail.get("file", {}) or {}).get("generic_json_edi", {}) or {}
     heading = edi.get("heading", {}) or {}
     summary = edi.get("summary", {}) or {}
 
-    flavor = "DSD" if "DSD" in (meta.get("trading_partner_flavor") or "") else "Dropship"
     po = str(meta.get("source_document_reference_id") or heading.get("purchase_order_number") or "")
-
-    # DSD carries its own ship-to; Dropship does not, so fall back to the PO.
     ship_to = heading.get("ship_to") or {}
-    po_info = po_index.get(po, {})
     province = (str(ship_to.get("state_province") or "").upper()
-                or str(po_info.get("province") or "").upper())
-    store = po_info.get("store")
-    if not store and ship_to.get("name"):
-        name = str(ship_to["name"]).upper()
-        store = "VAUGHAN" if "VAUGHAN" in name else "CALGARY" if "CALGARY" in name else None
+                or str((po_index.get(po) or {}).get("province") or "").upper())
 
-    mapping = (config["wholesale_stores"].get(store or "", {}) if flavor == "DSD"
-               else config["dropship_provinces"].get(province, {}))
-
-    lines = []
-    for entry in (edi.get("detail", {}) or {}).get("baseline_item_data_invoice_loop", []) or []:
-        base = entry.get("baseline_item_data_invoice", {}) or {}
-        lines.append(_num(base.get("quantity_invoiced")) * _num(base.get("unit_price")))
-    subtotal = round(sum(lines), 2)
+    subtotal = round(sum(
+        num((e.get("baseline_item_data_invoice", {}) or {}).get("quantity_invoiced"))
+        * num((e.get("baseline_item_data_invoice", {}) or {}).get("unit_price"))
+        for e in (edi.get("detail", {}) or {}).get("baseline_item_data_invoice_loop", []) or []
+    ), 2)
 
     deductions, charges, taxes = {}, {}, {}
     for entry in summary.get("service_promotion_allowance_or_charge_information_loop", []) or []:
         sac = entry.get("service_promotion_allowance_or_charge_information", {}) or {}
         code = sac.get("service_promotion_allowance_or_charge_code") or "?"
-        amt = _num(sac.get("amount"))
+        amt = num(sac.get("amount"))
         if code in SAC_KIND:
             taxes[SAC_KIND[code]] = round(taxes.get(SAC_KIND[code], 0) + amt, 2)
         elif sac.get("allowance_or_charge_indicator") == "A":
@@ -114,25 +113,29 @@ def extract(detail, po_index, config):
             charges[code] = round(charges.get(code, 0) + amt, 2)
 
     for entry in summary.get("tax_information", []) or []:
-        kind = TXI_KIND.get(entry.get("tax_type_code"), entry.get("tax_type_code") or "?")
-        taxes[kind] = round(taxes.get(kind, 0) + _num(entry.get("monetary_amount")), 2)
+        kind = TXI_KIND.get(entry.get("tax_type_code")) or entry.get("tax_type_code") or "?"
+        taxes[kind] = round(taxes.get(kind, 0) + num(entry.get("monetary_amount")), 2)
 
-    stated = _num((summary.get("total_monetary_value_summary", {}) or {}).get("total_amount")
-                  or meta.get("value"))
+    # metadata.value is Crstl's canonical total (app/crstl.py says so); fall
+    # back to the EDI summary only when it is genuinely absent, not when it is
+    # a legitimate 0.00.
+    stated = num(meta.get("value") if meta.get("value") is not None
+                 else (summary.get("total_monetary_value_summary", {}) or {}).get("total_amount"))
+
+    # An 810 with no parsable line loop reports subtotal 0; the app treats the
+    # stated total as the subtotal in that case rather than under-reporting.
+    if subtotal == 0.0:
+        subtotal = stated
+
     computed = round(subtotal - sum(deductions.values()) + sum(charges.values())
                      + sum(taxes.values()), 2)
 
     return {
-        "invoice": heading.get("invoice_number") or meta.get("reference_id") or "",
+        "invoice": str(meta.get("reference_id") or heading.get("invoice_number") or ""),
         "date": heading.get("invoice_date") or "",
         "po": po,
-        "flavor": flavor,
+        "flavor": flavor_of(meta),
         "province": province,
-        "store": store or "",
-        "customer": mapping.get("customer_id", ""),
-        "tax_code": mapping.get("tax_code", ""),
-        "currency": (heading.get("currency") or {}).get("currency_code") or config.get("currency", "CAD"),
-        "line_count": len(lines),
         "subtotal": subtotal,
         "deductions": deductions,
         "charges": charges,
@@ -143,35 +146,35 @@ def extract(detail, po_index, config):
     }
 
 
-def build_workbook(rows, out_path, window):
-    """Invoices sheet: what was invoiced and how much, one row each.
+def reconciles(row):
+    return abs(row["variance"]) <= tolerance_for(row["stated"])
 
-    Deliberately plain -- invoice, province, date, subtotal, discounts, tax,
-    total. The per-code and per-kind breakdowns live in the payload and can be
-    added back, but accounting asked for the money, not the mechanics.
-    """
+
+def build_workbook(rows, out_path, window):
     wb = Workbook()
     ws = wb.active
     ws.title = "Invoices"
 
     headers = ["Invoice", "Type", "Province", "Invoice Date", "Subtotal",
-               "Discounts", "Tax", "Total"]
+               "Discounts", "Charges", "Tax", "Total"]
     ws.append(headers)
     for cell in ws[1]:
         cell.fill, cell.font = HDR_FILL, HDR_FONT
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
+    def totals(rs, key):
+        return round(sum(sum(r[key].values()) for r in rs), 2)
+
     for r in rows:
         ws.append([r["invoice"], r["flavor"], r["province"], r["date"], r["subtotal"],
                    -round(sum(r["deductions"].values()), 2) or 0,
+                   round(sum(r["charges"].values()), 2) or 0,
                    round(sum(r["taxes"].values()), 2), r["stated"]])
 
     last = ws.max_row + 1
-    ws.append(["Total", "", "", "",
-               round(sum(r["subtotal"] for r in rows), 2),
-               -round(sum(sum(r["deductions"].values()) for r in rows), 2),
-               round(sum(sum(r["taxes"].values()) for r in rows), 2),
-               round(sum(r["stated"] for r in rows), 2)])
+    ws.append(["Total", "", "", "", round(sum(r["subtotal"] for r in rows), 2),
+               -totals(rows, "deductions"), totals(rows, "charges"),
+               totals(rows, "taxes"), round(sum(r["stated"] for r in rows), 2)])
     for cell in ws[last]:
         cell.font = Font(bold=True)
         cell.border = Border(top=Side(style="thin"))
@@ -180,38 +183,30 @@ def build_workbook(rows, out_path, window):
         for cell in row:
             if isinstance(cell.value, (int, float)):
                 cell.number_format = MONEY
-    for i, w in enumerate((18, 11, 10, 14, 13, 12, 12, 13), start=1):
+    for i, w in enumerate((18, 11, 10, 14, 13, 12, 11, 12, 13), start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:H{last - 1}"
+    ws.auto_filter.ref = f"A1:I{last - 1}"
 
-    # Summary: the same money by flavor, plus anything that does not tie back
-    # to HD's stated total. Kept off the main sheet so the report stays plain.
     s = wb.create_sheet("Summary")
     s.append(["Invoiced", window]); s["A1"].font = Font(bold=True, size=13)
     s.append(["Source", "Crstl 810 transactions, state = Accepted"])
     s.append([])
-    s.append(["Type", "Invoices", "Subtotal", "Discounts", "Tax", "Total"])
+    s.append(["Type", "Invoices", "Subtotal", "Discounts", "Charges", "Tax", "Total"])
     for cell in s[4]:
         cell.fill, cell.font = HDR_FILL, HDR_FONT
-    for flavor in ("Dropship", "DSD"):
+    for flavor in sorted({r["flavor"] for r in rows}):
         sub = [r for r in rows if r["flavor"] == flavor]
-        if not sub:
-            continue
-        s.append([flavor, len(sub),
-                  round(sum(r["subtotal"] for r in sub), 2),
-                  -round(sum(sum(r["deductions"].values()) for r in sub), 2),
-                  round(sum(sum(r["taxes"].values()) for r in sub), 2),
-                  round(sum(r["stated"] for r in sub), 2)])
-    s.append(["Total", len(rows),
-              round(sum(r["subtotal"] for r in rows), 2),
-              -round(sum(sum(r["deductions"].values()) for r in rows), 2),
-              round(sum(sum(r["taxes"].values()) for r in rows), 2),
-              round(sum(r["stated"] for r in rows), 2)])
+        s.append([flavor, len(sub), round(sum(r["subtotal"] for r in sub), 2),
+                  -totals(sub, "deductions"), totals(sub, "charges"),
+                  totals(sub, "taxes"), round(sum(r["stated"] for r in sub), 2)])
+    s.append(["Total", len(rows), round(sum(r["subtotal"] for r in rows), 2),
+              -totals(rows, "deductions"), totals(rows, "charges"),
+              totals(rows, "taxes"), round(sum(r["stated"] for r in rows), 2)])
     for cell in s[s.max_row]:
         cell.font = Font(bold=True)
 
-    unbalanced = [r for r in rows if abs(r["variance"]) >= 0.005]
+    unbalanced = [r for r in rows if not reconciles(r)]
     s.append([])
     s.append(["Do not match HD's total", len(unbalanced)])
     s[s.max_row][0].font = Font(bold=True)
@@ -224,14 +219,33 @@ def build_workbook(rows, out_path, window):
             s.append([r["invoice"], r["stated"], r["computed"], r["variance"]])
     for row in s.iter_rows(min_row=5):
         for cell in row:
-            # column 2 on the flavor rows is a count of invoices, not money
             if isinstance(cell.value, (int, float)) and cell.column > 2:
                 cell.number_format = MONEY
-    for i, w in enumerate((24, 14, 14, 14, 12, 14), start=1):
+    for i, w in enumerate((24, 14, 14, 14, 12, 12, 14), start=1):
         s.column_dimensions[get_column_letter(i)].width = w
 
     wb.save(out_path)
     return out_path
+
+
+def _fetch_details(client, transactions):
+    """Fetch details in parallel, skipping records that fail rather than losing
+    the whole report to one bad one -- the same trade-off fetch_invoices makes."""
+    out = []
+    with ThreadPoolExecutor(max_workers=CrstlClient.MAX_WORKERS) as pool:
+        futures = {}
+        for t in transactions:
+            tid = t.get("id") or (t.get("metadata") or {}).get("id")
+            if not tid:
+                print(f"WARNING: skipping transaction with no id: {t.get('reference_id')}")
+                continue
+            futures[pool.submit(client._fetch_transaction_detail, tid)] = t
+        for fut in as_completed(futures):
+            try:
+                out.append(fut.result())
+            except Exception as exc:
+                print(f"WARNING: could not fetch {futures[fut].get('reference_id')}: {exc}")
+    return out
 
 
 def main():
@@ -250,36 +264,78 @@ def main():
         lo = hi = day
     window = lo if lo == hi else f"{lo} to {hi}"
 
-    _load_env()
-    from app.crstl import CrstlClient
+    load_env(os.path.join(REPO, ".env"))
     client = CrstlClient(base_url=os.environ.get("CRSTL_BASE_URL", "https://api.crstl.so/v2"),
                          api_key=os.environ["CRSTL_API_KEY"])
-    config = json.loads((pathlib.Path(REPO) / "config" / "netsuite_customers.json").read_text())
 
     print(f"Fetching 810 transactions for {window} ...")
-    accepted = [t for t in client._fetch_all_transactions("810")
-                if (t.get("state") or {}).get("value") == "Accepted"]
-    po_index = client.fetch_po_provinces()
+    listing = client._fetch_all_transactions("810")
 
-    rows = []
-    for t in accepted:
-        detail = client._fetch_transaction_detail(t["id"])
-        row = extract(detail, po_index, config)
-        if lo <= (row["date"] or "") <= hi:
+    accepted, unknown_states = [], {}
+    for t in listing:
+        state = (t.get("state") or {}).get("value")
+        if state == "Accepted":
+            accepted.append(t)
+        elif state != "Draft":
+            unknown_states[state] = unknown_states.get(state, 0) + 1
+    if unknown_states:
+        # Same reasoning as app/main.py's _reportable: an unrecognised state
+        # must not vanish silently, or a new "good" state would quietly stop
+        # reaching accounting.
+        print(f"WARNING: withheld invoices with unrecognised status {unknown_states} — "
+              f"if one of these is reportable, this filter needs updating")
+
+    # Narrow by created_at before fetching details. A generous buffer keeps
+    # invoices whose invoice_date trails their creation; the exact filter on
+    # invoice_date still happens after extraction.
+    def created(t):
+        return str(t.get("created_at") or "")[:10]
+    buf_lo = (datetime.fromisoformat(lo).date() - timedelta(days=14)).isoformat() if lo[0].isdigit() and lo != "0000-00-00" else lo
+    buf_hi = (datetime.fromisoformat(hi).date() + timedelta(days=14)).isoformat() if hi[0].isdigit() and hi != "9999-99-99" else hi
+    candidates = [t for t in accepted if not created(t) or buf_lo <= created(t) <= buf_hi]
+
+    details = _fetch_details(client, candidates)
+
+    # Only look up the POs actually needed; fetch_po_provinces() crawls every
+    # 850 on record, which is wasted work for a one-day report.
+    need_po = {str((d.get("metadata") or {}).get("source_document_reference_id") or "")
+               for d in details}
+    po_index = {}
+    pos = [p for p in client._fetch_all_transactions("850")
+           if str(p.get("reference_id") or "") in need_po]
+    for detail in _fetch_details(client, pos):
+        st = ((detail.get("file", {}) or {}).get("generic_json_edi", {})
+              .get("heading", {}) or {}).get("ship_to", {}) or {}
+        ref = str((detail.get("metadata") or {}).get("reference_id") or "")
+        if ref and st.get("state_province"):
+            po_index[ref] = {"province": str(st["state_province"]).upper()}
+
+    rows, undated = [], 0
+    for detail in details:
+        row = extract(detail, po_index)
+        if not row["date"]:
+            undated += 1
+            print(f"WARNING: {row['invoice']} has no invoice_date and is not in any window")
+            continue
+        if lo <= row["date"] <= hi:
             rows.append(row)
     rows.sort(key=lambda r: (r["flavor"], r["invoice"]))
 
     if not rows:
+        # A quiet day is not a failure. A cron wrapper must not read it as one.
         print(f"No Accepted invoices dated {window}.")
-        return 1
+        return 0
 
-    out = args.out or os.path.join(REPO, ".tmp", f"HD_Invoices_{lo}.xlsx" if lo == hi
+    out = args.out or os.path.join(REPO, ".tmp",
+                                   f"HD_Invoices_{lo}.xlsx" if lo == hi
                                    else f"HD_Invoices_{lo}_to_{hi}.xlsx")
     pathlib.Path(out).parent.mkdir(parents=True, exist_ok=True)
     build_workbook(rows, out, window)
-    bad = sum(1 for r in rows if abs(r["variance"]) >= 0.005)
-    print(f"{len(rows)} invoices ({sum(1 for r in rows if r['flavor']=='Dropship')} Dropship, "
-          f"{sum(1 for r in rows if r['flavor']=='DSD')} DSD)")
+
+    bad = sum(1 for r in rows if not reconciles(r))
+    by_flavor = ", ".join(f"{sum(1 for r in rows if r['flavor'] == f)} {f}"
+                          for f in sorted({r["flavor"] for r in rows}))
+    print(f"{len(rows)} invoices ({by_flavor})")
     print(f"{bad} do not reconcile" if bad else "all invoices reconcile")
     print(f"-> {out}")
     return 0
