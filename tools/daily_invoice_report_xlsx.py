@@ -163,18 +163,16 @@ def reconciles(row):
 
 
 def build_workbook(rows, out_path, window):
-    """Columns are driven by what the invoices actually carry.
+    """Summary columns, not a column per code.
 
-    Every SAC code and every tax code present in the window gets its own
-    column, so nothing on an invoice is invisible because a column was not
-    anticipated. Freight and fee charges have never been transmitted to date,
-    but if one arrives it appears as its own column rather than disappearing
-    into a total that then fails to add up.
+    Charges and Unclassified are included only when some invoice in the window
+    actually carries one -- freight has never been transmitted, so on a normal
+    day the sheet is the plain seven columns, and the moment a freight or fee
+    amount arrives it appears as its own column instead of being folded into a
+    total that then does not add up.
     """
-    ded_codes = sorted({c for r in rows for c in r["deductions"]})
-    chg_codes = sorted({c for r in rows for c in r["charges"]})
-    tax_kinds = sorted({k for r in rows for k in r["taxes"]})
-    unk_codes = sorted({c for r in rows for c in r["unknown"]})
+    has_charges = any(r["charges"] for r in rows)
+    has_unknown = any(r["unknown"] for r in rows)
 
     def tot(rs, key):
         return round(sum(sum(r[key].values()) for r in rs), 2)
@@ -183,41 +181,35 @@ def build_workbook(rows, out_path, window):
     ws = wb.active
     ws.title = "Invoices"
 
-    headers = (["Invoice", "Type", "Province", "Invoice Date", "Subtotal",
-                "Discounts"] + [f"Ded {c}" for c in ded_codes]
-               + ["Charges"] + [f"Chg {c}" for c in chg_codes]
-               + ["Tax"] + [f"Tax {k}" for k in tax_kinds]
-               + (["Unclassified"] + [f"Unc {c}" for c in unk_codes] if unk_codes else [])
+    headers = (["Invoice", "Type", "Province", "Invoice Date", "Subtotal", "Discounts"]
+               + (["Charges"] if has_charges else [])
+               + ["Tax"]
+               + (["Unclassified"] if has_unknown else [])
                + ["Total"])
     ws.append(headers)
     for cell in ws[1]:
         cell.fill, cell.font = HDR_FILL, HDR_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
 
     for r in rows:
-        row = ([r["invoice"], r["flavor"], r["province"], r["date"], r["subtotal"],
-                -round(sum(r["deductions"].values()), 2) or 0]
-               + [-r["deductions"][c] if c in r["deductions"] else None for c in ded_codes]
-               + [round(sum(r["charges"].values()), 2) or 0]
-               + [r["charges"].get(c) for c in chg_codes]
-               + [round(sum(r["taxes"].values()), 2) or 0]
-               + [r["taxes"].get(k) for k in tax_kinds])
-        if unk_codes:
-            row += [round(sum(r["unknown"].values()), 2) or 0] + [r["unknown"].get(c) for c in unk_codes]
+        row = [r["invoice"], r["flavor"], r["province"], r["date"], r["subtotal"],
+               -round(sum(r["deductions"].values()), 2) or 0]
+        if has_charges:
+            row.append(round(sum(r["charges"].values()), 2) or 0)
+        row.append(round(sum(r["taxes"].values()), 2) or 0)
+        if has_unknown:
+            row.append(round(sum(r["unknown"].values()), 2) or 0)
         row.append(r["stated"])
         ws.append(row)
 
     last = ws.max_row + 1
-    total_row = (["Total", "", "", "", round(sum(r["subtotal"] for r in rows), 2),
-                  -tot(rows, "deductions")]
-                 + [-round(sum(r["deductions"].get(c, 0) for r in rows), 2) or None for c in ded_codes]
-                 + [tot(rows, "charges")]
-                 + [round(sum(r["charges"].get(c, 0) for r in rows), 2) or None for c in chg_codes]
-                 + [tot(rows, "taxes")]
-                 + [round(sum(r["taxes"].get(k, 0) for r in rows), 2) or None for k in tax_kinds])
-    if unk_codes:
-        total_row += [tot(rows, "unknown")] + [round(sum(r["unknown"].get(c, 0) for r in rows), 2) or None
-                                               for c in unk_codes]
+    total_row = ["Total", "", "", "", round(sum(r["subtotal"] for r in rows), 2),
+                 -tot(rows, "deductions")]
+    if has_charges:
+        total_row.append(tot(rows, "charges"))
+    total_row.append(tot(rows, "taxes"))
+    if has_unknown:
+        total_row.append(tot(rows, "unknown"))
     total_row.append(round(sum(r["stated"] for r in rows), 2))
     ws.append(total_row)
     for cell in ws[last]:
@@ -231,7 +223,7 @@ def build_workbook(rows, out_path, window):
     widths = [18, 11, 10, 14, 13] + [12] * (len(headers) - 6) + [13]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
-    ws.freeze_panes = "E2"
+    ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{last - 1}"
 
     s = wb.create_sheet("Summary")
