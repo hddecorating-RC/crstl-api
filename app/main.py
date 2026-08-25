@@ -81,7 +81,12 @@ def _generate_mock_invoices(count: int = 50) -> list[dict]:
         ("Solar Screen Installation", 230.00),
     ]
     _PARTNERS = ["Home Depot", "Lowe's", "Costco"]
-    _STATUSES = ["Open", "Open", "Open", "Completed"]  # 3:1 open:completed ratio
+    # Mirror the states Crstl actually returns. "Open"/"Completed" were invented
+    # here and appear nowhere in real data; using them meant mock mode exercised
+    # a status vocabulary production never sees, so the Accepted-only reporting
+    # filter passed its tests while dropping every mock invoice. Live ratio on
+    # 2026-08-24 was 107 Accepted to 43 Draft.
+    _STATUSES = ["Accepted", "Accepted", "Accepted", "Draft"]
     _HARDWARE = ("Hardware / Materials", 1, 85.00)
 
     invoices = []
@@ -249,6 +254,40 @@ def _generate_netsuite_export() -> None:
     print(f"NetSuite export: {len(records)} invoices → {out_path} ({len(skipped)} skipped)")
 
 
+# Only invoices HD has acknowledged are reported. The warehouse resubmits when
+# it catches a mistake, and every resubmission lands as another Crstl record --
+# measured 2026-08-24: 36 redundant records across 150 invoices, 31 of them
+# Drafts shadowing an Accepted twin. Reporting Drafts hands accounting the same
+# invoice several times, which is a double-entry risk, not just noise.
+#
+# This is an allowlist, not a "skip Draft" rule: an unrecognised state must not
+# quietly reach accounting. The trade-off is that a NEW good state would be
+# filtered out instead, so _reportable logs anything it drops that is not a
+# known Draft. Only "Draft" and "Accepted" have ever been observed.
+REPORTABLE_STATUSES = frozenset({"Accepted"})
+_KNOWN_UNREPORTABLE = frozenset({"Draft"})
+
+
+def _reportable(invoices: list[dict]) -> list[dict]:
+    """Invoices fit to report to accounting. A Draft that is later accepted is
+    picked up by the next digest: it is never marked emailed while filtered, so
+    nothing is lost, only deferred until HD acknowledges it."""
+    keep, dropped = [], {}
+    for inv in invoices:
+        status = inv.get("status") or ""
+        if status in REPORTABLE_STATUSES:
+            keep.append(inv)
+        elif status not in _KNOWN_UNREPORTABLE:
+            dropped[status] = dropped.get(status, 0) + 1
+    if dropped:
+        # Loud on purpose. If Crstl introduces a state that means "good", these
+        # invoices would silently stop reaching accounting; this is the warning
+        # that says to add it to REPORTABLE_STATUSES.
+        print(f"WARNING: withheld invoices with unrecognised status {dropped} — "
+              f"if one of these is reportable, add it to REPORTABLE_STATUSES")
+    return keep
+
+
 def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
     """Send an invoice email.
 
@@ -277,9 +316,12 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
         to_send = [inv for inv in invoices if inv["transaction_id"] in selected_set]
         mode = "selection"
     else:
-        all_ids = [inv["transaction_id"] for inv in invoices]
+        # Accepted only. Drafts are the warehouse's superseded resubmissions;
+        # emailing them duplicates invoices in accounting's queue.
+        reportable = _reportable(invoices)
+        all_ids = [inv["transaction_id"] for inv in reportable]
         new_ids = set(tracking.get_unemailed_ids(all_ids))
-        to_send = [inv for inv in invoices if inv["transaction_id"] in new_ids]
+        to_send = [inv for inv in reportable if inv["transaction_id"] in new_ids]
         mode = "digest"
 
     today = date.today().isoformat()
@@ -456,6 +498,10 @@ def export(body: ExportRequest = ExportRequest()) -> Response:
             content={"message": "Cache is empty. Trigger /api/sync first."},
         )
     filename = f"invoices_{date.today().isoformat()}.csv"
+    # A bulk export is a report, so it carries Accepted only. An explicit id
+    # list is a deliberate pick from the dashboard and is honoured as given.
+    if body.ids is None:
+        invoices = _reportable(invoices)
     csv_bytes = build_csv(invoices, ids=body.ids)
 
     cache_ids = {inv["transaction_id"] for inv in invoices}
