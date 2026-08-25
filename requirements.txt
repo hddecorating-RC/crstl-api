@@ -7,3 +7,5 @@ msal>=1.24
 pytest>=8.0
 gspread>=6.0
 gspread-formatting>=1.1
+# tools/daily_invoice_report_xlsx.py and tools/export_dsd_asn_audit_xlsx.py
+openpyxl>=3.1
