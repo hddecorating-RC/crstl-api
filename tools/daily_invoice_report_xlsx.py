@@ -144,61 +144,55 @@ def extract(detail, po_index, config):
 
 
 def build_workbook(rows, out_path, window):
-    ded_codes = sorted({c for r in rows for c in r["deductions"]})
-    chg_codes = sorted({c for r in rows for c in r["charges"]})
-    tax_kinds = sorted({k for r in rows for k in r["taxes"]})
+    """Invoices sheet: what was invoiced and how much, one row each.
 
+    Deliberately plain -- invoice, province, date, subtotal, discounts, tax,
+    total. The per-code and per-kind breakdowns live in the payload and can be
+    added back, but accounting asked for the money, not the mechanics.
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = "Invoices"
 
-    headers = (["Invoice", "Date", "PO", "Type", "Province", "Store",
-                "NetSuite Customer", "Tax Code", "Currency", "Lines", "Subtotal"]
-               + [f"Ded {c}" for c in ded_codes] + ["Deductions Total"]
-               + [f"Chg {c}" for c in chg_codes]
-               + [f"Tax {k}" for k in tax_kinds] + ["Tax Total"]
-               + ["Invoice Total", "Computed", "Variance", "Reconciles"])
+    headers = ["Invoice", "Province", "Invoice Date", "Subtotal",
+               "Discounts", "Tax", "Total"]
     ws.append(headers)
     for cell in ws[1]:
         cell.fill, cell.font = HDR_FILL, HDR_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
 
     for r in rows:
-        ded_total = round(sum(r["deductions"].values()), 2)
-        tax_total = round(sum(r["taxes"].values()), 2)
-        balanced = abs(r["variance"]) < 0.005
-        ws.append([r["invoice"], r["date"], r["po"], r["flavor"], r["province"], r["store"],
-                   r["customer"], r["tax_code"], r["currency"], r["line_count"], r["subtotal"]]
-                  + [-r["deductions"].get(c, 0) or None for c in ded_codes] + [-ded_total or None]
-                  + [r["charges"].get(c, 0) or None for c in chg_codes]
-                  + [r["taxes"].get(k, 0) or None for k in tax_kinds] + [tax_total or None]
-                  + [r["stated"], r["computed"], r["variance"],
-                     "OK" if balanced else "CHECK"])
-        if not balanced:
-            for cell in ws[ws.max_row]:
-                cell.fill = BAD_FILL
+        ws.append([r["invoice"], r["province"], r["date"], r["subtotal"],
+                   -round(sum(r["deductions"].values()), 2) or 0,
+                   round(sum(r["taxes"].values()), 2), r["stated"]])
 
-    first_money = headers.index("Subtotal") + 1
-    for row in ws.iter_rows(min_row=2, min_col=first_money):
+    last = ws.max_row + 1
+    ws.append(["Total", "", "",
+               round(sum(r["subtotal"] for r in rows), 2),
+               -round(sum(sum(r["deductions"].values()) for r in rows), 2),
+               round(sum(sum(r["taxes"].values()) for r in rows), 2),
+               round(sum(r["stated"] for r in rows), 2)])
+    for cell in ws[last]:
+        cell.font = Font(bold=True)
+        cell.border = Border(top=Side(style="thin"))
+
+    for row in ws.iter_rows(min_row=2, min_col=4):
         for cell in row:
             if isinstance(cell.value, (int, float)):
                 cell.number_format = MONEY
-    for row in ws.iter_rows(min_row=1):
-        for cell in row:
-            cell.border = BORDER
-    for i, h in enumerate(headers, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = max(10, min(20, len(h) + 3))
-    ws.freeze_panes = "B2"
-    ws.auto_filter.ref = ws.dimensions
+    for i, w in enumerate((18, 10, 14, 13, 12, 12, 13), start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:G{last - 1}"
 
-    # Summary
+    # Summary: the same money by flavor, plus anything that does not tie back
+    # to HD's stated total. Kept off the main sheet so the report stays plain.
     s = wb.create_sheet("Summary")
-    s.append(["Daily invoice report"]); s["A1"].font = Font(bold=True, size=13)
-    s.append(["Window", window])
+    s.append(["Invoiced", window]); s["A1"].font = Font(bold=True, size=13)
     s.append(["Source", "Crstl 810 transactions, state = Accepted"])
     s.append([])
-    s.append(["Type", "Invoices", "Subtotal", "Deductions", "Tax", "Invoice Total"])
-    for cell in s[5]:
+    s.append(["Type", "Invoices", "Subtotal", "Discounts", "Tax", "Total"])
+    for cell in s[4]:
         cell.fill, cell.font = HDR_FILL, HDR_FONT
     for flavor in ("Dropship", "DSD"):
         sub = [r for r in rows if r["flavor"] == flavor]
@@ -216,20 +210,24 @@ def build_workbook(rows, out_path, window):
               round(sum(r["stated"] for r in rows), 2)])
     for cell in s[s.max_row]:
         cell.font = Font(bold=True)
+
     unbalanced = [r for r in rows if abs(r["variance"]) >= 0.005]
     s.append([])
-    s.append(["Invoices that do not reconcile", len(unbalanced)])
+    s.append(["Do not match HD's total", len(unbalanced)])
+    s[s.max_row][0].font = Font(bold=True)
     if unbalanced:
-        s[s.max_row][0].font = Font(bold=True)
         s[s.max_row][1].fill = BAD_FILL
+        s.append(["Invoice", "HD total", "Adds up to", "Difference"])
+        for cell in s[s.max_row]:
+            cell.font = Font(bold=True)
         for r in unbalanced:
-            s.append(["", r["invoice"], f"stated {r['stated']:,.2f} vs computed {r['computed']:,.2f}",
-                      f"variance {r['variance']:,.2f}"])
-    for row in s.iter_rows(min_row=6):
+            s.append([r["invoice"], r["stated"], r["computed"], r["variance"]])
+    for row in s.iter_rows(min_row=5):
         for cell in row:
+            # column 2 on the flavor rows is a count of invoices, not money
             if isinstance(cell.value, (int, float)) and cell.column > 2:
                 cell.number_format = MONEY
-    for i, w in enumerate((34, 14, 16, 16, 14, 16), start=1):
+    for i, w in enumerate((24, 14, 14, 14, 12, 14), start=1):
         s.column_dimensions[get_column_letter(i)].width = w
 
     wb.save(out_path)
