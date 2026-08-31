@@ -1,6 +1,11 @@
+import io
+
 import pytest
+from openpyxl import load_workbook
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
+
+from app.report import XLSX_MEDIA_TYPE
 
 MOCK_INVOICES = [
     {
@@ -24,6 +29,63 @@ MOCK_INVOICES = [
 ]
 
 
+def _raw_810(tx_id, subtotal, tax, *, invoice_date="2026-07-01",
+             flavor="HD Canada Dropship", province="ON", po="PO-123"):
+    """A minimal 810 detail payload in the shape app/report.py extracts from.
+
+    The export re-reads each invoice from Crstl rather than trusting the cached
+    figures, so a test that exercises /api/export has to stand up the raw
+    payload too — a MagicMock detail would extract into a workbook of
+    MagicMocks and assert nothing real.
+    """
+    return {
+        "metadata": {
+            "id": tx_id,
+            "reference_id": f"INV-{tx_id}",
+            "source_document_reference_id": po,
+            "trading_partner_flavor": flavor,
+            "state": {"value": "Accepted"},
+            "value": round(subtotal + tax, 2),
+            "created_at": f"{invoice_date}T00:00:00Z",
+        },
+        "file": {"generic_json_edi": {
+            "heading": {
+                "invoice_number": f"INV-{tx_id}",
+                "invoice_date": invoice_date,
+                "ship_to": {"state_province": province},
+            },
+            "detail": {"baseline_item_data_invoice_loop": [
+                {"baseline_item_data_invoice": {
+                    "quantity_invoiced": "1", "unit_price": f"{subtotal}"}}
+            ]},
+            # Dropship carries tax in TXI, not SAC. VA is HD's code for HST.
+            "summary": {"tax_information": (
+                [{"tax_type_code": "VA", "monetary_amount": f"{tax}"}] if tax else []
+            )},
+        }},
+    }
+
+
+# Amounts per transaction id, mirroring the cached fixtures below.
+_RAW_AMOUNTS = {"tx-001": (4180.0, 320.0)}
+
+
+def _detail_side_effect(tx_id):
+    subtotal, tax = _RAW_AMOUNTS.get(tx_id, (100.0, 0.0))
+    return _raw_810(tx_id, subtotal, tax)
+
+
+def _invoice_rows(content):
+    """Data rows of the workbook's Invoices sheet — header and Total excluded."""
+    ws = load_workbook(io.BytesIO(content))["Invoices"]
+    return [r for r in ws.iter_rows(min_row=2, values_only=True)
+            if r and r[0] and r[0] != "Total"]
+
+
+def _invoice_numbers(content):
+    return [r[0] for r in _invoice_rows(content)]
+
+
 @pytest.fixture
 def client(monkeypatch, tmp_path):
     # Prevent .env MOCK_DATA=true from bypassing the patched CrstlClient
@@ -33,12 +95,17 @@ def client(monkeypatch, tmp_path):
     with patch("app.main.CrstlClient") as MockClient:
         mock_instance = MagicMock()
         mock_instance.fetch_invoices.return_value = MOCK_INVOICES
+        # A real dict, not a MagicMock: _refresh_cache now keeps this map so the
+        # export can resolve a Dropship province without re-crawling every 850.
+        mock_instance.fetch_po_provinces.return_value = {}
+        mock_instance._fetch_transaction_detail.side_effect = _detail_side_effect
         MockClient.return_value = mock_instance
 
         from app.main import app, _cache, _netsuite_state
         with TestClient(app) as c:
             # Reset cache after startup so each test controls its own state
             _cache["invoices"] = []
+            _cache["po_provinces"] = {}
             _cache["last_synced"] = None
             _cache["status"] = "never"
             _netsuite_state["last_generated"] = None
@@ -68,21 +135,49 @@ def test_sync_triggers_refresh(client):
     assert data["status"] == "ok"
 
 
-def test_export_all_returns_csv(client):
+def test_export_all_returns_xlsx(client):
     # Pre-populate cache via sync
     client.post("/api/sync")
     resp = client.post("/api/export", json={})
     assert resp.status_code == 200
-    assert "text/csv" in resp.headers["content-type"]
+    assert resp.headers["content-type"] == XLSX_MEDIA_TYPE
     assert "attachment" in resp.headers["content-disposition"]
+    assert resp.headers["content-disposition"].endswith('.xlsx"')
+    assert _invoice_numbers(resp.content) == ["INV-tx-001"]
 
 
 def test_export_subset_by_ids(client):
     client.post("/api/sync")
     resp = client.post("/api/export", json={"ids": ["tx-001"]})
     assert resp.status_code == 200
-    lines = resp.content.decode().splitlines()
-    assert len(lines) == 2  # header + 1 row
+    assert _invoice_numbers(resp.content) == ["INV-tx-001"]
+
+
+def test_export_reports_the_810_figures_not_the_cached_ones(client):
+    """The cache infers Dropship tax from a province rate table; the workbook
+    reads the TXI segment HD actually sent. This asserts the workbook is built
+    from the payload, so the two can never silently diverge behind one
+    filename."""
+    client.post("/api/sync")
+    resp = client.post("/api/export", json={"ids": ["tx-001"]})
+    row = _invoice_rows(resp.content)[0]
+    # Invoice, Type, Province, Date, Subtotal, Discounts, Tax, Total
+    assert row[1] == "Dropship"
+    assert row[2] == "ON"
+    assert row[4] == 4180.0      # subtotal from the line loop
+    assert row[-2] == 320.0      # tax from TXI, not from a rate table
+    assert row[-1] == 4500.0     # metadata.value, HD's stated total
+
+
+def test_export_502s_when_crstl_returns_nothing(client):
+    """An empty workbook reads as "a quiet day" to whoever opens it. If every
+    detail fetch failed, that must surface as an error instead."""
+    from app.main import _cache
+    client.post("/api/sync")
+    with patch("app.main.rows_for_transactions", return_value=[]):
+        resp = client.post("/api/export", json={})
+    assert resp.status_code == 502
+    assert "no detail" in resp.json()["message"]
 
 
 def test_export_empty_cache_returns_503(client):
@@ -225,11 +320,9 @@ def test_bulk_export_excludes_drafts(client):
     from app.main import _cache
     client.post("/api/sync")
     with patch.dict(_cache, {"invoices": _mixed_status_invoices()}):
-        body = client.post("/api/export", json={}).content.decode()
-    rows = [r for r in body.splitlines()[1:] if r.strip()]
-    assert len(rows) == 1, f"expected only the Accepted invoice, got {len(rows)} rows"
-    assert "tx-acc" in body
-    assert "tx-dr1" not in body and "tx-dr2" not in body
+        content = client.post("/api/export", json={}).content
+    numbers = _invoice_numbers(content)
+    assert numbers == ["INV-tx-acc"], f"expected only the Accepted invoice, got {numbers}"
 
 
 def test_explicit_id_selection_is_honoured_even_for_a_draft(client):
@@ -238,9 +331,8 @@ def test_explicit_id_selection_is_honoured_even_for_a_draft(client):
     from app.main import _cache
     client.post("/api/sync")
     with patch.dict(_cache, {"invoices": _mixed_status_invoices()}):
-        body = client.post("/api/export", json={"ids": ["tx-dr1"]}).content.decode()
-    assert "tx-dr1" in body
-    assert "tx-acc" not in body
+        content = client.post("/api/export", json={"ids": ["tx-dr1"]}).content
+    assert _invoice_numbers(content) == ["INV-tx-dr1"]
 
 
 def test_draft_is_not_marked_emailed_so_it_can_be_reported_once_accepted(client):
@@ -257,3 +349,37 @@ def test_draft_is_not_marked_emailed_so_it_can_be_reported_once_accepted(client)
     assert mail.called
     # the drafts remain unemailed and are therefore still eligible later
     assert set(get_unemailed_ids(["tx-acc", "tx-dr1", "tx-dr2"])) == {"tx-dr1", "tx-dr2"}
+
+
+def test_digest_attaches_the_workbook(client, monkeypatch):
+    """The digest carries the same workbook the Export button produces. These
+    are the two surfaces accounting actually receives, so they must not drift
+    into different formats — or different figures — from one another."""
+    from app.main import _send_daily_digest
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    client.post("/api/sync")
+    with patch("app.main.send_mail") as mail:
+        result = _send_daily_digest()
+    assert result["count"] == 1
+    attachments = mail.call_args.kwargs["attachments"]
+    assert len(attachments) == 1
+    name, content, mime = attachments[0]
+    assert name.endswith(".xlsx")
+    assert mime == XLSX_MEDIA_TYPE
+    assert _invoice_numbers(content) == ["INV-tx-001"]
+
+
+def test_digest_aborts_rather_than_emailing_without_the_workbook(client, monkeypatch):
+    """If Crstl can't be reached the digest must fail, not send. Nothing is
+    marked emailed, so tomorrow's digest still carries these invoices instead
+    of accounting receiving a mail that quietly omits them."""
+    from app.main import _send_daily_digest, ReportUnavailable
+    from app.tracking import get_unemailed_ids
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    client.post("/api/sync")
+    with patch("app.main.rows_for_transactions", return_value=[]), \
+         patch("app.main.send_mail") as mail:
+        with pytest.raises(ReportUnavailable):
+            _send_daily_digest()
+    assert not mail.called
+    assert get_unemailed_ids(["tx-001"]) == ["tx-001"]

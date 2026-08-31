@@ -14,11 +14,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel
 
 from app.crstl import CrstlClient
-from app.export import build_csv
 from app import tracking
 from app.mail import send_mail, MailConfigError
 from app.netsuite import transform_invoice
 from app.netsuite_csv import build_netsuite_csv
+from app.report import (XLSX_MEDIA_TYPE, flavor_of, rows_for_transactions,
+                        window_label, workbook_bytes)
 
 
 def load_env(path: str = ".env") -> None:
@@ -35,7 +36,10 @@ def load_env(path: str = ".env") -> None:
 
 load_env()
 
-_cache: dict = {"invoices": [], "last_synced": None, "status": "never"}
+# po_provinces is kept, not just applied to the invoices, because the workbook
+# recovers a Dropship invoice's province from its 850 the same way -- and
+# rebuilding that map at export time would crawl every 850 on record again.
+_cache: dict = {"invoices": [], "last_synced": None, "status": "never", "po_provinces": {}}
 _cache_lock = threading.Lock()
 _netsuite_state: dict = {"last_generated": None, "path": None, "count": 0, "skipped": 0, "error": None, "generating": False}
 _netsuite_lock = threading.Lock()
@@ -81,6 +85,10 @@ def _generate_mock_invoices(count: int = 50) -> list[dict]:
         ("Solar Screen Installation", 230.00),
     ]
     _PARTNERS = ["Home Depot", "Lowe's", "Costco"]
+    # The workbook's Type column reads this. Without it mock mode exercised the
+    # export with every row typed "Unknown", which is not a shape production
+    # ever produces.
+    _FLAVORS = ["HD Canada Dropship", "HD Canada DSD", "HD Canada Wholesale"]
     # Mirror the states Crstl actually returns. "Open"/"Completed" were invented
     # here and appear nowhere in real data; using them meant mock mode exercised
     # a status vocabulary production never sees, so the Accepted-only reporting
@@ -113,6 +121,7 @@ def _generate_mock_invoices(count: int = 50) -> list[dict]:
             "invoice_number": f"INV-2025-{base_inv - i:03d}",
             "po_number": f"PO-{base_po - i * 3}",
             "trading_partner": _PARTNERS[i % len(_PARTNERS)],
+            "trading_partner_flavor": _FLAVORS[i % len(_FLAVORS)],
             "invoice_date": inv_date.isoformat(),
             "due_date": due_date.isoformat(),
             "status": _STATUSES[i % len(_STATUSES)],
@@ -194,12 +203,17 @@ def _annotate_tax_suggestion(invoices: list[dict]) -> None:
             }
 
 
+def _mock_mode() -> bool:
+    return os.environ.get("MOCK_DATA", "").lower() in ("1", "true", "yes")
+
+
 def _refresh_cache() -> None:
-    if os.environ.get("MOCK_DATA", "").lower() in ("1", "true", "yes"):
+    if _mock_mode():
         invoices = list(_MOCK_INVOICES)
         _attach_provinces(invoices, _MOCK_PO_PROVINCES)
         with _cache_lock:
             _cache["invoices"] = invoices
+            _cache["po_provinces"] = dict(_MOCK_PO_PROVINCES)
             _cache["last_synced"] = datetime.now(timezone.utc).isoformat()
             _cache["status"] = "ok (mock)"
         return
@@ -211,11 +225,75 @@ def _refresh_cache() -> None:
         _annotate_tax_suggestion(invoices)
         with _cache_lock:
             _cache["invoices"] = invoices
+            _cache["po_provinces"] = po_provinces
             _cache["last_synced"] = datetime.now(timezone.utc).isoformat()
             _cache["status"] = "ok"
     except Exception as exc:
         with _cache_lock:
             _cache["status"] = f"error: {exc}"
+
+
+class ReportUnavailable(RuntimeError):
+    """The workbook could not be built because Crstl returned nothing usable."""
+
+
+def _mock_report_row(inv: dict) -> dict:
+    """MOCK_DATA only: a workbook row from a cached invoice dict.
+
+    Mock invoices have no 810 payload to extract from, so without this the mock
+    dashboard's Export button would have nothing to build from. Production must
+    never take this path: the cached dicts read tax differently from
+    app/report.py (see its module docstring), and letting both reach the
+    workbook would put two different tax readings behind one filename.
+    """
+    subtotal = round(inv.get("subtotal") or 0.0, 2)
+    tax = round(inv.get("tax_amount") or 0.0, 2)
+    stated = round(inv.get("total_amount") or 0.0, 2)
+    computed = round(subtotal + tax, 2)
+    return {
+        "transaction_id": inv.get("transaction_id", ""),
+        "invoice": inv.get("invoice_number", ""),
+        "date": inv.get("invoice_date", ""),
+        "po": inv.get("po_number", ""),
+        "flavor": flavor_of(inv),
+        "province": inv.get("province") or "",
+        "subtotal": subtotal,
+        "deductions": {},
+        "charges": {},
+        "taxes": {"GST": tax} if tax else {},
+        "unknown": {},
+        "stated": stated,
+        "computed": computed,
+        "variance": round(stated - computed, 2),
+    }
+
+
+def _workbook_for(invoices: list[dict]) -> bytes:
+    """The accounting workbook for a set of cached invoices, as .xlsx bytes.
+
+    Re-reads each invoice's raw 810 from Crstl rather than using the cached
+    figures, because the cache and the workbook disagree on tax — the cache
+    classifies SAC by code before indicator and never reads TXI at all, so
+    Dropship tax there is inferred from a province rate table rather than
+    reported. app/report.py's module docstring has the detail. The province
+    map is the one `_refresh_cache` already built, so no 850 is re-crawled.
+    """
+    if _mock_mode():
+        rows = sorted((_mock_report_row(inv) for inv in invoices),
+                      key=lambda r: (r["flavor"], r["invoice"]))
+    else:
+        with _cache_lock:
+            po_index = dict(_cache["po_provinces"])
+        ids = [inv["transaction_id"] for inv in invoices if inv.get("transaction_id")]
+        rows = rows_for_transactions(_get_client(), ids, po_index)
+        if ids and not rows:
+            # Every detail fetch failed. An empty workbook would read as "a
+            # quiet day" to whoever opens it, which is the one thing it must
+            # not do.
+            raise ReportUnavailable(
+                f"Crstl returned no detail for any of the {len(ids)} invoices requested."
+            )
+    return workbook_bytes(rows, window_label(rows))
 
 
 def _generate_netsuite_export() -> None:
@@ -353,10 +431,13 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
               <tr><th align="left">Province</th><th align="right">Count</th></tr>
               {prov_rows}
             </table>
-            <p>Full details attached as CSV.</p>
+            <p>Full details attached as an Excel workbook.</p>
         """
-        csv_bytes = build_csv(to_send)
-        attachments = [(f"hd_invoices_{today}.csv", csv_bytes, "text/csv")]
+        # Raises ReportUnavailable if Crstl can't be reached. That aborts the
+        # send, which is deliberate: nothing is marked emailed, so tomorrow's
+        # digest carries these invoices instead of accounting receiving a
+        # workbook that quietly omits them.
+        attachments = [(f"hd_invoices_{today}.xlsx", _workbook_for(to_send), XLSX_MEDIA_TYPE)]
     else:
         # Only reachable in digest mode — selection mode with 0 matches is a caller bug
         subject = f"HD Invoice Digest — {today} — 0 new"
@@ -497,24 +578,30 @@ def export(body: ExportRequest = ExportRequest()) -> Response:
             status_code=503,
             content={"message": "Cache is empty. Trigger /api/sync first."},
         )
-    filename = f"invoices_{date.today().isoformat()}.csv"
     # A bulk export is a report, so it carries Accepted only. An explicit id
     # list is a deliberate pick from the dashboard and is honoured as given.
     if body.ids is None:
         invoices = _reportable(invoices)
-    csv_bytes = build_csv(invoices, ids=body.ids)
+    else:
+        wanted = set(body.ids)
+        invoices = [inv for inv in invoices if inv["transaction_id"] in wanted]
+    if not invoices:
+        return JSONResponse(
+            status_code=404,
+            content={"message": "No invoices matched the request."},
+        )
 
-    cache_ids = {inv["transaction_id"] for inv in invoices}
-    exported_ids = (
-        [i for i in body.ids if i in cache_ids]
-        if body.ids is not None
-        else [inv["transaction_id"] for inv in invoices]
-    )
-    tracking.record_events(exported_ids, "exported")
+    try:
+        xlsx_bytes = _workbook_for(invoices)
+    except ReportUnavailable as exc:
+        return JSONResponse(status_code=502, content={"message": str(exc)})
 
+    tracking.record_events([inv["transaction_id"] for inv in invoices], "exported")
+
+    filename = f"invoices_{date.today().isoformat()}.xlsx"
     return Response(
-        content=csv_bytes,
-        media_type="text/csv",
+        content=xlsx_bytes,
+        media_type=XLSX_MEDIA_TYPE,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

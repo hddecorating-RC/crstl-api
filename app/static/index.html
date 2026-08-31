@@ -147,19 +147,19 @@
                  etc., without losing the Draft/Sent status filter. -->
             <select x-model="exportStateFilter" @change="currentPage = 1"
                     class="px-3 py-1.5 text-xs border border-gray-200 rounded-full bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-600"
-                    title="Filter by CSV download / email digest history">
+                    title="Filter by workbook download / email digest history">
               <option value="Any">All export states</option>
               <option value="Emailed">Emailed ✉</option>
               <option value="NotEmailed">Not emailed</option>
-              <option value="Exported">CSV exported ↓</option>
-              <option value="NotExported">Not CSV exported</option>
+              <option value="Exported">Exported ↓</option>
+              <option value="NotExported">Not exported</option>
             </select>
           </div>
         </template>
         <template x-if="selected.size > 0">
           <div class="flex items-center gap-2">
             <span class="text-sm font-medium text-blue-700" x-text="`${selected.size} selected`"></span>
-            <button @click="exportCsv()" :disabled="exporting"
+            <button @click="exportSelected()" :disabled="exporting"
                     class="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-2 rounded-full disabled:opacity-50">
               <span x-show="!exporting">↓ Export</span>
               <span x-show="exporting">Exporting…</span>
@@ -388,7 +388,7 @@
               <div class="col-span-2 border-t pt-4 mt-1">
                 <dt class="text-xs text-gray-400 mb-1">Export History</dt>
                 <dd class="text-xs text-gray-600 space-y-0.5">
-                  <span class="block">CSV: <span x-text="activeInvoice.exported_at ? fmtTime(activeInvoice.exported_at) : '—'"></span></span>
+                  <span class="block">Workbook: <span x-text="activeInvoice.exported_at ? fmtTime(activeInvoice.exported_at) : '—'"></span></span>
                   <span class="block">NetSuite: <span x-text="activeInvoice.netsuite_at ? fmtTime(activeInvoice.netsuite_at) : '—'"></span></span>
                 </dd>
               </div>
@@ -445,7 +445,7 @@
     <div class="flex gap-3 mt-4">
       <button @click="exportAll()" :disabled="exporting || invoices.length === 0"
               class="bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-2 rounded-lg disabled:opacity-50 transition">
-        <span x-show="!exporting">↓ Export All &amp; Download CSV</span>
+        <span x-show="!exporting">↓ Export All &amp; Download Workbook</span>
         <span x-show="exporting">Exporting…</span>
       </button>
       <button @click="syncNow()" :disabled="syncing"
@@ -644,56 +644,45 @@ function dashboard() {
       }
     },
 
-    async exportCsv() {
+    // The export re-reads each invoice's 810 from Crstl to build the workbook,
+    // so this is seconds rather than instant on a full export. The button's
+    // disabled/"Exporting…" state covers the wait.
+    async downloadWorkbook(body) {
       this.exporting = true;
       try {
-        const body = this.selected.size > 0 ? { ids: [...this.selected] } : {};
         const res = await fetch('/api/export', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
         if (!res.ok) {
-          this.showToast('Export failed — try refreshing first');
+          // The server explains a 502 (Crstl unreachable) and a 503 (cache
+          // empty); showing its reason beats guessing at "try refreshing".
+          const detail = await res.json().catch(() => null);
+          this.showToast(detail?.message || 'Export failed — try refreshing first');
           return;
         }
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `invoices_${new Date().toISOString().slice(0,10)}.csv`;
+        a.download = `invoices_${new Date().toISOString().slice(0,10)}.xlsx`;
         a.click();
         setTimeout(() => URL.revokeObjectURL(url), 100);
         this.lastExport = new Date().toISOString();
         await this.loadInvoices();
-        this.showToast('CSV downloaded');
+        this.showToast('Workbook downloaded');
       } finally {
         this.exporting = false;
       }
     },
 
-    async exportAll() {
-      this.exporting = true;
-      try {
-        const res = await fetch('/api/export', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({}),
-        });
-        if (!res.ok) { this.showToast('Export failed — try refreshing first'); return; }
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `invoices_${new Date().toISOString().slice(0,10)}.csv`;
-        a.click();
-        setTimeout(() => URL.revokeObjectURL(url), 100);
-        this.lastExport = new Date().toISOString();
-        await this.loadInvoices();
-        this.showToast('CSV downloaded');
-      } finally {
-        this.exporting = false;
-      }
+    exportSelected() {
+      return this.downloadWorkbook(this.selected.size > 0 ? { ids: [...this.selected] } : {});
+    },
+
+    exportAll() {
+      return this.downloadWorkbook({});
     },
 
     selectInvoice(inv) {
