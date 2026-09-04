@@ -27,6 +27,17 @@ predates H770 and routes HST to H680.
 
 Dropship invoices carry no ship-to, so the province is recovered from the 850
 PO; DSD carries its own.
+
+Ship Date and Pickup Date are two columns because the 856 sends one date that
+means two different things: the real ship date on Dropship and Wholesale, a
+scheduled pickup on DSD whose goods leave 3-4 days later. A DSD Ship Date is
+left blank rather than filled with the pickup date -- the actual one is in
+Finale, which this service does not read. app/shipments.py has the evidence.
+
+The Product column -- drapery or blinds -- comes from the 850 as well. An 810
+carries no vendor item number on any flavor, and the 850 is already fetched
+for the province, so the same po_index answers both. app/products.py holds the
+rule; DSD is settled here, because DSD 850s carry no item number either.
 """
 import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,6 +47,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from app.crstl import CrstlClient
+from app.products import DRAPE, UNKNOWN, label_for
+
 
 num = CrstlClient._parse_float             # strips thousands separators
 
@@ -75,6 +88,41 @@ def flavor_of(meta):
     return raw or "Unknown"
 
 
+def product_for(flavor, po_entry):
+    """The Product column for one invoice: what was sold, not how it shipped.
+
+    Blinds have only ever reached us by Dropship, but the Dropship reading is
+    keyed on the item number rather than on the flavor, so the day a blind
+    ships another way the column follows the item. DSD is the one flavor read
+    from the flavor itself -- its 850s carry no item number to read instead --
+    and every DSD item HD has ordered is drapery.
+    """
+    label = label_for((po_entry or {}).get("vendor_items") or ())
+    if label:
+        return label
+    if flavor == "DSD":
+        return DRAPE
+    return UNKNOWN
+
+
+def dates_for(flavor, asn_date):
+    """Split the one date the 856 carries into the two columns it means.
+
+    Dropship and Wholesale send the real ship date. DSD sends a scheduled
+    pickup date -- HD requires one to raise the ASN -- and the goods ship 3-4
+    days later; that actual date is in Finale, not in any EDI document we
+    receive. app/shipments.py has the evidence.
+
+    So a DSD row's Ship Date is left blank on purpose. Putting the pickup date
+    there would read as a ship date to accounting and be wrong by 3-4 days on
+    every DSD line, which is worse than saying nothing. The blank is the slot
+    Finale fills.
+    """
+    if flavor == "DSD":
+        return {"ship_date": "", "pickup_date": asn_date}
+    return {"ship_date": asn_date, "pickup_date": ""}
+
+
 def extract(detail, po_index):
     """Flatten one 810 payload into the row accounting needs."""
     meta = detail.get("metadata", {}) or {}
@@ -83,9 +131,11 @@ def extract(detail, po_index):
     summary = edi.get("summary", {}) or {}
 
     po = str(meta.get("source_document_reference_id") or heading.get("purchase_order_number") or "")
+    po_entry = po_index.get(po) or {}
     ship_to = heading.get("ship_to") or {}
     province = (str(ship_to.get("state_province") or "").upper()
-                or str((po_index.get(po) or {}).get("province") or "").upper())
+                or str(po_entry.get("province") or "").upper())
+    flavor = flavor_of(meta)
 
     subtotal = round(sum(
         num((e.get("baseline_item_data_invoice", {}) or {}).get("quantity_invoiced"))
@@ -139,8 +189,10 @@ def extract(detail, po_index):
         "invoice": str(meta.get("reference_id") or heading.get("invoice_number") or ""),
         "date": heading.get("invoice_date") or "",
         "po": po,
-        "flavor": flavor_of(meta),
+        "flavor": flavor,
+        "product": product_for(flavor, po_entry),
         "province": province,
+        **dates_for(flavor, str(po_entry.get("asn_date") or "")),
         "subtotal": subtotal,
         "deductions": deductions,
         "charges": charges,
@@ -159,6 +211,9 @@ def reconciles(row):
 def build_workbook(rows, window):
     """Summary columns, not a column per code. Returns an openpyxl Workbook.
 
+    Type is how the invoice shipped, Product is what was on it -- an invoice
+    can be Dropship and carry either line, so accounting needs both.
+
     Charges and Unclassified are included only when some invoice in the window
     actually carries one -- freight has never been transmitted, so on a normal
     day the sheet is the plain seven columns, and the moment a freight or fee
@@ -175,7 +230,8 @@ def build_workbook(rows, window):
     ws = wb.active
     ws.title = "Invoices"
 
-    headers = (["Invoice", "Type", "Province", "Invoice Date", "Subtotal", "Discounts"]
+    headers = (["Invoice", "Type", "Product", "Province", "Invoice Date",
+                "Ship Date", "Pickup Date", "Subtotal", "Discounts"]
                + (["Charges"] if has_charges else [])
                + ["Tax"]
                + (["Unclassified"] if has_unknown else [])
@@ -186,7 +242,8 @@ def build_workbook(rows, window):
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     for r in rows:
-        row = [r["invoice"], r["flavor"], r["province"], r["date"], r["subtotal"],
+        row = [r["invoice"], r["flavor"], r["product"], r["province"], r["date"],
+               r["ship_date"], r["pickup_date"], r["subtotal"],
                -round(sum(r["deductions"].values()), 2) or 0]
         if has_charges:
             row.append(round(sum(r["charges"].values()), 2) or 0)
@@ -197,7 +254,8 @@ def build_workbook(rows, window):
         ws.append(row)
 
     last = ws.max_row + 1
-    total_row = ["Total", "", "", "", round(sum(r["subtotal"] for r in rows), 2),
+    total_row = ["Total", "", "", "", "", "", "",
+                 round(sum(r["subtotal"] for r in rows), 2),
                  -tot(rows, "deductions")]
     if has_charges:
         total_row.append(tot(rows, "charges"))
@@ -210,11 +268,13 @@ def build_workbook(rows, window):
         cell.font = Font(bold=True)
         cell.border = Border(top=Side(style="thin"))
 
-    for row in ws.iter_rows(min_row=2, min_col=5):
+    # Subtotal is column 8 now that Ship Date and Pickup Date sit between the
+    # dates and the money. Formatting earlier would money-format the dates.
+    for row in ws.iter_rows(min_row=2, min_col=8):
         for cell in row:
             if isinstance(cell.value, (int, float)):
                 cell.number_format = MONEY
-    widths = [18, 11, 10, 14, 13] + [12] * (len(headers) - 6) + [13]
+    widths = [18, 11, 13, 10, 14, 16, 16, 13] + [12] * (len(headers) - 9) + [13]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
@@ -223,20 +283,38 @@ def build_workbook(rows, window):
     s = wb.create_sheet("Summary")
     s.append(["Invoiced", window]); s["A1"].font = Font(bold=True, size=13)
     s.append(["Source", "Crstl 810 transactions, state = Accepted"])
-    s.append([])
-    s.append(["Type", "Invoices", "Subtotal", "Discounts", "Charges", "Tax", "Total"])
-    for cell in s[4]:
-        cell.fill, cell.font = HDR_FILL, HDR_FONT
-    for flavor in sorted({r["flavor"] for r in rows}):
-        sub = [r for r in rows if r["flavor"] == flavor]
-        s.append([flavor, len(sub), round(sum(r["subtotal"] for r in sub), 2),
-                  -tot(sub, "deductions"), tot(sub, "charges"), tot(sub, "taxes"),
-                  round(sum(r["stated"] for r in sub), 2)])
-    s.append(["Total", len(rows), round(sum(r["subtotal"] for r in rows), 2),
-              -tot(rows, "deductions"), tot(rows, "charges"), tot(rows, "taxes"),
-              round(sum(r["stated"] for r in rows), 2)])
-    for cell in s[s.max_row]:
-        cell.font = Font(bold=True)
+
+    def block(title, key):
+        """One breakdown of the money, split by `key`.
+
+        Type is how an invoice shipped, Product is what was on it. They are
+        two cuts of the same invoices, not two subsets, so each block carries
+        its own Total row and the two must agree -- a reader who adds up one
+        block can check it against the other without leaving the sheet.
+
+        A block is written even when everything falls in one bucket. Drapery
+        outsells blinds by an order of magnitude, so most windows have a
+        single Product row, and a "Drape Panel 52" line that equals the total
+        is the sheet stating there were no blinds rather than staying silent
+        about them.
+        """
+        s.append([])
+        s.append([title, "Invoices", "Subtotal", "Discounts", "Charges", "Tax", "Total"])
+        for cell in s[s.max_row]:
+            cell.fill, cell.font = HDR_FILL, HDR_FONT
+        for value in sorted({r[key] for r in rows}):
+            sub = [r for r in rows if r[key] == value]
+            s.append([value, len(sub), round(sum(r["subtotal"] for r in sub), 2),
+                      -tot(sub, "deductions"), tot(sub, "charges"), tot(sub, "taxes"),
+                      round(sum(r["stated"] for r in sub), 2)])
+        s.append(["Total", len(rows), round(sum(r["subtotal"] for r in rows), 2),
+                  -tot(rows, "deductions"), tot(rows, "charges"), tot(rows, "taxes"),
+                  round(sum(r["stated"] for r in rows), 2)])
+        for cell in s[s.max_row]:
+            cell.font = Font(bold=True)
+
+    block("Type", "flavor")
+    block("Product", "product")
 
     unbalanced = [r for r in rows if not reconciles(r)]
     s.append([])
@@ -249,7 +327,7 @@ def build_workbook(rows, window):
             cell.font = Font(bold=True)
         for r in unbalanced:
             s.append([r["invoice"], r["stated"], r["computed"], r["variance"]])
-    for row in s.iter_rows(min_row=5):
+    for row in s.iter_rows(min_row=3):
         for cell in row:
             if isinstance(cell.value, (int, float)) and cell.column > 2:
                 cell.number_format = MONEY

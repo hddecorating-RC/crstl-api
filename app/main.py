@@ -18,8 +18,9 @@ from app import tracking
 from app.mail import send_mail, MailConfigError
 from app.netsuite import transform_invoice
 from app.netsuite_csv import build_netsuite_csv
-from app.report import (XLSX_MEDIA_TYPE, flavor_of, rows_for_transactions,
-                        window_label, workbook_bytes)
+from app.report import (XLSX_MEDIA_TYPE, dates_for, flavor_of, product_for,
+                        rows_for_transactions, window_label, workbook_bytes)
+from app.shipments import merge_asn_dates
 
 
 def load_env(path: str = ".env") -> None:
@@ -52,12 +53,19 @@ def _build_mock_po_provinces() -> dict[str, dict]:
     result = {}
     for i in range(50):
         po = f"PO-{98801 - i * 3}"
+        # A blind every seventh PO, so the mock dashboard exercises the
+        # Product column instead of showing one value down the whole sheet.
+        items = ["138VB48D36WHTC"] if i % 7 == 0 else [f"72{135 + i % 40}-109-52-84-404"]
+        # Every ninth PO has no ASN, so the mock exercises a blank date
+        # column as well as a filled one.
+        ship = {} if i % 9 == 0 else {"asn_date": f"2026-08-{(i % 27) + 1:02d}"}
         if i % 10 < 2:
-            result[po] = {"province": "ON", "store": "VAUGHAN"}
+            result[po] = {"province": "ON", "store": "VAUGHAN", "vendor_items": items, **ship}
         elif i % 10 < 4:
-            result[po] = {"province": "AB", "store": "CALGARY"}
+            result[po] = {"province": "AB", "store": "CALGARY", "vendor_items": items, **ship}
         else:
-            result[po] = {"province": provinces[i % len(provinces)], "store": None}
+            result[po] = {"province": provinces[i % len(provinces)], "store": None,
+                          "vendor_items": items, **ship}
     return result
 
 
@@ -238,6 +246,10 @@ def _refresh_cache() -> None:
         client = _get_client()
         invoices = client.fetch_invoices()
         po_provinces = client.fetch_po_provinces()
+        # The Ship Date and Pickup Date columns come from the 856, joined on
+        # the same PO number. Narrowed to POs already on file so the sync
+        # does not crawl ASN details for orders the report will never show.
+        merge_asn_dates(po_provinces, client.fetch_asn_dates(po_provinces.keys()))
         _attach_provinces(invoices, po_provinces)
         _annotate_tax_suggestion(invoices)
         with _cache_lock:
@@ -273,7 +285,10 @@ def _mock_report_row(inv: dict) -> dict:
         "date": inv.get("invoice_date", ""),
         "po": inv.get("po_number", ""),
         "flavor": flavor_of(inv),
+        "product": product_for(flavor_of(inv), _MOCK_PO_PROVINCES.get(inv.get("po_number", ""))),
         "province": inv.get("province") or "",
+        **dates_for(flavor_of(inv),
+                    (_MOCK_PO_PROVINCES.get(inv.get("po_number", "")) or {}).get("asn_date", "")),
         "subtotal": subtotal,
         "deductions": {},
         "charges": {},

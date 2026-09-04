@@ -86,6 +86,17 @@ def _invoice_numbers(content):
     return [r[0] for r in _invoice_rows(content)]
 
 
+def _invoice_header(content):
+    """Header labels of the Invoices sheet.
+
+    Assertions index by label rather than by position: the sheet has gained
+    columns twice (Product, then Ship Date), and each time every positional
+    assertion downstream of the insert broke without the figures themselves
+    being wrong."""
+    ws = load_workbook(io.BytesIO(content))["Invoices"]
+    return [c.value for c in ws[1]]
+
+
 @pytest.fixture
 def client(monkeypatch, tmp_path):
     # Prevent .env MOCK_DATA=true from bypassing the patched CrstlClient
@@ -161,12 +172,16 @@ def test_export_reports_the_810_figures_not_the_cached_ones(client):
     client.post("/api/sync")
     resp = client.post("/api/export", json={"ids": ["tx-001"]})
     row = _invoice_rows(resp.content)[0]
-    # Invoice, Type, Province, Date, Subtotal, Discounts, Tax, Total
-    assert row[1] == "Dropship"
-    assert row[2] == "ON"
-    assert row[4] == 4180.0      # subtotal from the line loop
-    assert row[-2] == 320.0      # tax from TXI, not from a rate table
-    assert row[-1] == 4500.0     # metadata.value, HD's stated total
+    at = _invoice_header(resp.content).index
+    assert row[at("Type")] == "Dropship"
+    # fetch_po_provinces is stubbed empty here, so there is no 850 to read the
+    # ordered items from. A Dropship invoice with no PO on file reports
+    # Unknown rather than defaulting to the product line we sell more of.
+    assert row[at("Product")] == "Unknown"
+    assert row[at("Province")] == "ON"
+    assert row[at("Subtotal")] == 4180.0    # subtotal from the line loop
+    assert row[at("Tax")] == 320.0          # tax from TXI, not from a rate table
+    assert row[at("Total")] == 4500.0       # metadata.value, HD's stated total
 
 
 def test_export_502s_when_crstl_returns_nothing(client):

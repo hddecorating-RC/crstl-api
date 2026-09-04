@@ -3,6 +3,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
 
+from app.products import vendor_items_in
+from app.shipments import asn_date_index
 from app.sac_codes import classify
 
 
@@ -46,9 +48,14 @@ class CrstlClient:
 
     def fetch_po_provinces(self) -> dict[str, dict]:
         """
-        Fetch all 850 POs and return {po_number: {"province": "ON", "store": "VAUGHAN"|None}}.
+        Fetch all 850 POs and return
+        {po_number: {"province": "ON", "store": "VAUGHAN"|None, "vendor_items": [...]}}.
         store is set for wholesale orders (identified by ship-to name containing VAUGHAN or CALGARY).
         province is the 2-letter Canadian province code from the ship-to address.
+        vendor_items are the ordered items' numbers, which app/products.py reads
+        to tell drapery from blinds -- the 810 carries no item number at all, so
+        the workbook's Product column depends on this map the same way its
+        Province column does.
         """
         pos = self._fetch_all_transactions(transaction_type="850")
         # (po_id, po_number) pairs — skip anything missing either
@@ -73,7 +80,12 @@ class CrstlClient:
                               .get("ship_to", {})
                     )
                     province = str(ship_to.get("state_province") or "").upper().strip()
-                    if not province:
+                    vendor_items = vendor_items_in(detail)
+                    # A PO with no ship-to province used to be dropped outright.
+                    # It still carries the items ordered, and dropping it now
+                    # would blank the Product column on an invoice whose
+                    # province was already blank -- two gaps for one cause.
+                    if not province and not vendor_items:
                         continue
 
                     ship_to_name = str(ship_to.get("name") or "").upper()
@@ -83,13 +95,50 @@ class CrstlClient:
                     elif "CALGARY" in ship_to_name:
                         store = "CALGARY"
 
-                    result[pnum] = {"province": province, "store": store}
+                    result[pnum] = {"province": province or None, "store": store,
+                                    "vendor_items": vendor_items}
                 except Exception as exc:
                     # Broad catch intentional: detail fetches can fail for structural reasons
                     # (malformed JSON, unexpected schema) beyond HTTP errors. Best-effort bulk fetch
                     # should skip bad records rather than abort the whole job.
                     print(f"WARNING: failed to fetch 850 detail for {pnum}: {exc}")
         return result
+
+    def fetch_asn_dates(self, po_numbers=None) -> dict[str, str]:
+        """Fetch 856 ASNs and return {po_number: date label} for the workbook's
+        Ship Date and Pickup Date columns. app/shipments.py holds the reading
+        rule, including why one date feeds two columns.
+
+        `po_numbers`, when given, narrows the detail fetches to the POs a
+        caller actually needs. The listing is cheap; the details are not, and a
+        one-day report needs a handful of the ASNs on record.
+
+        Returns only POs with a dated Accepted ASN, so merging this into the PO
+        index cannot overwrite a known date with a blank.
+        """
+        wanted = set(po_numbers) if po_numbers is not None else None
+        asns = self._fetch_all_transactions(transaction_type="856")
+        to_fetch = []
+        for asn in asns:
+            meta = asn.get("metadata") or asn
+            aid = asn.get("id") or meta.get("id")
+            po = str(meta.get("source_document_reference_id") or "")
+            if not aid or not po or (wanted is not None and po not in wanted):
+                continue
+            to_fetch.append((aid, po))
+
+        details = []
+        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as pool:
+            futures = {pool.submit(self._fetch_transaction_detail, aid): po
+                       for aid, po in to_fetch}
+            for future in as_completed(futures):
+                try:
+                    details.append(future.result())
+                except Exception as exc:
+                    # Same best-effort stance as the 850 crawl: one unreadable
+                    # ASN blanks one Ship Date cell, it does not lose the report.
+                    print(f"WARNING: failed to fetch 856 detail for {futures[future]}: {exc}")
+        return asn_date_index(details)
 
     def _fetch_all_transactions(self, transaction_type: str = "810") -> list:
         results = []

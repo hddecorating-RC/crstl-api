@@ -189,10 +189,11 @@ def test_fetch_po_provinces_extracts_store_and_province():
         }}}}
     }
     mock_detail_dropship = {
-        "file": {"generic_json_edi": {"heading": {"ship_to": {
-            "state_province": "QC",
-            "name": "GELINAS ANICK",
-        }}}}
+        "file": {"generic_json_edi": {
+            "heading": {"ship_to": {"state_province": "QC", "name": "GELINAS ANICK"}},
+            "detail": {"baseline_item_data_loop": [
+                {"baseline_item_data": {"vendors_item_number": "138VB48D36WHTC"}}]},
+        }}
     }
 
     with patch.object(client, "_fetch_all_transactions", return_value=mock_transactions), \
@@ -203,3 +204,42 @@ def test_fetch_po_provinces_extracts_store_and_province():
     assert result["PO-40850625"]["store"] == "VAUGHAN"
     assert result["PO-537608514"]["province"] == "QC"
     assert result["PO-537608514"]["store"] is None
+    # The map feeds the workbook's Product column as well as its Province one:
+    # an 810 carries no vendor item number, so this is the only place to read it.
+    assert result["PO-537608514"]["vendor_items"] == ["138VB48D36WHTC"]
+    assert result["PO-40850625"]["vendor_items"] == []
+
+
+def test_fetch_po_provinces_keeps_a_po_that_has_items_but_no_province():
+    """A PO with no ship-to province used to be dropped. Dropping it now would
+    blank the Product column too, so one missing field would cost two."""
+    from unittest.mock import patch
+    from app.crstl import CrstlClient
+
+    client = CrstlClient(base_url="https://api.crstl.ai/v2", api_key="ct_live_test")
+    detail = {"file": {"generic_json_edi": {
+        "heading": {"ship_to": {"name": "NO PROVINCE ON FILE"}},
+        "detail": {"baseline_item_data_loop": [
+            {"baseline_item_data": {"vendors_item_number": "72318-109-52-84-404"}}]},
+    }}}
+
+    with patch.object(client, "_fetch_all_transactions",
+                      return_value=[{"id": "850-003", "reference_id": "PO-1"}]), \
+         patch.object(client, "_fetch_transaction_detail", return_value=detail):
+        result = client.fetch_po_provinces()
+
+    assert result["PO-1"]["province"] is None
+    assert result["PO-1"]["vendor_items"] == ["72318-109-52-84-404"]
+
+
+def test_fetch_po_provinces_still_drops_a_po_with_neither():
+    from unittest.mock import patch
+    from app.crstl import CrstlClient
+
+    client = CrstlClient(base_url="https://api.crstl.ai/v2", api_key="ct_live_test")
+    with patch.object(client, "_fetch_all_transactions",
+                      return_value=[{"id": "850-004", "reference_id": "PO-2"}]), \
+         patch.object(client, "_fetch_transaction_detail", return_value={}):
+        result = client.fetch_po_provinces()
+
+    assert result == {}
