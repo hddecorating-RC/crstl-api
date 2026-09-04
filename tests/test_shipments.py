@@ -195,12 +195,30 @@ def test_a_dsd_row_stays_blank_until_the_goods_actually_move():
     assert row["pickup_date"] == "2026-09-08"
 
 
-def test_dropship_keeps_the_date_we_transmitted_to_hd():
-    """Finale agrees with the ASN on Dropship, so the ASN wins: it is what was
-    sent, and the report shows what was sent."""
+def test_finale_wins_over_the_asn_because_it_is_the_observed_event():
+    """The warehouse presses "ship shipment" when the goods actually leave.
+    The ASN date is what we told HD would happen; where they disagree, the
+    button press is the one that was observed."""
     po_index = {"PO-1": {"province": "ON", "asn_date": "2026-09-03",
                          "finale_ship_date": "2026-09-04"}}
+    assert extract(_invoice("PO-1"), po_index)["ship_date"] == "2026-09-04"
+
+
+def test_the_asn_still_beats_a_blank_on_dropship():
+    """Finale is preferred, not required. On Dropship the ASN date is a ship
+    date rather than a plan, so a row Finale has no record of still reports
+    one."""
+    po_index = {"PO-1": {"province": "ON", "asn_date": "2026-09-03"}}
     assert extract(_invoice("PO-1"), po_index)["ship_date"] == "2026-09-03"
+
+
+def test_dsd_never_falls_back_to_its_pickup_date():
+    """A DSD ASN date is a scheduled pickup. No Finale record means the goods
+    have not moved, and saying otherwise would invent a shipment."""
+    po_index = {"PO-1": {"province": "ON", "asn_date": "2026-09-08"}}
+    row = extract(_invoice("PO-1", flavor="Direct Store Delivery (DSD)"), po_index)
+    assert row["ship_date"] == ""
+    assert row["pickup_date"] == "2026-09-08"
 
 
 def test_finale_backfills_a_dropship_row_whose_asn_never_arrived():

@@ -85,7 +85,7 @@ class FinaleClient:
     """Read-only client for the one thing the workbook needs from Finale."""
 
     TIMEOUT = 90
-    PAGE_LIMIT = 1000
+    PAGE_LIMIT = 10000
 
     def __init__(self, account_id=None, api_key=None, api_secret=None):
         account_id = account_id if account_id is not None else os.environ.get("FINALE_ACCOUNT_ID", "")
@@ -107,8 +107,20 @@ class FinaleClient:
         return all(os.environ.get(k) for k in ENV_KEYS)
 
     def fetch_ship_dates(self) -> dict:
-        """{po_number: ship date} for everything Finale has shipped."""
+        """{po_number: ship date} for everything Finale has shipped.
+
+        Fetched in one request because `offset` does not work on this endpoint
+        -- asking for offset=50 returns the same first row as offset=0 -- so
+        there is no way to page. The limit is set far above the current volume
+        (446 shipments on record) and a full page is reported rather than
+        silently truncated, because the failure mode otherwise is ship dates
+        quietly going missing for the oldest orders.
+        """
         resp = self.session.get(f"{self.base_url}/shipment",
                                 params={"limit": self.PAGE_LIMIT}, timeout=self.TIMEOUT)
         resp.raise_for_status()
-        return ship_date_index(to_rows(resp.json()))
+        rows = to_rows(resp.json())
+        if len(rows) >= self.PAGE_LIMIT:
+            print(f"WARNING: Finale returned {len(rows)} shipments, the maximum asked "
+                  f"for — some ship dates may be missing. Raise FinaleClient.PAGE_LIMIT.")
+        return ship_date_index(rows)

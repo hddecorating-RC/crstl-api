@@ -106,26 +106,29 @@ def product_for(flavor, po_entry):
 
 
 def dates_for(flavor, asn_date, finale_date=""):
-    """Split the one date the 856 carries into the two columns it means, and
-    fill the DSD gap from Finale.
+    """Ship Date and Pickup Date for one invoice.
 
-    Dropship and Wholesale send the real ship date in the ASN, and that is
-    what goes in Ship Date -- it is the value we transmitted to HD, and the
-    report shows what was sent. Finale agrees with it (49 of 56 exact, 7 at
-    +1 day), so there is nothing to gain by preferring another source.
+    FINALE WINS. The warehouse presses "ship shipment" when the goods actually
+    leave, so Finale's shipment record is the physical event; an ASN date is
+    what we told HD was going to happen. Where the two disagree -- 7 of 56
+    Dropship rows, by a day -- the button press is the one that was observed.
 
-    DSD sends a scheduled pickup date and no ship date at all. Its Ship Date
-    comes from Finale's shipment record, which is the only place the actual
-    departure is written down; the pickup date is reported beside it rather
-    than in place of it.
+    The ASN date is the fallback for Dropship and Wholesale, not the first
+    choice: it still beats a blank on a row Finale has no record of, and on
+    those two flavors it is a ship date rather than a plan.
+
+    DSD never falls back. Its ASN date is a scheduled pickup, so an empty
+    Finale record means the goods have not moved, and the pickup date is
+    reported in its own column as the confirmation to check the Ship Date
+    against rather than as a substitute for it.
 
     A DSD Ship Date legitimately arrives after the invoice: HD raises the
     invoice at pickup time and the goods move days later, so a same-day export
-    has nothing to show and the cell stays blank until a later re-export.
+    has nothing to show and the cell fills on a later re-export.
     """
     if flavor == "DSD":
         return {"ship_date": finale_date, "pickup_date": asn_date}
-    return {"ship_date": asn_date or finale_date, "pickup_date": ""}
+    return {"ship_date": finale_date or asn_date, "pickup_date": ""}
 
 
 def extract(detail, po_index):
