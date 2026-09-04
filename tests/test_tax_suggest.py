@@ -109,3 +109,61 @@ def test_tolerance_absorbs_cent_rounding():
     inv = _base(discrepancy=2.57, total_amount=53.92)  # residual is $2.57
     _annotate_tax_suggestion([inv])
     assert inv.get("tax_suggestion") is not None
+
+
+# ── Accounting's rate sheet, 2026-09-03 ──────────────────────────────────────
+# Transcribed from the sheet itself, not from the code it checks. These are the
+# rates we charge HD, which is not the same as the rates each province levies:
+# BC levies PST at 7% and we do not charge it, so BC is GST-only here.
+RATE_SHEET = {
+    "AB": ("GST", 0.05),      "BC": ("GST", 0.05),      "MB": ("GST", 0.05),
+    "NT": ("GST", 0.05),      "NU": ("GST", 0.05),      "YT": ("GST", 0.05),
+    "SK": ("GST+PST", 0.11),  "ON": ("HST", 0.13),      "NS": ("HST", 0.14),
+    "NB": ("HST", 0.15),      "NL": ("HST", 0.15),      "PE": ("HST", 0.15),
+    "QC": ("GST+QST", 0.14975),
+}
+
+
+def test_rate_table_matches_accountings_sheet():
+    """Pinned to the sheet so a rate change has to be a deliberate edit here.
+    SK sat at 5% for months because nothing compared the two."""
+    from app.main import _PROVINCE_TAX_RATES
+    assert _PROVINCE_TAX_RATES == RATE_SHEET
+
+
+def test_saskatchewan_residual_matches_gst_plus_pst():
+    """SK is the one province where we charge PST. At the old 5% the residual
+    on an SK invoice matched nothing and the invoice read as unexplained."""
+    inv = _base(province="SK", subtotal=1000.0, discount_amount=0.0,
+                discrepancy=110.0)
+    _annotate_tax_suggestion([inv])
+    ts = inv.get("tax_suggestion")
+    assert ts is not None
+    assert ts["kind"] == "GST+PST"
+    assert ts["rate"] == 0.11
+    assert ts["amount"] == 110.0
+
+
+def test_saskatchewan_at_gst_only_is_no_longer_suggested():
+    """The mirror of the above: 5% of net on an SK invoice is not what we
+    charge, so it must not be offered as the explanation for a residual."""
+    inv = _base(province="SK", subtotal=1000.0, discount_amount=0.0,
+                discrepancy=50.0)
+    _annotate_tax_suggestion([inv])
+    assert inv.get("tax_suggestion") is None
+
+
+def test_bc_stays_gst_only_while_crstl_still_sends_pst():
+    """Crstl has been asked to stop sending an ST segment on BC dropship. Until
+    that lands a BC invoice can carry 12%, and that residual must NOT resolve
+    to a tidy suggestion: 5% is what we charge, and offering it as the
+    explanation for a 12% residual would be the hint asserting something false.
+
+    This is the dashboard hint only. It says nothing about the workbook, which
+    reads TXI and reconciles such an invoice to the cent -- see the note on
+    _PROVINCE_TAX_RATES.
+    """
+    inv = _base(province="BC", subtotal=1000.0, discount_amount=0.0,
+                discrepancy=120.0)
+    _annotate_tax_suggestion([inv])
+    assert inv.get("tax_suggestion") is None

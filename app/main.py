@@ -149,16 +149,33 @@ def _attach_provinces(invoices: list[dict], po_provinces: dict[str, dict]) -> No
         inv["store"] = loc.get("store")
 
 
-# Standard Canadian sales-tax rates per ship-to province, used ONLY to annotate
-# an unreconciled invoice with a "likely this tax at this rate" hint. This is
-# NOT a substitute for the actual tax value from HD; it's a cross-check helper
-# for accounting because Crstl's public API strips TXI segments from dropship
-# 810s (their UI shows the value; their JSON does not — support ticket filed).
+# What we charge HD per ship-to province, used ONLY to annotate an
+# unreconciled invoice with a "likely this tax at this rate" hint. This is NOT
+# a substitute for the actual tax value from HD; it's a cross-check helper for
+# accounting because Crstl's public API strips TXI segments from dropship 810s
+# (their UI shows the value; their JSON does not — support ticket filed).
 # Remove this once Crstl exposes TXI in generic_json_edi.
+#
+# Source: accounting's rate sheet, 2026-09-03. These are the rates we charge,
+# not the rates a province levies, and the two differ:
+#
+#   SK  we charge PST. 5% GST + 6% PST = 11%.
+#   BC  we do NOT charge PST, so BC is GST-only at 5% even though BC levies
+#       PST at 7%. Dropship 810s have been arriving with an ST segment of 7%
+#       anyway; Crstl has been asked to remove it and the fix may not have
+#       landed yet, so a BC invoice may still read 12% until it does. Leave
+#       this at 5% regardless -- the sheet is what we charge, and moving it to
+#       match the bad data would make the error permanent.
+#
+#       Note this table does not reach the workbook. app/report.py reads the
+#       TXI segment HD sent, so a BC invoice carrying the extra 7% reconciles
+#       to the cent and appears in the export as ordinary tax -- the export
+#       reports what was transmitted and does not check it against a rate.
+#       This table only feeds the dashboard's Suggested Tax hint.
 _PROVINCE_TAX_RATES: dict[str, tuple[str, float]] = {
     "AB": ("GST", 0.05),   "BC": ("GST", 0.05),   "MB": ("GST", 0.05),
-    "SK": ("GST", 0.05),   "YT": ("GST", 0.05),   "NT": ("GST", 0.05),
-    "NU": ("GST", 0.05),
+    "YT": ("GST", 0.05),   "NT": ("GST", 0.05),   "NU": ("GST", 0.05),
+    "SK": ("GST+PST", 0.11),
     "ON": ("HST", 0.13),
     "NB": ("HST", 0.15),   "NL": ("HST", 0.15),   "PE": ("HST", 0.15),
     "NS": ("HST", 0.14),   # config sets NS at 14% — trust the config
