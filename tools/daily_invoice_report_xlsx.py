@@ -33,7 +33,9 @@ sys.path.insert(0, REPO)
 from app.crstl import CrstlClient                                    # noqa: E402
 from app.main import load_env                                        # noqa: E402
 from app.products import vendor_items_in                             # noqa: E402
-from app.shipments import merge_asn_dates                            # noqa: E402
+from app.finale import FinaleClient, FinaleUnavailable               # noqa: E402
+from app.shipments import (merge_asn_dates,                          # noqa: E402
+                           merge_finale_ship_dates)
 from app.report import (extract, fetch_details, reconciles,          # noqa: E402
                         save_workbook)
 
@@ -109,6 +111,17 @@ def main():
     # the 850s above are: a one-day report needs a few of the ASNs on record.
     merge_asn_dates(po_index, client.fetch_asn_dates(need_po))
 
+    # A DSD ASN has a pickup date and no ship date, so Finale is the only
+    # source for the actual departure. Swallowed on failure: a blank Ship Date
+    # is a gap, a failed report is a missing morning.
+    if FinaleClient.configured():
+        try:
+            merge_finale_ship_dates(po_index, FinaleClient().fetch_ship_dates())
+        except Exception as exc:
+            print(f"WARNING: Finale ship dates unavailable, leaving them blank: {exc}")
+    else:
+        print("Finale not configured — DSD ship dates will be blank")
+
     rows, undated = [], 0
     for detail in details:
         row = extract(detail, po_index)
@@ -136,15 +149,15 @@ def main():
                           for f in sorted({r["flavor"] for r in rows}))
     by_product = ", ".join(f"{sum(1 for r in rows if r['product'] == p)} {p}"
                            for p in sorted({r["product"] for r in rows}))
-    no_asn = sum(1 for r in rows if not r["ship_date"] and not r["pickup_date"])
-    dsd = sum(1 for r in rows if r["pickup_date"])
+    awaiting = sum(1 for r in rows if r["pickup_date"] and not r["ship_date"])
+    no_date = sum(1 for r in rows if not r["ship_date"] and not r["pickup_date"])
     print(f"{len(rows)} invoices ({by_flavor})")
     print(f"{by_product}")
-    if dsd:
-        print(f"{dsd} DSD: Pickup Date only -- actual ship date is in Finale, "
-              f"not in the ASN")
-    if no_asn:
-        print(f"{no_asn} with no Accepted ASN on file -- both dates left blank")
+    if awaiting:
+        print(f"{awaiting} DSD not shipped yet -- pickup scheduled, Finale has no "
+              f"shipment record; Ship Date fills on a later run")
+    if no_date:
+        print(f"{no_date} with no ASN and nothing in Finale -- both dates blank")
     print(f"{bad} do not reconcile" if bad else "all invoices reconcile")
     print(f"-> {out}")
     return 0

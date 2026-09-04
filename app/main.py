@@ -20,7 +20,8 @@ from app.netsuite import transform_invoice
 from app.netsuite_csv import build_netsuite_csv
 from app.report import (XLSX_MEDIA_TYPE, dates_for, flavor_of, product_for,
                         rows_for_transactions, window_label, workbook_bytes)
-from app.shipments import merge_asn_dates
+from app.finale import FinaleClient
+from app.shipments import merge_asn_dates, merge_finale_ship_dates
 
 
 def load_env(path: str = ".env") -> None:
@@ -59,6 +60,10 @@ def _build_mock_po_provinces() -> dict[str, dict]:
         # Every ninth PO has no ASN, so the mock exercises a blank date
         # column as well as a filled one.
         ship = {} if i % 9 == 0 else {"asn_date": f"2026-08-{(i % 27) + 1:02d}"}
+        # Finale answers a day later, so the mock shows the two columns
+        # disagreeing the way they do in production.
+        if ship and i % 3 == 0:
+            ship["finale_ship_date"] = f"2026-08-{(i % 27) + 2:02d}"
         if i % 10 < 2:
             result[po] = {"province": "ON", "store": "VAUGHAN", "vendor_items": items, **ship}
         elif i % 10 < 4:
@@ -147,6 +152,26 @@ def _generate_mock_invoices(count: int = 50) -> list[dict]:
 
 
 _MOCK_INVOICES = _generate_mock_invoices(50)
+
+
+def _merge_finale(po_index: dict) -> None:
+    """Fill DSD ship dates from Finale, or leave them blank.
+
+    A DSD ASN carries a pickup date and no ship date, so Finale is the only
+    source for the actual departure. It is also a second external service on
+    the sync path, so every failure here is swallowed: a blank Ship Date is a
+    gap accounting can see, while a failed sync would take the whole dashboard
+    down for a column that did not exist last week.
+    """
+    try:
+        if not FinaleClient.configured():
+            print("Finale not configured — DSD ship dates will be blank")
+            return
+        merge_finale_ship_dates(po_index, FinaleClient().fetch_ship_dates())
+    except Exception as exc:
+        # Broad by intent, and the configured() check is inside it: nothing
+        # about this column is worth failing a sync for.
+        print(f"WARNING: Finale ship dates unavailable, leaving them blank: {exc}")
 
 
 def _attach_provinces(invoices: list[dict], po_provinces: dict[str, dict]) -> None:
@@ -250,6 +275,7 @@ def _refresh_cache() -> None:
         # the same PO number. Narrowed to POs already on file so the sync
         # does not crawl ASN details for orders the report will never show.
         merge_asn_dates(po_provinces, client.fetch_asn_dates(po_provinces.keys()))
+        _merge_finale(po_provinces)
         _attach_provinces(invoices, po_provinces)
         _annotate_tax_suggestion(invoices)
         with _cache_lock:
@@ -288,7 +314,8 @@ def _mock_report_row(inv: dict) -> dict:
         "product": product_for(flavor_of(inv), _MOCK_PO_PROVINCES.get(inv.get("po_number", ""))),
         "province": inv.get("province") or "",
         **dates_for(flavor_of(inv),
-                    (_MOCK_PO_PROVINCES.get(inv.get("po_number", "")) or {}).get("asn_date", "")),
+                    (_MOCK_PO_PROVINCES.get(inv.get("po_number", "")) or {}).get("asn_date", ""),
+                    (_MOCK_PO_PROVINCES.get(inv.get("po_number", "")) or {}).get("finale_ship_date", "")),
         "subtotal": subtotal,
         "deductions": {},
         "charges": {},

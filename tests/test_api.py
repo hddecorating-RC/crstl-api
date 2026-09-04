@@ -103,6 +103,10 @@ def client(monkeypatch, tmp_path):
     monkeypatch.delenv("MOCK_DATA", raising=False)
     # Isolate tracking DB per test — must be set before TestClient starts the lifespan
     monkeypatch.setenv("TRACKING_DB", str(tmp_path / "tracking.db"))
+    # Finale is a real third-party API and the sync now calls it. Stubbed here
+    # so the suite neither reaches the network nor depends on whoever runs it
+    # having Finale credentials.
+    monkeypatch.setattr("app.main.FinaleClient.configured", staticmethod(lambda: False))
     with patch("app.main.CrstlClient") as MockClient:
         mock_instance = MagicMock()
         mock_instance.fetch_invoices.return_value = MOCK_INVOICES
@@ -398,3 +402,15 @@ def test_digest_aborts_rather_than_emailing_without_the_workbook(client, monkeyp
             _send_daily_digest()
     assert not mail.called
     assert get_unemailed_ids(["tx-001"]) == ["tx-001"]
+
+
+def test_sync_survives_finale_being_down(monkeypatch, client):
+    """Finale is a second external service on the sync path. If it fails the
+    Ship Date column goes blank; it must not take the dashboard with it."""
+    down = MagicMock()
+    down.configured.return_value = True
+    down.side_effect = RuntimeError("finale is down")
+    monkeypatch.setattr("app.main.FinaleClient", down)
+    resp = client.post("/api/sync")
+    assert resp.status_code == 200
+    assert client.get("/api/invoices").json()["status"] == "ok"

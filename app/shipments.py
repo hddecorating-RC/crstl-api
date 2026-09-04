@@ -103,3 +103,15 @@ def merge_asn_dates(po_index: dict, asn_dates: dict) -> dict:
     for po, label in (asn_dates or {}).items():
         po_index.setdefault(po, {})["asn_date"] = label
     return po_index
+
+
+def merge_finale_ship_dates(po_index: dict, ship_dates: dict) -> dict:
+    """Fold Finale's actual ship dates into the PO index, in place.
+
+    Kept separate from the ASN date rather than overwriting it: the two answer
+    different questions -- what we told HD, and what actually left -- and
+    app/report.py needs both to fill Ship Date and Pickup Date correctly.
+    """
+    for po, date in (ship_dates or {}).items():
+        po_index.setdefault(po, {})["finale_ship_date"] = date
+    return po_index

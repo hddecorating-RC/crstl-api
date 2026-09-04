@@ -30,9 +30,9 @@ PO; DSD carries its own.
 
 Ship Date and Pickup Date are two columns because the 856 sends one date that
 means two different things: the real ship date on Dropship and Wholesale, a
-scheduled pickup on DSD whose goods leave 3-4 days later. A DSD Ship Date is
-left blank rather than filled with the pickup date -- the actual one is in
-Finale, which this service does not read. app/shipments.py has the evidence.
+scheduled pickup on DSD. A DSD Ship Date is never the pickup date -- it comes
+from Finale's shipment record, the only place the actual departure is written
+down. app/shipments.py and app/finale.py hold the evidence for each.
 
 The Product column -- drapery or blinds -- comes from the 850 as well. An 810
 carries no vendor item number on any flavor, and the 850 is already fetched
@@ -105,22 +105,27 @@ def product_for(flavor, po_entry):
     return UNKNOWN
 
 
-def dates_for(flavor, asn_date):
-    """Split the one date the 856 carries into the two columns it means.
+def dates_for(flavor, asn_date, finale_date=""):
+    """Split the one date the 856 carries into the two columns it means, and
+    fill the DSD gap from Finale.
 
-    Dropship and Wholesale send the real ship date. DSD sends a scheduled
-    pickup date -- HD requires one to raise the ASN -- and the goods ship 3-4
-    days later; that actual date is in Finale, not in any EDI document we
-    receive. app/shipments.py has the evidence.
+    Dropship and Wholesale send the real ship date in the ASN, and that is
+    what goes in Ship Date -- it is the value we transmitted to HD, and the
+    report shows what was sent. Finale agrees with it (49 of 56 exact, 7 at
+    +1 day), so there is nothing to gain by preferring another source.
 
-    So a DSD row's Ship Date is left blank on purpose. Putting the pickup date
-    there would read as a ship date to accounting and be wrong by 3-4 days on
-    every DSD line, which is worse than saying nothing. The blank is the slot
-    Finale fills.
+    DSD sends a scheduled pickup date and no ship date at all. Its Ship Date
+    comes from Finale's shipment record, which is the only place the actual
+    departure is written down; the pickup date is reported beside it rather
+    than in place of it.
+
+    A DSD Ship Date legitimately arrives after the invoice: HD raises the
+    invoice at pickup time and the goods move days later, so a same-day export
+    has nothing to show and the cell stays blank until a later re-export.
     """
     if flavor == "DSD":
-        return {"ship_date": "", "pickup_date": asn_date}
-    return {"ship_date": asn_date, "pickup_date": ""}
+        return {"ship_date": finale_date, "pickup_date": asn_date}
+    return {"ship_date": asn_date or finale_date, "pickup_date": ""}
 
 
 def extract(detail, po_index):
@@ -192,7 +197,8 @@ def extract(detail, po_index):
         "flavor": flavor,
         "product": product_for(flavor, po_entry),
         "province": province,
-        **dates_for(flavor, str(po_entry.get("asn_date") or "")),
+        **dates_for(flavor, str(po_entry.get("asn_date") or ""),
+                    str(po_entry.get("finale_ship_date") or "")),
         "subtotal": subtotal,
         "deductions": deductions,
         "charges": charges,

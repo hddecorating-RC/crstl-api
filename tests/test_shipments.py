@@ -174,3 +174,35 @@ def test_merge_records_a_shipment_whose_850_never_arrived():
     po_index = {}
     merge_asn_dates(po_index, {"P9": "2026-08-18"})
     assert po_index == {"P9": {"asn_date": "2026-08-18"}}
+
+
+def test_finale_fills_the_dsd_ship_date_the_asn_cannot():
+    """The pickup date stays in its own column; Ship Date carries the actual
+    departure Finale recorded."""
+    po_index = {"PO-1": {"province": "ON", "asn_date": "2026-09-08",
+                         "finale_ship_date": "2026-09-09"}}
+    row = extract(_invoice("PO-1", flavor="Direct Store Delivery (DSD)"), po_index)
+    assert row["ship_date"] == "2026-09-09"
+    assert row["pickup_date"] == "2026-09-08"
+
+
+def test_a_dsd_row_stays_blank_until_the_goods_actually_move():
+    """HD raises the invoice at pickup time, so a same-day export has no
+    Finale shipment to read yet. The cell fills on a later re-export."""
+    po_index = {"PO-1": {"province": "ON", "asn_date": "2026-09-08"}}
+    row = extract(_invoice("PO-1", flavor="Direct Store Delivery (DSD)"), po_index)
+    assert row["ship_date"] == ""
+    assert row["pickup_date"] == "2026-09-08"
+
+
+def test_dropship_keeps_the_date_we_transmitted_to_hd():
+    """Finale agrees with the ASN on Dropship, so the ASN wins: it is what was
+    sent, and the report shows what was sent."""
+    po_index = {"PO-1": {"province": "ON", "asn_date": "2026-09-03",
+                         "finale_ship_date": "2026-09-04"}}
+    assert extract(_invoice("PO-1"), po_index)["ship_date"] == "2026-09-03"
+
+
+def test_finale_backfills_a_dropship_row_whose_asn_never_arrived():
+    po_index = {"PO-1": {"province": "ON", "finale_ship_date": "2026-09-04"}}
+    assert extract(_invoice("PO-1"), po_index)["ship_date"] == "2026-09-04"
