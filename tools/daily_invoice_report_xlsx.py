@@ -1,10 +1,10 @@
 """Daily invoice report for accounting, as a .xlsx workbook.
 
-One row per invoice -- invoice, type, province, date, subtotal, discounts,
-charges, tax, total -- plus a total row. The Summary sheet carries the same
-money split by type and lists anything whose parts do not add up to the total
-HD stated, because an invoice that does not balance is worth seeing before it
-is keyed rather than after.
+One row per invoice -- invoice, type, product, province, invoice date, ship
+date, pickup date, subtotal, discounts, charges, tax, total -- plus a total row. The Summary
+sheet carries the same money split by type and by product, and lists anything
+whose parts do not add up to the total HD stated, because an invoice that does
+not balance is worth seeing before it is keyed rather than after.
 
 The workbook itself is built by app/report.py, which the dashboard's Export
 button and the digest email attachment also use -- one definition of the
@@ -32,6 +32,8 @@ sys.path.insert(0, REPO)
 
 from app.crstl import CrstlClient                                    # noqa: E402
 from app.main import load_env                                        # noqa: E402
+from app.products import vendor_items_in                             # noqa: E402
+from app.shipments import merge_asn_dates                            # noqa: E402
 from app.report import (extract, fetch_details, reconciles,          # noqa: E402
                         save_workbook)
 
@@ -95,8 +97,17 @@ def main():
         st = ((detail.get("file", {}) or {}).get("generic_json_edi", {})
               .get("heading", {}) or {}).get("ship_to", {}) or {}
         ref = str((detail.get("metadata") or {}).get("reference_id") or "")
-        if ref and st.get("state_province"):
-            po_index[ref] = {"province": str(st["state_province"]).upper()}
+        # vendor_items feeds the Product column and st the Province one; a PO
+        # is worth indexing when it has either, not only when it has both.
+        items = vendor_items_in(detail)
+        if ref and (st.get("state_province") or items):
+            po_index[ref] = {"province": str(st.get("state_province") or "").upper() or None,
+                             "vendor_items": items}
+
+    # Ship Date and Pickup Date come from the 856, joined on the same PO
+    # number. Narrowed to the POs this window actually invoices, the same way
+    # the 850s above are: a one-day report needs a few of the ASNs on record.
+    merge_asn_dates(po_index, client.fetch_asn_dates(need_po))
 
     rows, undated = [], 0
     for detail in details:
@@ -123,7 +134,17 @@ def main():
     bad = sum(1 for r in rows if not reconciles(r))
     by_flavor = ", ".join(f"{sum(1 for r in rows if r['flavor'] == f)} {f}"
                           for f in sorted({r["flavor"] for r in rows}))
+    by_product = ", ".join(f"{sum(1 for r in rows if r['product'] == p)} {p}"
+                           for p in sorted({r["product"] for r in rows}))
+    no_asn = sum(1 for r in rows if not r["ship_date"] and not r["pickup_date"])
+    dsd = sum(1 for r in rows if r["pickup_date"])
     print(f"{len(rows)} invoices ({by_flavor})")
+    print(f"{by_product}")
+    if dsd:
+        print(f"{dsd} DSD: Pickup Date only -- actual ship date is in Finale, "
+              f"not in the ASN")
+    if no_asn:
+        print(f"{no_asn} with no Accepted ASN on file -- both dates left blank")
     print(f"{bad} do not reconcile" if bad else "all invoices reconcile")
     print(f"-> {out}")
     return 0
