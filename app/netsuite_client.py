@@ -126,13 +126,15 @@ class NetSuiteClient:
         params = ", ".join(f'{_pct(k)}="{_pct(v)}"' for k, v in sorted(oauth.items()))
         return f'OAuth realm="{self.realm}", {params}'
 
-    def _request(self, method: str, path: str, json_body=None) -> dict:
+    def _request(self, method: str, path: str, json_body=None, extra_headers=None) -> dict:
         url = f"{self.base_url}{path}"
         headers = {
             "Authorization": self._auth_header(method, url),
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        if extra_headers:
+            headers.update(extra_headers)
         resp = self.session.request(method, url, headers=headers, json=json_body, timeout=self.timeout)
         if resp.status_code >= 400:
             raise NetSuiteUnavailable(f"NetSuite {method} {path} -> {resp.status_code}: {resp.text[:500]}")
@@ -171,8 +173,23 @@ class NetSuiteClient:
         query = "?expandSubResources=true" if expand else ""
         return self._request("GET", f"/record/v1/{record_type}/{record_id}{query}")
 
+    def list_records(self, record_type: str, limit: int = 5) -> dict:
+        """Read-only list of a record type (ids + links). Handy for grabbing an
+        existing record id to inspect."""
+        return self._request("GET", f"/record/v1/{record_type}?limit={limit}")
+
+    def suiteql(self, query: str, limit: int = 1000, offset: int = 0) -> dict:
+        """Run a read-only SuiteQL SELECT (POST /query/v1/suiteql). Used to look
+        up internal ids by name -- items, tax codes, classes -- so the config
+        gaps can be filled from here. SELECT only; needs the role to permit REST
+        queries. Returns {"items": [...], ...}."""
+        return self._request(
+            "POST", f"/query/v1/suiteql?limit={limit}&offset={offset}",
+            json_body={"q": query}, extra_headers={"Prefer": "transient"},
+        )
+
     def test_connection(self) -> dict:
         """Cheapest authenticated call: list one sales order. Proves the signing
         and the five credentials work without creating anything. Run this first
         when credentials land."""
-        return self._request("GET", "/record/v1/salesOrder?limit=1")
+        return self.list_records("salesOrder", limit=1)

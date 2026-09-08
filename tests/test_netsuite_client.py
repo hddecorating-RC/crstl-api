@@ -155,6 +155,18 @@ def test_http_error_raises_netsuite_unavailable():
         client.upsert_sales_order({"externalId": "X"})
 
 
+def test_suiteql_posts_read_only_query_with_prefer_header():
+    client = NetSuiteClient(**CREDS)
+    client.session = _FakeSession(_FakeResponse(200, content=b'{"items":[{"id":"201"}]}'))
+    result = client.suiteql("SELECT id, itemid FROM item")
+    call = client.session.calls[0]
+    assert call["method"] == "POST"
+    assert "/query/v1/suiteql" in call["url"]
+    assert call["json"] == {"q": "SELECT id, itemid FROM item"}
+    assert call["headers"].get("Prefer") == "transient"
+    assert result["items"][0]["id"] == "201"
+
+
 # ---- payload (sales order, internal-id refs) ----
 
 def test_build_sales_order_payload_uses_internal_ids():
