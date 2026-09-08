@@ -18,9 +18,13 @@ Usage:
 """
 import argparse
 import json
+import os
 import sys
 
-from app.netsuite_client import NetSuiteClient, NetSuiteUnavailable
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.main import load_env  # noqa: E402  -- also loads .env at import
+from app.netsuite_client import NetSuiteClient, NetSuiteUnavailable  # noqa: E402
 
 
 def main() -> None:
@@ -31,8 +35,9 @@ def main() -> None:
     parser.add_argument("--sql", help="run a read-only SuiteQL SELECT and print the rows")
     args = parser.parse_args()
 
+    load_env()
     if not NetSuiteClient.configured():
-        print("ERROR: NETSUITE_* credentials not set (see .env.example).")
+        print("ERROR: NETSUITE_* credentials not set in .env (see .env.example).")
         sys.exit(1)
 
     try:

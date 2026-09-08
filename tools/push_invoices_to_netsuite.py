@@ -27,11 +27,15 @@ There is no sandbox: use --only/--limit to send a single controlled record first
 """
 import argparse
 import json
+import os
 import pathlib
 import sys
 
-from app.netsuite import transform_invoice
-from app.netsuite_payload import build_sales_order_payload, load_refs, unresolved_ids
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.main import load_env  # noqa: E402  -- also loads .env at import
+from app.netsuite import transform_invoice  # noqa: E402
+from app.netsuite_payload import build_sales_order_payload, load_refs, unresolved_ids  # noqa: E402
 
 INPUT_PATH = pathlib.Path(".tmp/invoices_raw.json")
 
@@ -55,6 +59,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, help="cap the number processed")
     args = parser.parse_args()
 
+    load_env()
     invoices = _load_invoices()
     if args.only:
         invoices = [i for i in invoices if str(i.get("transaction_id")) == args.only]
