@@ -28,5 +28,21 @@
   "item": "Merchandise Sales",
   "allowance_item": "Allowance",
   "charge_item": "Charge",
-  "currency": "CAD"
+  "currency": "CAD",
+
+  "_comment_ids": "Internal NetSuite ids for the REST sales-order connector. Look them up in NetSuite (a read-only GET of an existing OMIS sales order via tools/netsuite_probe.py shows them). Blank values are reported by the push tool and block a live send.",
+  "item_ids": {
+    "Merchandise Sales": "",
+    "Allowance": "",
+    "Charge": ""
+  },
+  "tax_code_ids": {
+    "CA-HST ONT": "",
+    "CA-GST 5%": "",
+    "CA-HST Maritimes": "",
+    "HST NS": "",
+    "CA-S-QST": ""
+  },
+  "class_id": "",
+  "subsidiary_id": ""
 }

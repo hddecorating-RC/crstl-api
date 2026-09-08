@@ -151,17 +151,28 @@ class NetSuiteClient:
             raise ValueError("upsert needs a non-empty external_id")
         return self._request("PUT", f"/record/v1/{record_type}/eid:{external_id}", json_body=body)
 
-    def upsert_invoice(self, record: dict) -> dict:
-        """Upsert one NetSuite invoice. `record` is a REST invoice body carrying
-        an externalId (build it with app.netsuite_payload.build_invoice_payload
-        from the line records app.netsuite.transform_invoice emits)."""
+    def upsert_sales_order(self, record: dict) -> dict:
+        """Upsert one NetSuite sales order. `record` is a REST salesOrder body
+        carrying an externalId (build it with
+        app.netsuite_payload.build_sales_order_payload from the line records
+        app.netsuite.transform_invoice emits). Sales orders -- not invoices --
+        because accounting matches them against orders then against payables,
+        mirroring OMIS's own NetSuite integration in this account."""
         external_id = record.get("externalId") or record.get("external_id")
         if not external_id:
-            raise ValueError("invoice record needs an externalId")
-        return self.upsert_record("invoice", external_id, record)
+            raise ValueError("sales order record needs an externalId")
+        return self.upsert_record("salesOrder", external_id, record)
+
+    def get_record(self, record_type: str, record_id: str, expand: bool = True) -> dict:
+        """Read one record by internal id. Read-only -- used to inspect the exact
+        shape NetSuite accepts (e.g. an existing OMIS-created sales order) before
+        writing anything, which stands in for the sandbox we do not have.
+        expandSubResources returns the item sublist inline."""
+        query = "?expandSubResources=true" if expand else ""
+        return self._request("GET", f"/record/v1/{record_type}/{record_id}{query}")
 
     def test_connection(self) -> dict:
-        """Cheapest authenticated call: list one invoice. Proves the signing and
-        the five credentials work without creating anything. Use this first when
-        credentials land."""
-        return self._request("GET", "/record/v1/invoice?limit=1")
+        """Cheapest authenticated call: list one sales order. Proves the signing
+        and the five credentials work without creating anything. Run this first
+        when credentials land."""
+        return self._request("GET", "/record/v1/salesOrder?limit=1")
