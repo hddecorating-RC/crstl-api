@@ -1,8 +1,8 @@
 """
 Tests for the NetSuite TBA connector. None need real credentials or a network:
 the OAuth signing is pure, and the transport is exercised with a fake session.
-This locks down the signing math and the request shape (salesOrder, id refs)
-before a single credential exists.
+This locks down the signing math and the request shape (invoice, id refs) before
+a single credential is used.
 """
 import pytest
 
@@ -11,7 +11,7 @@ from app.netsuite_client import (
     NetSuiteUnavailable,
     signature_base_string,
 )
-from app.netsuite_payload import build_sales_order_payload, unresolved_ids
+from app.netsuite_payload import build_invoice_payload, unresolved_ids
 
 
 CREDS = dict(
@@ -54,10 +54,10 @@ def test_signature_base_string_is_exact():
         "oauth_nonce": "abc",
         "oauth_version": "1.0",
     }
-    url = "https://1234567.suitetalk.api.netsuite.com/services/rest/record/v1/salesOrder"
+    url = "https://1234567.suitetalk.api.netsuite.com/services/rest/record/v1/invoice"
     expected = (
         "GET&"
-        "https%3A%2F%2F1234567.suitetalk.api.netsuite.com%2Fservices%2Frest%2Frecord%2Fv1%2FsalesOrder&"
+        "https%3A%2F%2F1234567.suitetalk.api.netsuite.com%2Fservices%2Frest%2Frecord%2Fv1%2Finvoice&"
         "oauth_consumer_key%3Dck%26oauth_nonce%3Dabc%26oauth_signature_method%3DHMAC-SHA256"
         "%26oauth_timestamp%3D1700000000%26oauth_token%3Dtk%26oauth_version%3D1.0"
     )
@@ -67,10 +67,10 @@ def test_signature_base_string_is_exact():
 def test_query_params_are_folded_into_the_signature():
     oauth = {"oauth_nonce": "n", "oauth_timestamp": "1"}
     base = signature_base_string(
-        "GET", "https://x.suitetalk.api.netsuite.com/services/rest/record/v1/salesOrder?limit=1", oauth
+        "GET", "https://x.suitetalk.api.netsuite.com/services/rest/record/v1/invoice?limit=1", oauth
     )
     assert "limit%3D1%26oauth_nonce%3Dn%26oauth_timestamp%3D1" in base
-    assert "%3Flimit" not in base  # the "?" is not part of the signed base URL
+    assert "%3Flimit" not in base
 
 
 def test_missing_credentials_raise():
@@ -91,7 +91,7 @@ def test_base_url_and_realm_production_vs_sandbox():
 
 def test_auth_header_is_deterministic_and_well_formed():
     client = NetSuiteClient(**CREDS)
-    url = f"{client.base_url}/record/v1/salesOrder"
+    url = f"{client.base_url}/record/v1/invoice"
     h1 = client._auth_header("GET", url, nonce="fixed", timestamp=1700000000)
     h2 = client._auth_header("GET", url, nonce="fixed", timestamp=1700000000)
     assert h1 == h2
@@ -126,33 +126,33 @@ class _FakeSession:
         return self.response
 
 
-def test_upsert_sales_order_puts_to_the_external_id_url():
+def test_upsert_invoice_puts_to_the_external_id_url():
     client = NetSuiteClient(**CREDS)
-    client.session = _FakeSession(_FakeResponse(204, {"Location": "/record/v1/salesOrder/987"}))
+    client.session = _FakeSession(_FakeResponse(204, {"Location": "/record/v1/invoice/987"}))
 
-    result = client.upsert_sales_order({"externalId": "TXN-123", "entity": {"id": "4147"}})
+    result = client.upsert_invoice({"externalId": "TXN-123", "entity": {"id": "4147"}})
 
     call = client.session.calls[0]
     assert call["method"] == "PUT"
-    assert call["url"].endswith("/services/rest/record/v1/salesOrder/eid:TXN-123")
+    assert call["url"].endswith("/services/rest/record/v1/invoice/eid:TXN-123")
     assert call["headers"]["Authorization"].startswith("OAuth ")
-    assert result["location"] == "/record/v1/salesOrder/987"
+    assert result["location"] == "/record/v1/invoice/987"
 
 
 def test_get_record_is_read_only_with_expand():
     client = NetSuiteClient(**CREDS)
     client.session = _FakeSession(_FakeResponse(200, content=b'{"id":"5"}'))
-    client.get_record("salesOrder", "5")
+    client.get_record("invoice", "5")
     call = client.session.calls[0]
     assert call["method"] == "GET"
-    assert call["url"].endswith("/record/v1/salesOrder/5?expandSubResources=true")
+    assert call["url"].endswith("/record/v1/invoice/5?expandSubResources=true")
 
 
 def test_http_error_raises_netsuite_unavailable():
     client = NetSuiteClient(**CREDS)
     client.session = _FakeSession(_FakeResponse(400, content=b'{"detail":"bad"}'))
     with pytest.raises(NetSuiteUnavailable):
-        client.upsert_sales_order({"externalId": "X"})
+        client.upsert_invoice({"externalId": "X"})
 
 
 def test_suiteql_posts_read_only_query_with_prefer_header():
@@ -167,17 +167,18 @@ def test_suiteql_posts_read_only_query_with_prefer_header():
     assert result["items"][0]["id"] == "201"
 
 
-# ---- payload (sales order, internal-id refs) ----
+# ---- payload (invoice, internal-id refs) ----
 
-def test_build_sales_order_payload_uses_internal_ids():
-    body = build_sales_order_payload(LINES, REFS)
+def test_build_invoice_payload_uses_internal_ids():
+    body = build_invoice_payload(LINES, REFS)
     assert body["externalId"] == "TXN-1"
     assert body["entity"] == {"id": "4147"}
+    assert body["dueDate"] == "2026-10-01"          # invoices carry a due date
     assert body["class"] == {"id": "5"}
-    assert "subsidiary" not in body  # blank -> omitted
+    assert "subsidiary" not in body                 # blank -> omitted
     items = body["item"]["items"]
     assert len(items) == 2
-    assert items[0]["item"] == {"id": "201"}      # resolved by name -> id
+    assert items[0]["item"] == {"id": "201"}        # resolved by name -> id
     assert items[0]["taxCode"] == {"id": "17"}
     assert items[1]["item"] == {"id": "202"}
     assert items[1]["amount"] == -5.0
@@ -186,11 +187,11 @@ def test_build_sales_order_payload_uses_internal_ids():
 def test_unresolved_ids_flags_blank_refs():
     refs = {"item_ids": {"Merchandise Sales": "201"}, "tax_code_ids": {}, "class_id": "", "subsidiary_id": ""}
     missing = unresolved_ids(LINES, refs)
-    assert "item:Allowance" in missing        # no id for Allowance
-    assert "taxCode:CA-HST ONT" in missing     # no tax ids at all
-    assert "item:Merchandise Sales" not in missing  # this one resolved
+    assert "item:Allowance" in missing
+    assert "taxCode:CA-HST ONT" in missing
+    assert "item:Merchandise Sales" not in missing
 
 
-def test_build_sales_order_payload_rejects_empty():
+def test_build_invoice_payload_rejects_empty():
     with pytest.raises(ValueError):
-        build_sales_order_payload([])
+        build_invoice_payload([])

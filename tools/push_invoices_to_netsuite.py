@@ -1,17 +1,15 @@
 """
 push_invoices_to_netsuite.py
 ----------------------------
-Push Crstl invoices into NetSuite as SALES ORDER records, via the TBA connector
-(app/netsuite_client.py). Sales orders (not invoices) because accounting matches
-them against orders and then against payables -- mirroring OMIS's own NetSuite
-integration in the same account.
+Push Crstl invoices into NetSuite as INVOICE records, via the TBA connector
+(app/netsuite_client.py). Accounting books this Home Depot revenue as invoices.
 
 Chain:
-    .tmp/invoices_raw.json             (tools/crstl_fetch_invoices.py)
-      -> province/store attached        (app.main._attach_provinces, upstream)
-      -> transform_invoice(...)          (app/netsuite.py -- business mapping)
-      -> build_sales_order_payload(...)  (app/netsuite_payload.py -- REST body, id refs)
-      -> NetSuiteClient.upsert_sales_order (app/netsuite_client.py -- TBA transport)
+    .tmp/invoices_raw.json           (tools/crstl_fetch_invoices.py)
+      -> province/store attached      (app.main._attach_provinces, upstream)
+      -> transform_invoice(...)        (app/netsuite.py -- business mapping)
+      -> build_invoice_payload(...)    (app/netsuite_payload.py -- REST body, id refs)
+      -> NetSuiteClient.upsert_invoice (app/netsuite_client.py -- TBA transport)
 
 Internal ids for item and tax code come from config/netsuite_customers.json
 (item_ids / tax_code_ids). Any still blank are reported here and BLOCK a --live
@@ -35,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.main import load_env  # noqa: E402  -- also loads .env at import
 from app.netsuite import transform_invoice  # noqa: E402
-from app.netsuite_payload import build_sales_order_payload, load_refs, unresolved_ids  # noqa: E402
+from app.netsuite_payload import build_invoice_payload, load_refs, unresolved_ids  # noqa: E402
 
 INPUT_PATH = pathlib.Path(".tmp/invoices_raw.json")
 
@@ -82,7 +80,7 @@ def main() -> None:
             print(f"  skip  {inv.get('transaction_id', '?')}: no province/store mapping")
             continue
         all_unresolved.update(unresolved_ids(lines, refs))
-        prepared.append((inv, build_sales_order_payload(lines, refs)))
+        prepared.append((inv, build_invoice_payload(lines, refs)))
 
     if all_unresolved:
         print("\nMissing internal ids in config/netsuite_customers.json "
@@ -111,13 +109,13 @@ def main() -> None:
     for inv, body in prepared:
         eid = inv.get("transaction_id", "?")
         if not args.live:
-            print(f"  DRY   {eid}: would PUT salesOrder/eid:{body['externalId']} "
+            print(f"  DRY   {eid}: would PUT invoice/eid:{body['externalId']} "
                   f"({len(body['item']['items'])} line(s))")
             print(json.dumps(body, indent=2, default=str))
             sent += 1
             continue
         try:
-            result = client.upsert_sales_order(body)
+            result = client.upsert_invoice(body)
             sent += 1
             print(f"  sent  {eid}: {result.get('location') or result}")
         except Exception as exc:  # one bad invoice shouldn't stop the batch

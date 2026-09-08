@@ -1,25 +1,23 @@
 """
-Assemble a NetSuite REST `salesOrder` body from the flat line records that
+Assemble a NetSuite REST `invoice` body from the flat line records that
 app.netsuite.transform_invoice emits (all of which share one external_id).
 
-WHY salesOrder, not invoice: OMIS's own NetSuite integration -- the reference
-implementation in the SAME account -- creates sales orders and matches them
-against orders, then against payables (see gems/omis-netsuite
-NetsuiteStoreSalesOrder). This mirrors it.
+Record type: accounting books this Home Depot Canada revenue as an INVOICE.
 
-WHY internal ids, not names: OMIS references item, taxCode, customer and class
-purely by internal id (BaseReference internal_id). This account is set up for
-ids, so the REST refs are {"id": ...}. transform_invoice carries human-readable
-item/tax NAMES (built for the CSV path), so this module resolves those names to
-internal ids via config/netsuite_customers.json:
+WHY internal ids, not names: OMIS's own NetSuite integration (same account)
+references item, taxCode, customer and class purely by internal id
+(BaseReference internal_id). This account is set up for ids, so the REST refs are
+{"id": ...}. transform_invoice carries human-readable item/tax NAMES (built for
+the CSV path), so this module resolves those names to internal ids via
+config/netsuite_customers.json:
   - item_ids:      {item name -> internal id}
   - tax_code_ids:  {tax code name -> internal id}
-  - class_id / subsidiary_id: optional account-level refs (OMIS uses class "5")
+  - class_id / subsidiary_id: optional account-level refs
 
 Fill those ids in the config (look them up in NetSuite -- tools/netsuite_probe.py
-can GET an existing OMIS sales order to read them off). Until an id is filled the
-ref is emitted empty; unresolved_ids() reports which, and the push tool refuses a
-live send while any remain.
+GETs an existing record, and Lists/Setup pages show ids with "Show Internal IDs"
+on). Until an id is filled the ref is emitted empty; unresolved_ids() reports
+which, and the push tool refuses a live send while any remain.
 """
 import functools
 import json
@@ -55,8 +53,8 @@ def unresolved_ids(line_records: list[dict], refs: dict | None = None) -> list[s
     return missing
 
 
-def build_sales_order_payload(line_records: list[dict], refs: dict | None = None) -> dict:
-    """One NetSuite REST salesOrder body from transform_invoice's line records.
+def build_invoice_payload(line_records: list[dict], refs: dict | None = None) -> dict:
+    """One NetSuite REST invoice body from transform_invoice's line records.
 
     Refs are internal ids ({"id": ...}); an unresolved item/tax name emits an
     empty id (see unresolved_ids). Amounts and the customer id come straight from
@@ -64,7 +62,7 @@ def build_sales_order_payload(line_records: list[dict], refs: dict | None = None
     ValueError on an empty list.
     """
     if not line_records:
-        raise ValueError("build_sales_order_payload needs at least one line record")
+        raise ValueError("build_invoice_payload needs at least one line record")
     refs = refs or load_refs()
     head = line_records[0]
 
@@ -72,6 +70,7 @@ def build_sales_order_payload(line_records: list[dict], refs: dict | None = None
         "externalId": head["external_id"],
         "entity": {"id": head["customer_id"]},
         "tranDate": head["tran_date"],
+        "dueDate": head["due_date"],
         "memo": head["memo"],
         "otherRefNum": head["other_ref_num"],
         "item": {

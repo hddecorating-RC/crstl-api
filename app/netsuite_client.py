@@ -153,17 +153,16 @@ class NetSuiteClient:
             raise ValueError("upsert needs a non-empty external_id")
         return self._request("PUT", f"/record/v1/{record_type}/eid:{external_id}", json_body=body)
 
-    def upsert_sales_order(self, record: dict) -> dict:
-        """Upsert one NetSuite sales order. `record` is a REST salesOrder body
-        carrying an externalId (build it with
-        app.netsuite_payload.build_sales_order_payload from the line records
-        app.netsuite.transform_invoice emits). Sales orders -- not invoices --
-        because accounting matches them against orders then against payables,
-        mirroring OMIS's own NetSuite integration in this account."""
+    def upsert_invoice(self, record: dict) -> dict:
+        """Upsert one NetSuite invoice. `record` is a REST invoice body carrying
+        an externalId (build it with app.netsuite_payload.build_invoice_payload
+        from the line records app.netsuite.transform_invoice emits). Accounting
+        books this Home Depot revenue as an invoice; refs are internal ids, the
+        convention OMIS uses in this same account."""
         external_id = record.get("externalId") or record.get("external_id")
         if not external_id:
-            raise ValueError("sales order record needs an externalId")
-        return self.upsert_record("salesOrder", external_id, record)
+            raise ValueError("invoice record needs an externalId")
+        return self.upsert_record("invoice", external_id, record)
 
     def get_record(self, record_type: str, record_id: str, expand: bool = True) -> dict:
         """Read one record by internal id. Read-only -- used to inspect the exact
@@ -189,7 +188,9 @@ class NetSuiteClient:
         )
 
     def test_connection(self) -> dict:
-        """Cheapest authenticated call: list one sales order. Proves the signing
-        and the five credentials work without creating anything. Run this first
-        when credentials land."""
-        return self.list_records("salesOrder", limit=1)
+        """Auth check that does NOT need search/list permission: fetch the invoice
+        record's metadata schema. Proves the credentials, signing, and invoice
+        access without reading customer data or creating anything. (A collection
+        GET is a search, which some roles refuse -- observed on this account.)"""
+        return self._request("GET", "/record/v1/metadata-catalog/invoice",
+                             extra_headers={"Accept": "application/schema+json"})

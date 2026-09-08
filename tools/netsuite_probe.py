@@ -1,20 +1,23 @@
 """
 netsuite_probe.py
 -----------------
-Read-only NetSuite explorer. Makes NO writes, so it is safe against production --
-which matters because there is no sandbox. Two purposes:
+Read-only NetSuite explorer. Makes NO writes, so it is safe against production
+(there is no sandbox). Two purposes:
 
-  1. Get TBA working: confirm the credentials and OAuth signing (a GET/SELECT,
-     creates nothing).
+  1. Get TBA working: confirm the credentials and OAuth signing (a read; creates
+     nothing). The connection test fetches the invoice metadata schema, which
+     does NOT require search/list permission.
   2. Look up the internal ids the connector needs, so we fill
-     config/netsuite_customers.json ourselves instead of waiting on accounting.
+     config/netsuite_customers.json ourselves.
 
 Usage:
-    python tools/netsuite_probe.py                       # test connection; list recent salesOrder ids
-    python tools/netsuite_probe.py --id 123456           # GET salesOrder 123456 (read its item/tax/class ids)
-    python tools/netsuite_probe.py --type invoice --id 1 # GET another record type
-    python tools/netsuite_probe.py --sql "SELECT id, itemid, displayname FROM item"
-    python tools/netsuite_probe.py --sql "SELECT id, itemid FROM item WHERE itemid IN ('Merchandise Sales','Allowance','Charge')"
+    python tools/netsuite_probe.py                    # test connection (invoice metadata)
+    python tools/netsuite_probe.py --id 123456        # GET invoice 123456 by INTERNAL id (numeric)
+    python tools/netsuite_probe.py --type salesOrder --id 123456
+    python tools/netsuite_probe.py --sql "SELECT id, itemid, displayname FROM item WHERE itemid IN ('Merchandise Sales','Allowance','Charge')"
+
+Note: --id takes the INTERNAL id (the number in the record URL, ...?id=NNNNN),
+not the document number like INV12345.
 """
 import argparse
 import json
@@ -29,9 +32,9 @@ from app.netsuite_client import NetSuiteClient, NetSuiteUnavailable  # noqa: E40
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--id", help="internal id of a record to fetch (read-only)")
-    parser.add_argument("--type", default="salesOrder",
-                        help="record type for --id (default: salesOrder)")
+    parser.add_argument("--id", help="INTERNAL id of a record to fetch (numeric, read-only)")
+    parser.add_argument("--type", default="invoice",
+                        help="record type for --id (default: invoice)")
     parser.add_argument("--sql", help="run a read-only SuiteQL SELECT and print the rows")
     args = parser.parse_args()
 
@@ -54,13 +57,11 @@ def main() -> None:
             print(json.dumps(client.get_record(args.type, args.id), indent=2, default=str))
             return
 
-        print("Testing connection (GET salesOrder?limit=5)...")
-        result = client.list_records("salesOrder", limit=5)
-        ids = [item.get("id") for item in result.get("items", [])]
-        print(f"  OK -- credentials and signing work. Recent salesOrder ids: {ids}")
-        print("  Next: python tools/netsuite_probe.py --id <one of those>  "
-              "to read its item/tax/class ids,")
-        print("  or:   python tools/netsuite_probe.py --sql \"SELECT id, itemid FROM item ...\"")
+        print("Testing connection (invoice metadata, read-only)...")
+        client.test_connection()
+        print("  OK -- credentials, signing, and invoice access work.")
+        print("  Next: --id <invoice internal id> to read a real record, "
+              "or fill the ids in config/netsuite_customers.json.")
     except NetSuiteUnavailable as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
