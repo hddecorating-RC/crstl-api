@@ -70,7 +70,6 @@ def build_invoice_payload(line_records: list[dict], refs: dict | None = None) ->
         "externalId": head["external_id"],
         "entity": {"id": head["customer_id"]},
         "tranDate": head["tran_date"],
-        "dueDate": head["due_date"],
         "memo": head["memo"],
         "otherRefNum": head["other_ref_num"],
         "item": {
@@ -87,7 +86,9 @@ def build_invoice_payload(line_records: list[dict], refs: dict | None = None) ->
             ]
         },
     }
-    # Optional account-level refs -- only sent when configured.
+    # Optional fields -- only sent when present, so NetSuite derives/rejects nothing.
+    if head.get("due_date"):
+        payload["dueDate"] = head["due_date"]  # NetSuite rejects an empty date string
     if refs.get("class_id"):
         payload["class"] = {"id": refs["class_id"]}
     if refs.get("subsidiary_id"):

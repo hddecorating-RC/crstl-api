@@ -184,6 +184,12 @@ def test_build_invoice_payload_uses_internal_ids():
     assert items[1]["amount"] == -5.0
 
 
+def test_build_invoice_payload_omits_empty_due_date():
+    lines = [dict(LINES[0], due_date="")]
+    body = build_invoice_payload(lines, REFS)
+    assert "dueDate" not in body  # NetSuite rejects an empty date string
+
+
 def test_unresolved_ids_flags_blank_refs():
     refs = {"item_ids": {"Merchandise Sales": "201"}, "tax_code_ids": {}, "class_id": "", "subsidiary_id": ""}
     missing = unresolved_ids(LINES, refs)

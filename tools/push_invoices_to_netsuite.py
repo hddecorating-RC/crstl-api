@@ -26,7 +26,6 @@ There is no sandbox: use --only/--limit to send a single controlled record first
 import argparse
 import json
 import os
-import pathlib
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,17 +34,23 @@ from app.main import load_env  # noqa: E402  -- also loads .env at import
 from app.netsuite import transform_invoice  # noqa: E402
 from app.netsuite_payload import build_invoice_payload, load_refs, unresolved_ids  # noqa: E402
 
-INPUT_PATH = pathlib.Path(".tmp/invoices_raw.json")
-
 
 def _load_invoices() -> list[dict]:
-    if not INPUT_PATH.exists():
-        print(f"ERROR: {INPUT_PATH} not found. Run tools/crstl_fetch_invoices.py first.")
-        sys.exit(1)
-    invoices = json.loads(INPUT_PATH.read_text())
+    """Build invoices the way the app does: fetch transaction details from Crstl,
+    flatten them (crstl._extract_invoice_fields), and attach province/store from
+    the source PO (main._attach_provinces). Read-only on Crstl; needs
+    CRSTL_API_KEY. This is the same pipeline the dashboard/report uses -- the raw
+    .tmp file is nested {file, metadata} and is NOT the flat shape we need."""
+    from app.crstl import CrstlClient
+    from app.main import _attach_provinces
+    client = CrstlClient()
+    print("Fetching invoices from Crstl (read-only)...")
+    invoices = client.fetch_invoices()
+    _attach_provinces(invoices, client.fetch_po_provinces())
     if not invoices:
         print("No invoices to push.")
         sys.exit(0)
+    print(f"  {len(invoices)} invoices fetched.")
     return invoices
 
 
