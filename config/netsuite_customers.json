@@ -36,17 +36,17 @@
       "note": "Base price - (0.50% trade + 1.25% IBx + 1.00% RDC off gross) - 3.5% MET off subtotal = 6.19% off gross (Backward Calculator V5)."
     },
     "dropship": {
-      "item": "-5.19% vendor discounts",
+      "item": "-5.19% dropship discount",
       "rate": 0.0519,
       "note": "Base price - (0.50% trade + 1.25% IBx off gross) - 3.5% MET off subtotal = 5.19% off gross; drops freight + RDC (Backward Calculator V5)."
     }
   },
 
-  "_comment_ids": "Internal NetSuite ids for the REST invoice connector. Read them from NetSuite with tools/netsuite_probe.py --type <recordtype> --id N (read-only). A blank value is reported by the push tool and BLOCKS a live send. Merchandise = NonInvtPart 194642 (Drapery Panels); DSD discount = Discount item 194744; dropship discount = a Discount item (rate 5.19) still to be created.",
+  "_comment_ids": "Internal NetSuite ids for the REST invoice connector. Read them from NetSuite with tools/netsuite_probe.py --type <recordtype> --id N (read-only). A blank value is reported by the push tool and BLOCKS a live send. Merchandise = NonInvtPart 194642 (Drapery Panels); DSD discount = Discount item 194744; dropship discount = Discount item 194745 (rate 5.19, contra-rev 49400).",
   "item_ids": {
     "Drapery Panels": "194642",
     "-6.19% vendor discounts": "194744",
-    "-5.19% vendor discounts": ""
+    "-5.19% dropship discount": "194745"
   },
   "tax_code_ids": {
     "CA-HST ONT": "468",
