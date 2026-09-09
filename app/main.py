@@ -434,6 +434,43 @@ def _reportable(invoices: list[dict]) -> list[dict]:
     return keep
 
 
+def _netsuite_push_digest_html() -> str:
+    """HTML section for the daily digest summarising the most recent NetSuite
+    push. The auto-push job runs at 7:05, before the 7:15 digest, so this reflects
+    it; a manual push later in the day would show instead."""
+    with _netsuite_push_lock:
+        st = dict(_netsuite_push_state)
+    heading = "<h3 style='margin-top:18px'>Pushed to NetSuite</h3>"
+    if st.get("mode") != "live" or not st.get("last_run"):
+        return heading + "<p>No NetSuite push since the last digest.</p>"
+    results = st.get("results") or []
+    sent = [r for r in results if r.get("status") == "sent"]
+    failed = [r for r in results if r.get("status") == "failed"]
+    total = sum((r.get("total") or 0) for r in sent)
+    header = (heading + f"<p><strong>{len(sent)} invoice(s) pushed</strong> &middot; total "
+              f"${total:,.2f} CAD"
+              + (f" &middot; <span style='color:#b32020'>{len(failed)} failed</span>" if failed else "")
+              + "</p>")
+    if st.get("blocked"):
+        header += f"<p style='color:#b45309'><strong>Blocked:</strong> {html.escape(str(st['blocked']))}</p>"
+    if not sent:
+        return header
+    rows = ""
+    for r in sent[:50]:
+        inv = html.escape(str(r.get("invoice_number") or r.get("transaction_id") or ""))
+        ch = html.escape(str(r.get("channel") or ""))
+        rows += (f"<tr><td>{inv}</td><td>{ch}</td>"
+                 f"<td style='text-align:right'>${(r.get('net') or 0):,.2f}</td>"
+                 f"<td style='text-align:right'>${(r.get('tax') or 0):,.2f}</td>"
+                 f"<td style='text-align:right'>${(r.get('total') or 0):,.2f}</td></tr>")
+    table = ("<table cellpadding='4' cellspacing='0' border='1' style='border-collapse:collapse'>"
+             "<tr><th align='left'>Invoice</th><th align='left'>Channel</th>"
+             "<th align='right'>Net</th><th align='right'>Tax</th><th align='right'>Total</th></tr>"
+             + rows + "</table>")
+    more = f"<p><em>&hellip; and {len(sent) - 50} more</em></p>" if len(sent) > 50 else ""
+    return header + table + more
+
+
 def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
     """Send an invoice email.
 
@@ -511,6 +548,9 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
         subject = f"HD Invoice Digest — {today} — 0 new"
         body_html = "<p>No new invoices since the last digest. Pipeline is healthy.</p>"
         attachments = None
+
+    if mode == "digest":
+        body_html += _netsuite_push_digest_html()
 
     send_mail(subject=subject, body_html=body_html, recipients=recipients, attachments=attachments)
 
