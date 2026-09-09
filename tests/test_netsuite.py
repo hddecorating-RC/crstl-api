@@ -25,10 +25,12 @@ SAMPLE_CONFIG = {
         "QC": {"customer_id": "cust-qc", "tax_code": "GST+QST", "tax_rate": 0.14975},
         "ON": {"customer_id": "cust-on-ds", "tax_code": "HST-ON", "tax_rate": 0.13},
     },
-    "item": "Merchandise Sales",
-    "allowance_item": "Allowance",
-    "charge_item": "Charge",
+    "item": "Drapery Panels",
     "currency": "CAD",
+    "channel_discounts": {
+        "dsd": {"item": "-6.19% vendor discounts", "rate": 0.0619, "note": "DSD note"},
+        "dropship": {"item": "-5.19% vendor discounts", "rate": 0.0519, "note": "Dropship note"},
+    },
 }
 
 
@@ -39,72 +41,57 @@ def mock_config():
 
 
 def test_transform_dsd_vaughan(mock_config):
+    """DSD invoice => 2 lines: gross merchandise + one 6.19% discount line, both
+    sharing external_id/customer/tax_code; tax computed on the NET."""
     from app.netsuite import transform_invoice
     lines = transform_invoice(SAMPLE_INVOICE, province="ON", store="VAUGHAN")
-    assert lines is not None and len(lines) == 1  # only merchandise line — no allowances/charges
-    row = lines[0]
-    assert row["external_id"] == "tx-001"  # transaction_id — the only field guaranteed unique
-    assert row["customer_id"] == "cust-vaughan"
-    assert row["tax_code"] == "HST-ON"
-    assert row["rate"] == 18000.00
-    assert row["tax_amount"] == 2340.00
-    assert row["tran_date"] == "2026-07-07"
-    assert row["due_date"] == "2026-08-06"
-    assert row["memo"] == "INV-001 / PO PO-12345"
-    assert row["other_ref_num"] == "PO-12345"
-    assert row["currency"] == "CAD"
-    assert row["item"] == "Merchandise Sales"
-    assert row["description"] == ""
-    assert row["quantity"] == 1
+    assert lines is not None and len(lines) == 2
+    merch, disc = lines
+
+    assert merch["external_id"] == "tx-001"  # transaction_id — the only unique field
+    assert merch["customer_id"] == "cust-vaughan"
+    assert merch["tax_code"] == "HST-ON"
+    assert merch["tran_date"] == "2026-07-07"
+    assert merch["due_date"] == "2026-08-06"
+    assert merch["memo"] == "INV-001 / PO PO-12345"
+    assert merch["other_ref_num"] == "PO-12345"
+    assert merch["currency"] == "CAD"
+    assert merch["item"] == "Drapery Panels"
+    assert merch["rate"] == 18000.00 and merch["amount"] == 18000.00
+    assert merch["quantity"] == 1
+    # gross 18000 * 6.19% = 1114.20; net 16885.80 * 13% = 2195.15 on the merch line
+    assert merch["tax_amount"] == 2195.15
+
+    assert disc["item"] == "-6.19% vendor discounts"
+    assert disc["rate"] == -1114.20 and disc["amount"] == -1114.20
+    assert disc["tax_amount"] == 0
+    assert disc["tax_code"] == "HST-ON"          # same code => reduces the taxable base
+    assert disc["description"] == "DSD note"
+    assert disc["external_id"] == "tx-001"       # shares the invoice
 
 
 def test_transform_dropship_quebec(mock_config):
+    """Dropship => the 5.19% channel discount (drops freight + RDC), QST tax."""
     from app.netsuite import transform_invoice
     lines = transform_invoice(SAMPLE_INVOICE, province="QC", store=None)
-    assert lines is not None and len(lines) == 1
-    assert lines[0]["customer_id"] == "cust-qc"
-    assert lines[0]["tax_code"] == "GST+QST"
+    assert lines is not None and len(lines) == 2
+    merch, disc = lines
+    assert merch["customer_id"] == "cust-qc"
+    assert merch["tax_code"] == "GST+QST"
+    assert disc["item"] == "-5.19% vendor discounts"
+    # 18000 * 5.19% = 934.20; net 17065.80 * 14.975% = 2555.60
+    assert disc["rate"] == -934.20
+    assert merch["tax_amount"] == 2555.60
 
 
-def test_transform_emits_allowance_and_charge_lines(mock_config):
-    """Real HD invoice: subtotal + 3 allowances + 1 charge = 5 lines, all shared external_id."""
+def test_transform_total_reconciles_to_net_plus_tax(mock_config):
+    """The invoice total NetSuite will book = gross + discount + tax; the per-line
+    fields must sum to it exactly (deterministic, no rounding drift)."""
     from app.netsuite import transform_invoice
-    inv = {
-        **SAMPLE_INVOICE,
-        "transaction_id": "6a6b84c9f971616e2921bbea",
-        "invoice_number": "INV40855335",
-        "po_number": "40855335",
-        "subtotal": 10273.56,
-        "tax_amount": 0.0,
-        "total_amount": 10166.97,
-        "allowances_charges": [
-            {"type": "Allowance", "code": "E210", "amount": 359.57},
-            {"type": "Allowance", "code": "H090", "amount": 102.74},
-            {"type": "Allowance", "code": "H000", "amount": 128.42},
-            {"type": "Charge",    "code": "D360", "amount": 484.14},
-        ],
-    }
-    lines = transform_invoice(inv, province="AB", store="CALGARY")
-    assert len(lines) == 5
-    # All lines share external_id, customer, tax_code
-    assert {l["external_id"] for l in lines} == {"6a6b84c9f971616e2921bbea"}
-    assert {l["customer_id"] for l in lines} == {"cust-calgary"}
-    assert {l["tax_code"] for l in lines} == {"GST"}
-    # Line 0 is merchandise
-    assert lines[0]["item"] == "Merchandise Sales"
-    assert lines[0]["rate"] == 10273.56
-    assert lines[0]["tax_amount"] == 0.0
-    # Allowance lines: negative rate, "Allowance" item, code as description, 0 tax
-    assert lines[1] == {**lines[1], "item": "Allowance", "description": "E210", "rate": -359.57, "amount": -359.57, "tax_amount": 0}
-    assert lines[2]["description"] == "H090" and lines[2]["rate"] == -102.74
-    assert lines[3]["description"] == "H000" and lines[3]["rate"] == -128.42
-    # Charge line: positive rate, "Charge" item
-    assert lines[4]["item"] == "Charge"
-    assert lines[4]["description"] == "D360"
-    assert lines[4]["rate"] == 484.14
-    # Row-sum sanity: sum(rate) + tax matches actual total ($10,166.97)
-    computed_total = sum(l["rate"] for l in lines) + lines[0]["tax_amount"]
-    assert round(computed_total, 2) == inv["total_amount"]
+    lines = transform_invoice(SAMPLE_INVOICE, province="ON", store="VAUGHAN")
+    total = sum(l["amount"] for l in lines) + sum(l["tax_amount"] for l in lines)
+    # gross 18000 - discount 1114.20 + tax 2195.15
+    assert round(total, 2) == 19080.95
 
 
 def test_transform_unknown_province_returns_none(mock_config):
@@ -129,7 +116,7 @@ SAMPLE_RECORD = {
     "due_date":      "2026-08-06",
     "memo":          "PO-12345",
     "other_ref_num": "PO-12345",
-    "item":          "Merchandise Sales",
+    "item":          "Drapery Panels",
     "description":   "",
     "quantity":      1,
     "rate":          18000.00,

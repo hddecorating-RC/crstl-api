@@ -25,30 +25,28 @@
     "QC": {"customer_id": "4146", "tax_code": "CA-S-QST", "tax_rate": 0.14975},
     "SK": {"customer_id": "4149", "tax_code": "CA-GST 5%", "tax_rate": 0.05}
   },
-  "item": "Merchandise Sales",
-  "allowance_item": "Allowance",
-  "charge_item": "Charge",
+  "item": "Drapery Panels",
   "currency": "CAD",
 
-  "_comment_ids": "Internal NetSuite ids for the REST sales-order connector. Look them up in NetSuite (a read-only GET of an existing OMIS sales order via tools/netsuite_probe.py shows them). Blank values are reported by the push tool and block a live send.",
+  "_comment_discount": "Vendor discount per Backward Calculator V5 (== HD Canada Invoice Allowance Spec). Booked in NetSuite as a percentage DISCOUNT item (itemType Discount) that carries the rate on the item itself; the connector emits one gross merchandise line + one discount-item line, both under the province tax code so NetSuite taxes the NET. DSD applies trade+IBx+RDC off gross and MET off the post-(trade+def+IBx) subtotal => 6.19% off gross (NetSuite item 194744, rate 6.19, verified 2026-09-09). Dropship drops freight+RDC => 5.19% (item to be created, rate 5.19). `rate` here must equal the NetSuite item's stored rate; it is used to compute the line amount (and drives the interim CSV path, which cannot recompute a percentage item).",
+  "channel_discounts": {
+    "dsd": {
+      "item": "-6.19% vendor discounts",
+      "rate": 0.0619,
+      "note": "Base price - (0.50% trade + 1.25% IBx + 1.00% RDC off gross) - 3.5% MET off subtotal = 6.19% off gross (Backward Calculator V5)."
+    },
+    "dropship": {
+      "item": "-5.19% vendor discounts",
+      "rate": 0.0519,
+      "note": "Base price - (0.50% trade + 1.25% IBx off gross) - 3.5% MET off subtotal = 5.19% off gross; drops freight + RDC (Backward Calculator V5)."
+    }
+  },
+
+  "_comment_ids": "Internal NetSuite ids for the REST invoice connector. Read them from NetSuite with tools/netsuite_probe.py --type <recordtype> --id N (read-only). A blank value is reported by the push tool and BLOCKS a live send. Merchandise = NonInvtPart 194642 (Drapery Panels); DSD discount = Discount item 194744; dropship discount = a Discount item (rate 5.19) still to be created.",
   "item_ids": {
-    "Merchandise Sales": "194642",
-    "Allowance": "",
-    "Charge": ""
-  },
-  "_comment_discount": "Vendor discount per Backward Calculator V5 (== HD Canada Invoice Allowance Spec, confirmed identical rules). Every allowance is a % off GROSS except MET, which is a % off the SUBTOTAL (gross - trade - defective - IBx). Invoice net stops after MET/freight/RDC; coop/rebate + payment terms are Off-PO and do NOT go on the invoice. DSD applies all (=> 6.19%); Dropship drops freight + RDC (=> 5.19%). Rates are VENDOR-SPECIFIC (calculator row 5) -- these are the drapery-panel/'3D Interior Fashion' profile; other products (e.g. warehouse blinds, item 195048) may have different rates -- confirm per product. Accounting's NetSuite invoices are WRONG (dropship posted at 1.25% IBx-only); the calculator is authoritative.",
-  "discount_rates": {
-    "trade": 0.005,
-    "defective": 0.0,
-    "ibx": 0.0125,
-    "met": 0.035,
-    "rdc": 0.01,
-    "freight": 0.0
-  },
-  "discount_channel_rules": {
-    "_note": "Which allowances apply per channel; MET is computed off the subtotal, all others off gross.",
-    "dsd": ["trade", "defective", "ibx", "met", "rdc", "freight"],
-    "dropship": ["trade", "defective", "ibx", "met"]
+    "Drapery Panels": "194642",
+    "-6.19% vendor discounts": "194744",
+    "-5.19% vendor discounts": ""
   },
   "tax_code_ids": {
     "CA-HST ONT": "468",

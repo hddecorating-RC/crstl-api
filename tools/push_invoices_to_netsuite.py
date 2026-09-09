@@ -41,9 +41,8 @@ def _load_invoices() -> list[dict]:
     the source PO (main._attach_provinces). Read-only on Crstl; needs
     CRSTL_API_KEY. This is the same pipeline the dashboard/report uses -- the raw
     .tmp file is nested {file, metadata} and is NOT the flat shape we need."""
-    from app.crstl import CrstlClient
-    from app.main import _attach_provinces
-    client = CrstlClient()
+    from app.main import _attach_provinces, _get_client
+    client = _get_client()
     print("Fetching invoices from Crstl (read-only)...")
     invoices = client.fetch_invoices()
     _attach_provinces(invoices, client.fetch_po_provinces())
@@ -60,6 +59,8 @@ def main() -> None:
                         help="actually upsert to NetSuite (needs NETSUITE_* creds + filled ids)")
     parser.add_argument("--only", metavar="TXN_ID", help="push just this transaction_id")
     parser.add_argument("--limit", type=int, help="cap the number processed")
+    parser.add_argument("--json", action="store_true",
+                        help="in a dry run, also dump the full REST body per invoice")
     args = parser.parse_args()
 
     load_env()
@@ -75,7 +76,7 @@ def main() -> None:
     refs = load_refs()
 
     # Map everything first, so id gaps are reported before NetSuite is touched.
-    prepared: list[tuple[dict, dict]] = []
+    prepared: list[tuple[dict, dict, list]] = []
     skipped_no_map = 0
     all_unresolved: set[str] = set()
     for inv in invoices:
@@ -85,7 +86,7 @@ def main() -> None:
             print(f"  skip  {inv.get('transaction_id', '?')}: no province/store mapping")
             continue
         all_unresolved.update(unresolved_ids(lines, refs))
-        prepared.append((inv, build_invoice_payload(lines, refs)))
+        prepared.append((inv, build_invoice_payload(lines, refs), lines))
 
     if all_unresolved:
         print("\nMissing internal ids in config/netsuite_customers.json "
@@ -111,12 +112,27 @@ def main() -> None:
         print("NetSuite connection OK.")
 
     sent = failed = 0
-    for inv, body in prepared:
+    for inv, body, lines in prepared:
         eid = inv.get("transaction_id", "?")
         if not args.live:
-            print(f"  DRY   {eid}: would PUT invoice/eid:{body['externalId']} "
-                  f"({len(body['item']['items'])} line(s))")
-            print(json.dumps(body, indent=2, default=str))
+            # Show the model at a glance and reconcile our computed invoice total
+            # against HD's stated 810 total, so a divergence is visible before any
+            # live write. gross + discount + tax are the transform's line fields
+            # (the REST body drops per-line tax, which NetSuite recomputes).
+            gross = lines[0]["amount"]
+            discount = sum(l["amount"] for l in lines[1:])
+            tax = sum(l["tax_amount"] for l in lines)
+            our_total = round(gross + discount + tax, 2)
+            hd_total = inv.get("total_amount")
+            delta = None if hd_total is None else round(our_total - hd_total, 2)
+            chan = "DSD " if inv.get("store") else "DROP"
+            where = inv.get("store") or inv.get("province") or "?"
+            print(f"  DRY  {eid} {chan} {where:<8} gross {gross:>10.2f}  disc {discount:>9.2f}  "
+                  f"net {round(gross + discount, 2):>10.2f}  tax {tax:>8.2f}  => total {our_total:>10.2f}"
+                  f"   HD810 {('' if hd_total is None else format(hd_total, '.2f')):>10}"
+                  f"   d {('' if delta is None else format(delta, '+.2f')):>9}")
+            if args.json:
+                print(json.dumps(body, indent=2, default=str))
             sent += 1
             continue
         try:
