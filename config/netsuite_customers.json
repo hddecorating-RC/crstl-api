@@ -39,9 +39,9 @@
   "tax_code_ids": {
     "CA-HST ONT": "468",
     "CA-GST 5%": "321",
-    "CA-HST Maritimes": "",
-    "HST NS": "",
-    "CA-S-QST": ""
+    "CA-HST Maritimes": "467",
+    "HST NS": "194234",
+    "CA-S-QST": "476"
   },
   "class_id": "",
   "subsidiary_id": "1"
