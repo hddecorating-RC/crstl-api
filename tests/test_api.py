@@ -205,10 +205,19 @@ def test_export_empty_cache_returns_503(client):
     assert resp.status_code == 503
 
 
-def test_netsuite_returns_501(client):
-    resp = client.post("/api/netsuite")
-    assert resp.status_code == 501
-    assert "not yet configured" in resp.json()["message"]
+def test_netsuite_push_dry_run(client):
+    client.post("/api/sync")
+    resp = client.post("/api/netsuite")   # dry_run defaults True -> writes nothing
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["mode"] == "dry"
+    assert "summary" in body and "results" in body
+    # a dry run must not set any per-invoice netsuite_at
+    invoices = client.get("/api/invoices").json()["invoices"]
+    assert all(inv["netsuite_at"] is None for inv in invoices)
+    # ...and it is logged for the dashboard
+    latest = client.get("/api/netsuite-push/latest").json()
+    assert latest["mode"] == "dry" and latest["running"] is False
 
 
 def test_export_sets_exported_at(client):

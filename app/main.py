@@ -18,6 +18,7 @@ from app import tracking
 from app.mail import send_mail, MailConfigError
 from app.netsuite import transform_invoice
 from app.netsuite_csv import build_netsuite_csv
+from app.netsuite_push import push_invoices
 from app.report import (XLSX_MEDIA_TYPE, dates_for, flavor_of, product_for,
                         rows_for_transactions, window_label, workbook_bytes)
 from app.finale import FinaleClient
@@ -45,6 +46,13 @@ _cache: dict = {"invoices": [], "last_synced": None, "status": "never", "po_prov
 _cache_lock = threading.Lock()
 _netsuite_state: dict = {"last_generated": None, "path": None, "count": 0, "skipped": 0, "error": None, "generating": False}
 _netsuite_lock = threading.Lock()
+# The REST push (POST /api/netsuite) is separate from the CSV export above. This
+# holds the last run's summary + per-invoice results so the dashboard can show a
+# push log; `running` guards against overlapping pushes.
+_netsuite_push_state: dict = {"last_run": None, "mode": None, "summary": None,
+                              "unresolved": [], "results": [], "blocked": None,
+                              "error": None, "running": False}
+_netsuite_push_lock = threading.Lock()
 _digest_state: dict = {"last_sent": None, "count": 0, "error": None, "sending": False}
 _digest_lock = threading.Lock()
 
@@ -665,12 +673,64 @@ def export(body: ExportRequest = ExportRequest()) -> Response:
     )
 
 
+class NetsuitePushRequest(BaseModel):
+    # Dry run by default: a live send must be asked for explicitly. `ids` pushes
+    # just those transaction_ids (the "test one invoice" flow); `limit` caps the
+    # batch. There is no sandbox, so the safe path is dry_run -> ids/limit -> live.
+    dry_run: bool = True
+    ids: Optional[list[str]] = None
+    limit: Optional[int] = None
+
+
+def _run_netsuite_push(live: bool, ids: Optional[list[str]], limit: Optional[int]) -> dict:
+    """Push the cached invoices via the shared engine and record the run. Runs in
+    a worker thread (the upsert loop is blocking network I/O)."""
+    with _cache_lock:
+        invoices = list(_cache["invoices"])
+    result = push_invoices(invoices, live=live, only=ids, limit=limit)
+    with _netsuite_push_lock:
+        _netsuite_push_state.update({
+            "last_run": datetime.now(timezone.utc).isoformat(),
+            "mode": result["mode"],
+            "summary": result["summary"],
+            "unresolved": result["unresolved"],
+            "results": result["results"],
+            "blocked": result.get("blocked"),
+            "error": None,
+        })
+    return result
+
+
 @app.post("/api/netsuite")
-def netsuite() -> JSONResponse:
-    return JSONResponse(
-        status_code=501,
-        content={"message": "NetSuite REST connector not yet configured. Use CSV export path."},
-    )
+async def netsuite_push(body: NetsuitePushRequest = NetsuitePushRequest()) -> JSONResponse:
+    """Manual push of Crstl invoices into NetSuite as invoices (TBA REST).
+    Dry run unless dry_run=false. A live send is refused (nothing written) while
+    any item/tax id is unresolved in config -- the unresolved list comes back so
+    it can be filled first."""
+    with _netsuite_push_lock:
+        if _netsuite_push_state.get("running"):
+            return JSONResponse(status_code=409, content={"message": "A NetSuite push is already in progress"})
+        _netsuite_push_state["running"] = True
+    try:
+        result = await asyncio.to_thread(_run_netsuite_push, not body.dry_run, body.ids, body.limit)
+    except Exception as exc:
+        with _netsuite_push_lock:
+            _netsuite_push_state["error"] = str(exc)
+        return JSONResponse(status_code=500, content={"message": str(exc)})
+    finally:
+        with _netsuite_push_lock:
+            _netsuite_push_state["running"] = False
+    with _netsuite_push_lock:
+        last_run = _netsuite_push_state["last_run"]
+    # A live send blocked on unresolved ids wrote nothing -> surface as 400.
+    status_code = 400 if result.get("blocked") else 200
+    return JSONResponse(status_code=status_code, content={**result, "last_run": last_run})
+
+
+@app.get("/api/netsuite-push/latest")
+def netsuite_push_latest() -> dict:
+    with _netsuite_push_lock:
+        return {**_netsuite_push_state}
 
 
 @app.get("/api/netsuite-export/latest")

@@ -453,10 +453,27 @@
         <span x-show="!syncing">↻ Refresh</span>
         <span x-show="syncing">Refreshing…</span>
       </button>
-      <button disabled class="bg-white border border-dashed border-gray-300 text-gray-300 text-sm px-4 py-2 rounded-lg cursor-not-allowed">
-        ⬡ Push All to NetSuite
-        <span class="ml-1 bg-gray-100 text-gray-400 text-xs px-1.5 py-0.5 rounded">coming soon</span>
+      <button @click="pushNetsuite(true)" :disabled="pushingNetsuite || invoices.length === 0"
+              class="bg-white border border-gray-200 hover:border-gray-300 text-gray-600 text-sm px-4 py-2 rounded-lg disabled:opacity-50 transition">
+        <span x-show="!pushingNetsuite">⬡ Dry-run NetSuite push</span>
+        <span x-show="pushingNetsuite">Working…</span>
       </button>
+      <button @click="pushNetsuite(false)" :disabled="pushingNetsuite || invoices.length === 0"
+              title="Sends live invoices to NetSuite. Refused while any id is unresolved."
+              class="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-4 py-2 rounded-lg disabled:opacity-50 transition">
+        ⬡ Push live
+      </button>
+    </div>
+
+    <!-- Last NetSuite push: summary + unresolved-id log -->
+    <div x-show="netsuitePush.last_run" class="mt-2 text-xs text-gray-500">
+      <span x-text="'Last push: ' + (netsuitePush.mode || '') + ' · ' + (netsuitePush.last_run ? fmtTime(netsuitePush.last_run) : '')"></span>
+      <template x-if="netsuitePush.summary">
+        <span x-text="' · built ' + netsuitePush.summary.built + ', sent ' + netsuitePush.summary.sent + ', failed ' + netsuitePush.summary.failed + ', skipped ' + netsuitePush.summary.skipped_no_map"></span>
+      </template>
+      <span x-show="netsuitePush.blocked" class="text-amber-600 font-medium" x-text="' · blocked: ' + netsuitePush.blocked"></span>
+      <div x-show="netsuitePush.unresolved && netsuitePush.unresolved.length"
+           class="text-amber-600 mt-1" x-text="'Unresolved ids (fill in config, then retry): ' + (netsuitePush.unresolved || []).join(', ')"></div>
     </div>
 
   </div>
@@ -485,6 +502,8 @@ function dashboard() {
     syncStatus: 'never',
     netsuiteExport: { available: false, last_generated: null, count: 0, skipped: 0, error: null },
     generatingNetsuite: false,
+    netsuitePush: { last_run: null, mode: null, summary: null, unresolved: [], results: [], blocked: null, running: false },
+    pushingNetsuite: false,
     digest: { last_sent: null, count: 0, error: null, sending: false, auto_enabled: true },
     sendingDigest: false,
     togglingAutoDigest: false,
@@ -514,6 +533,7 @@ function dashboard() {
       );
       await this.loadInvoices();
       await this.loadNetsuiteStatus();
+      await this.loadNetsuitePush();
       await this.loadDigestStatus();
       setInterval(() => this.loadInvoices(), 60000);
     },
@@ -641,6 +661,44 @@ function dashboard() {
         this.showToast('NetSuite export failed');
       } finally {
         this.generatingNetsuite = false;
+      }
+    },
+
+    async loadNetsuitePush() {
+      try {
+        const res = await fetch('/api/netsuite-push/latest');
+        this.netsuitePush = await res.json();
+      } catch {
+        /* keep prior state if the status call fails */
+      }
+    },
+
+    // Manual push. dryRun=true builds + reconciles without writing; dryRun=false
+    // sends live (refused by the server while any id is unresolved -> data.blocked).
+    async pushNetsuite(dryRun) {
+      if (!dryRun && !confirm('Send LIVE invoices to NetSuite now? This writes to production NetSuite.')) return;
+      this.pushingNetsuite = true;
+      try {
+        const res = await fetch('/api/netsuite', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dry_run: dryRun }),
+        });
+        const data = await res.json();
+        if (res.status === 409) { this.showToast(data.message || 'A push is already running'); return; }
+        this.netsuitePush = { ...this.netsuitePush, ...data, running: false };
+        if (data.blocked) {
+          this.showToast('Live push refused: unresolved ids — see below');
+        } else if (dryRun) {
+          this.showToast('Dry run: ' + data.summary.built + ' built, ' + data.summary.skipped_no_map + ' skipped');
+        } else {
+          this.showToast('Pushed ' + data.summary.sent + ', ' + data.summary.failed + ' failed');
+          await this.loadInvoices();   // refresh netsuite_at markers
+        }
+      } catch {
+        this.showToast('NetSuite push failed');
+      } finally {
+        this.pushingNetsuite = false;
       }
     },
 

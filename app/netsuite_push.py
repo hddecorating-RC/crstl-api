@@ -1,0 +1,148 @@
+"""
+Shared engine for pushing Crstl invoices into NetSuite as INVOICE records via the
+TBA REST connector. One code path, used by both the CLI (tools/push_invoices_to_
+netsuite.py) and the web app (POST /api/netsuite), so a dry run and a live send
+are always built the same way.
+
+Pipeline per invoice:
+    transform_invoice(...)      app.netsuite      -- business mapping (2 lines)
+    build_invoice_payload(...)  app.netsuite_payload -- REST body, internal-id refs
+    NetSuiteClient.upsert_invoice(...)               -- TBA transport (PUT eid:)
+
+Safety:
+  * dry run (live=False) builds and reconciles but sends nothing.
+  * a live send is REFUSED while any item/tax id is unresolved in config
+    (unresolved_ids); the caller gets the list back and no write happens.
+  * a successful live upsert records a per-invoice "netsuite" event
+    (app.tracking) so the dashboard's netsuite_at reflects it.
+
+Results are plain JSON-serialisable dicts so the API can return them directly.
+"""
+from __future__ import annotations
+
+from app.netsuite import transform_invoice
+from app.netsuite_payload import build_invoice_payload, load_refs, unresolved_ids
+
+
+def _reconcile(inv: dict, lines: list[dict]) -> dict:
+    """Per-invoice money view: gross -> discount -> net -> tax -> our total, and
+    the delta vs the total on the 810 we sent Home Depot. The REST body drops
+    per-line tax (NetSuite recomputes), so read it from the transform lines."""
+    gross = lines[0]["amount"]
+    discount = round(sum(l["amount"] for l in lines[1:]), 2)
+    tax = round(sum(l["tax_amount"] for l in lines), 2)
+    total = round(gross + discount + tax, 2)
+    hd_total = inv.get("total_amount")
+    return {
+        "gross": gross,
+        "discount": discount,
+        "net": round(gross + discount, 2),
+        "tax": tax,
+        "total": total,
+        "hd_total": hd_total,
+        "delta": None if hd_total is None else round(total - hd_total, 2),
+    }
+
+
+def _select(invoices: list[dict], only: list[str] | None, limit: int | None) -> list[dict]:
+    if only:
+        wanted = {str(x) for x in only}
+        invoices = [i for i in invoices if str(i.get("transaction_id")) in wanted]
+    if limit:
+        invoices = invoices[:limit]
+    return invoices
+
+
+def push_invoices(
+    invoices: list[dict],
+    *,
+    live: bool = False,
+    only: list[str] | None = None,
+    limit: int | None = None,
+    refs: dict | None = None,
+    client=None,
+) -> dict:
+    """Build (and, when live, send) NetSuite invoices for these Crstl invoices.
+
+    Returns {mode, unresolved, results, summary}:
+      * results: one dict per invoice with transaction_id, channel, where,
+        status (built|sent|failed|skipped_no_map), the reconciliation numbers,
+        and location (live) or error.
+      * summary: counts of built/sent/failed/skipped_no_map.
+    A live send is refused (nothing written) if `unresolved` is non-empty.
+    """
+    refs = refs or load_refs()
+    invoices = _select(invoices, only, limit)
+
+    results: list[dict] = []
+    prepared: list[tuple[dict, dict]] = []   # (result-row, payload) for rows to send
+    unresolved: list[str] = []
+    skipped_no_map = 0
+
+    for inv in invoices:
+        tid = str(inv.get("transaction_id", "?"))
+        store, province = inv.get("store"), inv.get("province")
+        lines = transform_invoice(inv, province, store)
+        if not lines:
+            skipped_no_map += 1
+            results.append({"transaction_id": tid, "channel": None, "where": None,
+                            "status": "skipped_no_map"})
+            continue
+        row = {
+            "transaction_id": tid,
+            "channel": "dsd" if store else "dropship",
+            "where": store or province,
+            "status": "built",
+            **_reconcile(inv, lines),
+        }
+        for tag in unresolved_ids(lines, refs):
+            if tag not in unresolved:
+                unresolved.append(tag)
+        results.append(row)
+        prepared.append((row, build_invoice_payload(lines, refs)))
+
+    mode = "live" if live else "dry"
+    sent = failed = 0
+
+    if live:
+        if unresolved:
+            # Refuse the whole batch; nothing is written.
+            return {"mode": mode, "unresolved": unresolved, "results": results,
+                    "summary": {"built": len(prepared), "sent": 0, "failed": 0,
+                                "skipped_no_map": skipped_no_map},
+                    "blocked": "unresolved ids"}
+        from app.netsuite_client import NetSuiteClient, NetSuiteUnavailable
+        if client is None:
+            if not NetSuiteClient.configured():
+                raise NetSuiteUnavailable("NETSUITE_* credentials not set")
+            client = NetSuiteClient()
+            client.test_connection()
+
+        pushed_ids: list[str] = []
+        for row, payload in prepared:
+            try:
+                result = client.upsert_invoice(payload)
+                row["status"] = "sent"
+                row["location"] = result.get("location") or result
+                sent += 1
+                pushed_ids.append(row["transaction_id"])
+            except Exception as exc:  # one bad invoice must not stop the batch
+                row["status"] = "failed"
+                row["error"] = str(exc)
+                failed += 1
+
+        if pushed_ids:
+            # Best-effort per-invoice log; never let a tracking hiccup fail a send.
+            try:
+                from app import tracking
+                tracking.record_events(pushed_ids, "netsuite")
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARNING: netsuite push succeeded but tracking failed: {exc}")
+
+    return {
+        "mode": mode,
+        "unresolved": unresolved,
+        "results": results,
+        "summary": {"built": len(prepared), "sent": sent, "failed": failed,
+                    "skipped_no_map": skipped_no_map},
+    }
