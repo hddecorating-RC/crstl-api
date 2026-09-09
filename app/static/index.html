@@ -473,17 +473,77 @@
       </button>
     </div>
 
-    <!-- Last NetSuite push: summary + unresolved-id log -->
-    <div x-show="netsuitePush.last_run" class="mt-2 text-xs text-gray-500">
-      <span x-text="'Last push: ' + (netsuitePush.mode || '') + ' · ' + (netsuitePush.last_run ? fmtTime(netsuitePush.last_run) : '')"></span>
+    <!-- Last NetSuite push: summary + view details -->
+    <div x-show="netsuitePush.last_run" class="mt-2 text-xs text-gray-500 flex items-center gap-2 flex-wrap">
+      <span x-text="'Last: ' + (netsuitePush.mode || '') + ' · ' + (netsuitePush.last_run ? fmtTime(netsuitePush.last_run) : '')"></span>
       <template x-if="netsuitePush.summary">
-        <span x-text="' · built ' + netsuitePush.summary.built + ', sent ' + netsuitePush.summary.sent + ', failed ' + netsuitePush.summary.failed + ', skipped ' + netsuitePush.summary.skipped_no_map"></span>
+        <span x-text="'built ' + netsuitePush.summary.built + ', sent ' + netsuitePush.summary.sent + ', failed ' + netsuitePush.summary.failed + ', skipped ' + netsuitePush.summary.skipped_no_map"></span>
       </template>
-      <span x-show="netsuitePush.blocked" class="text-amber-600 font-medium" x-text="' · blocked: ' + netsuitePush.blocked"></span>
-      <div x-show="netsuitePush.unresolved && netsuitePush.unresolved.length"
-           class="text-amber-600 mt-1" x-text="'Unresolved ids (fill in config, then retry): ' + (netsuitePush.unresolved || []).join(', ')"></div>
+      <button x-show="netsuitePush.results && netsuitePush.results.length" @click="showPreview = true"
+              class="text-blue-600 hover:text-blue-800 hover:underline">View details →</button>
+      <span x-show="netsuitePush.blocked" class="text-amber-600 font-medium" x-text="'· blocked: ' + netsuitePush.blocked"></span>
+      <div x-show="netsuitePush.unresolved && netsuitePush.unresolved.length" class="w-full text-amber-600"
+           x-text="'Unresolved ids (fill in config, then retry): ' + (netsuitePush.unresolved || []).join(', ')"></div>
     </div>
 
+  </div>
+
+  <!-- NetSuite push preview / results modal -->
+  <div x-show="showPreview" x-transition.opacity class="fixed inset-0 z-50 flex items-center justify-center p-4"
+       style="display:none;" @keydown.escape.window="showPreview = false">
+    <div class="absolute inset-0 bg-black/40" @click="showPreview = false"></div>
+    <div class="relative bg-white rounded-xl shadow-2xl w-full max-w-5xl max-h-[85vh] flex flex-col">
+      <div class="flex items-center gap-3 px-5 py-4 border-b border-gray-100">
+        <h2 class="font-bold text-slate-800 text-base"
+            x-text="netsuitePush.mode === 'live' ? 'NetSuite push results' : 'NetSuite push preview — dry run (nothing sent)'"></h2>
+        <span class="text-xs text-gray-500" x-show="netsuitePush.summary"
+              x-text="netsuitePush.summary ? (netsuitePush.summary.built + ' invoices' + (netsuitePush.mode==='live' ? ' · ' + netsuitePush.summary.sent + ' sent · ' + netsuitePush.summary.failed + ' failed' : '') + (netsuitePush.summary.skipped_no_map ? ' · ' + netsuitePush.summary.skipped_no_map + ' skipped (no mapping)' : '')) : ''"></span>
+        <button @click="showPreview = false" class="ml-auto text-gray-400 hover:text-gray-700 text-2xl leading-none">&times;</button>
+      </div>
+      <div x-show="netsuitePush.unresolved && netsuitePush.unresolved.length"
+           class="px-5 py-2 bg-amber-50 text-amber-700 text-xs border-b border-amber-100"
+           x-text="'A live push is blocked until these ids are filled in config: ' + (netsuitePush.unresolved||[]).join(', ')"></div>
+      <div class="overflow-auto px-5 py-3">
+        <table class="w-full text-xs">
+          <thead class="text-gray-400 text-left">
+            <tr class="border-b border-gray-200">
+              <th class="py-1.5 pr-3">Invoice</th><th class="pr-2">Ch</th><th class="pr-2">Loc</th>
+              <th class="pr-3 text-right">Gross</th><th class="pr-3 text-right">Discount</th>
+              <th class="pr-3 text-right">Net</th><th class="pr-3 text-right">Tax</th>
+              <th class="pr-3 text-right">Total</th>
+              <th class="pr-3 text-right" title="Total on the 810 we sent Home Depot">810</th>
+              <th class="pr-3 text-right" title="Our total minus the 810 total">Δ</th>
+              <th class="text-right">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="r in netsuitePush.results" :key="r.transaction_id">
+              <tr class="border-b border-gray-50">
+                <td class="py-1 pr-3 font-medium text-slate-700" x-text="r.invoice_number || r.transaction_id"></td>
+                <td class="pr-2 uppercase text-gray-500" x-text="r.channel === 'dsd' ? 'DSD' : (r.channel === 'dropship' ? 'DS' : '—')"></td>
+                <td class="pr-2 text-gray-500" x-text="r.where || ''"></td>
+                <td class="pr-3 text-right tabular-nums" x-text="r.gross != null ? fmtMoney(r.gross) : ''"></td>
+                <td class="pr-3 text-right tabular-nums text-gray-500" x-text="r.discount != null ? fmtMoney(r.discount) : ''"></td>
+                <td class="pr-3 text-right tabular-nums" x-text="r.net != null ? fmtMoney(r.net) : ''"></td>
+                <td class="pr-3 text-right tabular-nums text-gray-500" x-text="r.tax != null ? fmtMoney(r.tax) : ''"></td>
+                <td class="pr-3 text-right tabular-nums font-medium" x-text="r.total != null ? fmtMoney(r.total) : ''"></td>
+                <td class="pr-3 text-right tabular-nums text-gray-400" x-text="r.hd_total != null ? fmtMoney(r.hd_total) : ''"></td>
+                <td class="pr-3 text-right tabular-nums" :class="Math.abs(r.delta||0) > 0.02 ? 'text-amber-600' : 'text-gray-300'"
+                    x-text="r.delta != null ? ((r.delta>=0?'+':'') + fmtMoney(r.delta)) : ''"></td>
+                <td class="text-right">
+                  <span x-text="r.status"
+                        :class="{'text-gray-500': r.status==='built', 'text-green-600 font-medium': r.status==='sent', 'text-red-600 font-medium': r.status==='failed', 'text-gray-400': r.status==='skipped_no_map'}"></span>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <div class="px-5 py-3 border-t border-gray-100 text-xs text-gray-400 flex items-center gap-2">
+        <span x-show="netsuitePush.mode !== 'live'">Preview only — nothing sent. Push live from an invoice's details or from selected rows.</span>
+        <button @click="showPreview = false" class="ml-auto bg-slate-700 hover:bg-slate-800 text-white px-3 py-1.5 rounded-lg">Close</button>
+      </div>
+    </div>
   </div>
 
 <script>
@@ -512,6 +572,7 @@ function dashboard() {
     generatingNetsuite: false,
     netsuitePush: { last_run: null, mode: null, summary: null, unresolved: [], results: [], blocked: null, running: false },
     pushingNetsuite: false,
+    showPreview: false,
     digest: { last_sent: null, count: 0, error: null, sending: false, auto_enabled: true },
     sendingDigest: false,
     togglingAutoDigest: false,
@@ -705,6 +766,7 @@ function dashboard() {
           this.showToast('Live push refused: unresolved ids — see below');
         } else if (dryRun) {
           this.showToast('Dry run: ' + data.summary.built + ' built, ' + data.summary.skipped_no_map + ' skipped');
+          this.showPreview = true;   // open the preview table
         } else {
           this.showToast('Pushed ' + data.summary.sent + ', ' + data.summary.failed + ' failed');
           await this.loadInvoices();   // refresh netsuite_at markers

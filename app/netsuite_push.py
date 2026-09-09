@@ -88,11 +88,12 @@ def push_invoices(
         lines = transform_invoice(inv, province, store)
         if not lines:
             skipped_no_map += 1
-            results.append({"transaction_id": tid, "channel": None, "where": None,
-                            "status": "skipped_no_map"})
+            results.append({"transaction_id": tid, "invoice_number": inv.get("invoice_number"),
+                            "channel": None, "where": None, "status": "skipped_no_map"})
             continue
         row = {
             "transaction_id": tid,
+            "invoice_number": inv.get("invoice_number"),
             "channel": "dsd" if store else "dropship",
             "where": store or province,
             "status": "built",
