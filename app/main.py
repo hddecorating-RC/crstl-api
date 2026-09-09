@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.crstl import CrstlClient
 from app import tracking
@@ -676,10 +676,23 @@ def export(body: ExportRequest = ExportRequest()) -> Response:
 class NetsuitePushRequest(BaseModel):
     # Dry run by default: a live send must be asked for explicitly. `ids` pushes
     # just those transaction_ids (the "test one invoice" flow); `limit` caps the
-    # batch. There is no sandbox, so the safe path is dry_run -> ids/limit -> live.
+    # batch. There is no sandbox, so the safe path is dry_run -> ids -> live.
+    # limit must be >= 1 when given: `limit=0` used to fall through to "no cap".
     dry_run: bool = True
     ids: Optional[list[str]] = None
-    limit: Optional[int] = None
+    limit: Optional[int] = Field(default=None, ge=1)
+
+
+def _sanitize_push_result(result: dict) -> dict:
+    """Strip internal detail (raw NetSuite response bodies, exception text) from a
+    push result before it is returned to / stored for the unauthenticated dashboard
+    endpoints. Full detail goes to journald instead. Reconciliation figures stay --
+    they are the dashboard's purpose and already sit behind the tailnet."""
+    for row in result.get("results", []):
+        if row.get("error"):
+            print(f"NetSuite push error [{row.get('transaction_id')}]: {row['error']}")
+            row["error"] = "upsert failed — see server logs"
+    return result
 
 
 def _run_netsuite_push(live: bool, ids: Optional[list[str]], limit: Optional[int]) -> dict:
@@ -687,7 +700,7 @@ def _run_netsuite_push(live: bool, ids: Optional[list[str]], limit: Optional[int
     a worker thread (the upsert loop is blocking network I/O)."""
     with _cache_lock:
         invoices = list(_cache["invoices"])
-    result = push_invoices(invoices, live=live, only=ids, limit=limit)
+    result = _sanitize_push_result(push_invoices(invoices, live=live, only=ids, limit=limit))
     with _netsuite_push_lock:
         _netsuite_push_state.update({
             "last_run": datetime.now(timezone.utc).isoformat(),
@@ -707,6 +720,14 @@ async def netsuite_push(body: NetsuitePushRequest = NetsuitePushRequest()) -> JS
     Dry run unless dry_run=false. A live send is refused (nothing written) while
     any item/tax id is unresolved in config -- the unresolved list comes back so
     it can be filled first."""
+    # A live send over this HTTP surface (the app has no auth of its own) MUST be
+    # scoped to named invoices. Blocks the "one unauthenticated POST pushes every
+    # invoice live to production" path; the operator CLI on the box can still do a
+    # deliberate full-batch live send.
+    if not body.dry_run and not body.ids:
+        return JSONResponse(status_code=400, content={
+            "message": "A live push must name the invoices to send (ids). "
+                       "Use dry_run for an unscoped preview."})
     with _netsuite_push_lock:
         if _netsuite_push_state.get("running"):
             return JSONResponse(status_code=409, content={"message": "A NetSuite push is already in progress"})
@@ -714,9 +735,10 @@ async def netsuite_push(body: NetsuitePushRequest = NetsuitePushRequest()) -> JS
     try:
         result = await asyncio.to_thread(_run_netsuite_push, not body.dry_run, body.ids, body.limit)
     except Exception as exc:
+        print(f"NetSuite push failed: {exc}")   # detail to journald, not to the caller
         with _netsuite_push_lock:
-            _netsuite_push_state["error"] = str(exc)
-        return JSONResponse(status_code=500, content={"message": str(exc)})
+            _netsuite_push_state["error"] = "push failed — see server logs"
+        return JSONResponse(status_code=500, content={"message": "NetSuite push failed — see server logs"})
     finally:
         with _netsuite_push_lock:
             _netsuite_push_state["running"] = False

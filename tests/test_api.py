@@ -231,6 +231,34 @@ def test_netsuite_push_scoped_by_ids(client):
     assert [r["transaction_id"] for r in resp.json()["results"]] == [tid]
 
 
+def test_netsuite_push_live_requires_ids(client):
+    """An unauthenticated live push MUST name invoices; an unscoped live POST is
+    refused (can't book the whole batch from one call)."""
+    client.post("/api/sync")
+    resp = client.post("/api/netsuite", json={"dry_run": False})   # no ids
+    assert resp.status_code == 400
+    assert "name the invoices" in resp.json()["message"]
+
+
+def test_netsuite_push_rejects_nonpositive_limit(client):
+    resp = client.post("/api/netsuite", json={"dry_run": True, "limit": 0})
+    assert resp.status_code == 422   # Pydantic ge=1 — no more "0 means no cap"
+
+
+def test_netsuite_push_error_detail_is_sanitized(client, monkeypatch):
+    """Raw NetSuite/exception detail must not reach the unauthenticated caller."""
+    def fake_push(invoices, **kw):
+        return {"mode": "live", "unresolved": [],
+                "summary": {"built": 1, "sent": 0, "failed": 1, "skipped_no_map": 0},
+                "results": [{"transaction_id": "X", "channel": "dsd", "where": "VAUGHAN",
+                             "status": "failed", "error": "NetSuite 400: {internal field detail}"}]}
+    monkeypatch.setattr("app.main.push_invoices", fake_push)
+    resp = client.post("/api/netsuite", json={"dry_run": False, "ids": ["X"]})
+    err = resp.json()["results"][0]["error"]
+    assert "internal field detail" not in err
+    assert err == "upsert failed — see server logs"
+
+
 def test_export_sets_exported_at(client):
     client.post("/api/sync")
     client.post("/api/export", json={})

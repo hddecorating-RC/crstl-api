@@ -48,7 +48,8 @@ def _select(invoices: list[dict], only: list[str] | None, limit: int | None) -> 
     if only:
         wanted = {str(x) for x in only}
         invoices = [i for i in invoices if str(i.get("transaction_id")) in wanted]
-    if limit:
+    # `is not None`, not truthiness: limit=0 must mean "cap at 0", never "no cap".
+    if limit is not None:
         invoices = invoices[:limit]
     return invoices
 
@@ -71,6 +72,8 @@ def push_invoices(
       * summary: counts of built/sent/failed/skipped_no_map.
     A live send is refused (nothing written) if `unresolved` is non-empty.
     """
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be >= 1")
     refs = refs or load_refs()
     invoices = _select(invoices, only, limit)
 

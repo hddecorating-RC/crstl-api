@@ -28,7 +28,12 @@ tailscale up --hostname=crstl-api --ssh
 Approve the machine in your Tailscale admin console. Note the machine's
 100.x.y.z address; MagicDNS `crstl-api` should also resolve.
 
-**Optional ACL** in Tailscale admin (locks down who can reach port 8000):
+**REQUIRED ACL** in Tailscale admin (locks down who can reach port 8000).
+This app has **no authentication of its own** — Tailscale is the only access
+control. Since `POST /api/netsuite` performs **live, irreversible writes to the
+production NetSuite** accounting system and `/api/email/*` sends mail as the org,
+the dashboard must **not** be reachable tailnet-wide. Restrict it to the people
+who are meant to run pushes (e.g. `group:accounting` / `group:admin`):
 
 ```json
 {
@@ -42,7 +47,11 @@ Approve the machine in your Tailscale admin console. Note the machine's
 Then tag the LXC in the admin console (Machines → crstl-api → Edit tags →
 add `tag:crstl-api`).
 
-Without an ACL, every device on your tailnet can reach the dashboard.
+Without this ACL, every device on your tailnet can reach the dashboard — and
+therefore trigger live NetSuite writes and org email. Treat applying it as part
+of the deploy, not an afterthought. (At the app layer, a live push is also
+refused unless it names specific invoices, so a stray unscoped POST can't book
+the whole batch — but that is defence in depth, not a substitute for the ACL.)
 
 ## LXC provisioning (in Proxmox)
 

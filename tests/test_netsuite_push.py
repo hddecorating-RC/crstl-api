@@ -116,3 +116,11 @@ def test_only_and_limit_filter_the_batch():
     assert [r["transaction_id"] for r in out["results"]] == ["T-DSD"]
     out2 = push_invoices(INVOICES, live=False, refs=REFS_FULL, limit=1)
     assert len(out2["results"]) == 1
+
+
+def test_limit_must_be_positive():
+    """limit=0 used to fall through to 'no cap' and push everything; now rejected."""
+    with pytest.raises(ValueError):
+        push_invoices(INVOICES, live=False, refs=REFS_FULL, limit=0)
+    with pytest.raises(ValueError):
+        push_invoices(INVOICES, live=False, refs=REFS_FULL, limit=-1)
