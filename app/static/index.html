@@ -477,6 +477,11 @@
         <span x-show="!pushingNetsuite" x-text="selected.size ? ('⬡ Preview selected (' + selected.size + ')') : '⬡ Preview all (dry-run)'"></span>
         <span x-show="pushingNetsuite">Working…</span>
       </button>
+      <button @click="openAutomation()"
+              title="Turn scheduled jobs on/off, see the schedule and run history"
+              class="bg-white border border-gray-200 hover:border-gray-300 text-gray-600 text-sm px-4 py-2 rounded-lg transition ml-auto">
+        ⚙ Automation
+      </button>
     </div>
 
     <!-- Last NetSuite push: summary + view details -->
@@ -552,6 +557,64 @@
     </div>
   </div>
 
+  <!-- Automation control modal: on/off toggles, schedule, run history -->
+  <div x-show="showAutomation" x-transition.opacity class="fixed inset-0 z-50 flex items-center justify-center p-4"
+       style="display:none;" @keydown.escape.window="showAutomation = false">
+    <div class="absolute inset-0 bg-black/40" @click="showAutomation = false"></div>
+    <div class="relative bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col">
+      <div class="flex items-center gap-3 px-5 py-4 border-b border-gray-100">
+        <h2 class="font-bold text-slate-800 text-base">Automation</h2>
+        <span class="text-xs" :class="automation.scheduler_running ? 'text-green-600' : 'text-amber-600'"
+              x-text="automation.scheduler_running ? 'scheduler running' : 'scheduler off (this instance)'"></span>
+        <button @click="showAutomation = false" class="ml-auto text-gray-400 hover:text-gray-700 text-2xl leading-none">&times;</button>
+      </div>
+      <div class="overflow-auto">
+        <div class="px-5 py-1">
+          <template x-for="j in automation.jobs" :key="j.id">
+            <div class="flex items-center gap-3 py-3 border-b border-gray-100">
+              <div class="flex-1 min-w-0">
+                <div class="font-medium text-slate-700 text-sm" x-text="j.label"></div>
+                <div class="text-xs text-gray-400" x-text="j.schedule + (j.next_run ? ' · next ' + fmtTime(j.next_run) : '')"></div>
+                <div class="text-xs mt-0.5" x-show="j.last_run">
+                  <span class="text-gray-400">last run: </span>
+                  <span :class="{'text-green-600': j.last_run && j.last_run.status==='ok','text-red-600': j.last_run && j.last_run.status==='error','text-amber-600': j.last_run && (j.last_run.status==='blocked'||j.last_run.status==='partial'),'text-gray-400': j.last_run && j.last_run.status==='skipped'}"
+                        x-text="j.last_run ? (j.last_run.status + (j.last_run.detail ? ' — ' + j.last_run.detail : '') + ' · ' + fmtTime(j.last_run.ran_at)) : ''"></span>
+                </div>
+              </div>
+              <button @click="toggleJob(j.id, !j.enabled)" :disabled="togglingJob === j.id"
+                      :class="j.enabled ? 'bg-green-500' : 'bg-gray-300'"
+                      class="relative inline-flex h-6 w-11 items-center rounded-full transition disabled:opacity-50 shrink-0"
+                      :title="j.enabled ? 'On — click to pause' : 'Paused — click to enable'">
+                <span :class="j.enabled ? 'translate-x-6' : 'translate-x-1'"
+                      class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition"></span>
+              </button>
+            </div>
+          </template>
+        </div>
+        <div class="px-5 py-3 border-t border-gray-100">
+          <div class="text-xs uppercase tracking-wide text-gray-400 mb-2">Recent runs</div>
+          <div class="max-h-56 overflow-auto">
+            <template x-for="(run, i) in automationLogs" :key="i">
+              <div class="flex items-center gap-2 py-1 text-xs border-b border-gray-50">
+                <span class="text-gray-400 shrink-0" style="width:9.5rem" x-text="fmtTime(run.ran_at)"></span>
+                <span class="text-slate-600 shrink-0" style="width:8rem" x-text="run.job"></span>
+                <span class="shrink-0 font-medium" style="width:4rem"
+                      :class="{'text-green-600': run.status==='ok','text-red-600': run.status==='error','text-amber-600': run.status==='blocked'||run.status==='partial','text-gray-400': run.status==='skipped'}"
+                      x-text="run.status"></span>
+                <span class="text-gray-500 truncate" x-text="run.detail"></span>
+              </div>
+            </template>
+            <div x-show="!automationLogs.length" class="text-gray-400 text-xs py-2">No runs recorded yet — jobs log here as they fire.</div>
+          </div>
+        </div>
+      </div>
+      <div class="px-5 py-3 border-t border-gray-100 flex items-center gap-2">
+        <span class="text-xs text-gray-400">Toggles are saved on the server and survive restarts.</span>
+        <button @click="showAutomation = false" class="ml-auto bg-slate-700 hover:bg-slate-800 text-white px-3 py-1.5 rounded-lg text-sm">Close</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 function dashboard() {
   return {
@@ -579,6 +642,10 @@ function dashboard() {
     netsuitePush: { last_run: null, mode: null, summary: null, unresolved: [], results: [], blocked: null, running: false },
     pushingNetsuite: false,
     showPreview: false,
+    automation: { jobs: [], scheduler_running: false },
+    automationLogs: [],
+    showAutomation: false,
+    togglingJob: null,
     digest: { last_sent: null, count: 0, error: null, sending: false, auto_enabled: true },
     sendingDigest: false,
     togglingAutoDigest: false,
@@ -746,6 +813,29 @@ function dashboard() {
       } catch {
         /* keep prior state if the status call fails */
       }
+    },
+
+    async loadAutomation() {
+      try { this.automation = await (await fetch('/api/automation')).json(); } catch {}
+    },
+    async loadAutomationLogs() {
+      try { this.automationLogs = (await (await fetch('/api/automation/logs?limit=50')).json()).runs || []; } catch {}
+    },
+    async openAutomation() {
+      await Promise.all([this.loadAutomation(), this.loadAutomationLogs()]);
+      this.showAutomation = true;
+    },
+    async toggleJob(id, enabled) {
+      this.togglingJob = id;
+      try {
+        const res = await fetch('/api/automation', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job: id, enabled }),
+        });
+        if (res.ok) { await this.loadAutomation(); this.showToast((enabled ? 'Enabled: ' : 'Paused: ') + id); }
+        else { this.showToast('Toggle failed'); }
+      } catch { this.showToast('Toggle failed'); }
+      finally { this.togglingJob = null; }
     },
 
     // Manual push. dryRun=true builds + reconciles without writing; dryRun=false

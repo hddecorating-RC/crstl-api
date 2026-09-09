@@ -42,6 +42,14 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
             value      TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS job_runs (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            job     TEXT NOT NULL,
+            status  TEXT NOT NULL,
+            detail  TEXT,
+            ran_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_runs_ran_at ON job_runs(ran_at);
     """)
 
     if row is None:
@@ -203,3 +211,56 @@ def get_unemailed_ids(candidate_ids: list[str]) -> list[str]:
         print(f"WARNING: tracking read failed: {exc}")
         return []
     return [tid for tid in candidate_ids if tid not in emailed]
+
+
+def get_unpushed_ids(candidate_ids: list[str]) -> list[str]:
+    """Return the subset of `candidate_ids` with no 'netsuite' event yet — i.e.
+    not yet pushed to NetSuite. Order preserved. Used by the auto-push job so a
+    scheduled run never re-pushes what a manual push already sent."""
+    if not candidate_ids:
+        return []
+    placeholders = ",".join("?" * len(candidate_ids))
+    try:
+        with contextlib.closing(_connect()) as conn:
+            rows = conn.execute(
+                f"""SELECT DISTINCT transaction_id FROM invoice_events
+                    WHERE event_type = 'netsuite' AND transaction_id IN ({placeholders})""",
+                candidate_ids,
+            ).fetchall()
+        pushed = {r[0] for r in rows}
+    except Exception as exc:
+        print(f"WARNING: tracking read failed: {exc}")
+        return []
+    return [tid for tid in candidate_ids if tid not in pushed]
+
+
+def record_job_run(job: str, status: str, detail: str = "") -> None:
+    """Append a scheduled-job run to the durable log (job_runs). Best-effort."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with contextlib.closing(_connect()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO job_runs (job, status, detail, ran_at) VALUES (?, ?, ?, ?)",
+                    (job, status, detail, now),
+                )
+    except Exception as exc:
+        print(f"ERROR: job_runs write failed for {job!r}: {exc}")
+
+
+def recent_job_runs(limit: int = 50, job: str | None = None) -> list[dict]:
+    """Most-recent scheduled-job runs, newest first. Optionally filter by job."""
+    try:
+        with contextlib.closing(_connect()) as conn:
+            if job:
+                rows = conn.execute(
+                    "SELECT job, status, detail, ran_at FROM job_runs WHERE job = ? "
+                    "ORDER BY id DESC LIMIT ?", (job, limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT job, status, detail, ran_at FROM job_runs "
+                    "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [{"job": r[0], "status": r[1], "detail": r[2], "ran_at": r[3]} for r in rows]
+    except Exception as exc:
+        print(f"WARNING: job_runs read failed: {exc}")
+        return []

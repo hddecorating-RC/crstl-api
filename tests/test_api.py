@@ -462,3 +462,25 @@ def test_sync_survives_finale_being_down(monkeypatch, client):
     resp = client.post("/api/sync")
     assert resp.status_code == 200
     assert client.get("/api/invoices").json()["status"] == "ok"
+
+
+def test_automation_status_and_toggle(client):
+    resp = client.get("/api/automation")
+    assert resp.status_code == 200
+    jobs = {j["id"]: j for j in resp.json()["jobs"]}
+    assert set(jobs) == {"daily_refresh", "netsuite_export", "netsuite_push", "daily_digest"}
+    assert jobs["netsuite_push"]["enabled"] is False   # off by default
+    assert jobs["daily_digest"]["enabled"] is True
+    # toggle push on, verify persisted
+    assert client.post("/api/automation", json={"job": "netsuite_push", "enabled": True}).status_code == 200
+    jobs2 = {j["id"]: j for j in client.get("/api/automation").json()["jobs"]}
+    assert jobs2["netsuite_push"]["enabled"] is True
+    client.post("/api/automation", json={"job": "netsuite_push", "enabled": False})
+    # unknown job -> 404
+    assert client.post("/api/automation", json={"job": "nope", "enabled": True}).status_code == 404
+
+
+def test_automation_logs(client):
+    resp = client.get("/api/automation/logs")
+    assert resp.status_code == 200
+    assert "runs" in resp.json()

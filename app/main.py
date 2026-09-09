@@ -55,6 +55,7 @@ _netsuite_push_state: dict = {"last_run": None, "mode": None, "summary": None,
 _netsuite_push_lock = threading.Lock()
 _digest_state: dict = {"last_sent": None, "count": 0, "error": None, "sending": False}
 _digest_lock = threading.Lock()
+_scheduler = None  # AsyncIOScheduler, set in lifespan; used to read next-run times
 
 
 def _build_mock_po_provinces() -> dict[str, dict]:
@@ -534,6 +535,7 @@ def _run_daily_digest_job() -> None:
     exits without sending. Manual /api/email/send-digest is unaffected."""
     if not _auto_digest_enabled():
         print("Digest: auto-send disabled via settings, skipping scheduled run")
+        tracking.record_job_run("daily_digest", "skipped", "disabled")
         return
     with _digest_lock:
         if _digest_state.get("sending"):
@@ -547,13 +549,90 @@ def _run_daily_digest_job() -> None:
             _digest_state["count"] = result["count"]
             _digest_state["error"] = None
         print(f"Digest: sent {result['count']} invoices to {result['sent_to']}")
+        tracking.record_job_run("daily_digest", "ok", f"{result['count']} invoice(s) emailed")
     except Exception as exc:
         with _digest_lock:
             _digest_state["error"] = str(exc)
         print(f"WARNING: digest send failed: {exc}")
+        tracking.record_job_run("daily_digest", "error", str(exc)[:200])
     finally:
         with _digest_lock:
             _digest_state["sending"] = False
+
+
+# ---- Automation control: on/off toggles, schedule, and run logs ----------
+# Each scheduled job self-checks its toggle (persisted in the settings table)
+# and records a run in job_runs, so the dashboard can show state + history.
+AUTO_SYNC_SETTING = "auto_sync_enabled"
+AUTO_NS_EXPORT_SETTING = "auto_ns_export_enabled"
+AUTO_NS_PUSH_SETTING = "auto_ns_push_enabled"
+
+# Registry drives the /api/automation panel. `default` "false" means the job is
+# off until someone turns it on (the NetSuite auto-push stays off until
+# accounting signs off). Keep `id` in sync with the scheduler job ids below.
+AUTOMATION_JOBS = [
+    {"id": "daily_refresh",   "label": "Invoice sync (Crstl)", "schedule": "Daily · 7:00 AM ET",   "setting": AUTO_SYNC_SETTING,      "default": "true"},
+    {"id": "netsuite_export", "label": "NetSuite CSV export",  "schedule": "Daily · 4:00 AM ET",   "setting": AUTO_NS_EXPORT_SETTING, "default": "true"},
+    {"id": "netsuite_push",   "label": "NetSuite auto-push",   "schedule": "Mon–Fri · 7:05 AM ET", "setting": AUTO_NS_PUSH_SETTING,   "default": "false"},
+    {"id": "daily_digest",    "label": "Daily digest email",   "schedule": "Mon–Fri · 7:15 AM ET", "setting": AUTO_DIGEST_SETTING,    "default": "true"},
+]
+_JOB_BY_ID = {j["id"]: j for j in AUTOMATION_JOBS}
+
+
+def _job_enabled(setting: str, default: str = "true") -> bool:
+    return (tracking.get_setting(setting, default) or default).lower() != "false"
+
+
+def _run_refresh_job() -> None:
+    if not _job_enabled(AUTO_SYNC_SETTING):
+        tracking.record_job_run("daily_refresh", "skipped", "disabled"); return
+    _refresh_cache()
+    with _cache_lock:
+        status, n = _cache.get("status", ""), len(_cache["invoices"])
+    if str(status).startswith("error"):
+        tracking.record_job_run("daily_refresh", "error", str(status)[:200])
+    else:
+        tracking.record_job_run("daily_refresh", "ok", f"{n} invoices synced")
+
+
+def _run_ns_export_job() -> None:
+    if not _job_enabled(AUTO_NS_EXPORT_SETTING):
+        tracking.record_job_run("netsuite_export", "skipped", "disabled"); return
+    try:
+        _generate_netsuite_export()
+        with _netsuite_lock:
+            st = dict(_netsuite_state)
+        if st.get("error"):
+            tracking.record_job_run("netsuite_export", "error", str(st["error"])[:200])
+        else:
+            tracking.record_job_run("netsuite_export", "ok", f"{st.get('count', 0)} rows, {st.get('skipped', 0)} skipped")
+    except Exception as exc:
+        tracking.record_job_run("netsuite_export", "error", str(exc)[:200])
+
+
+def _run_netsuite_push_job() -> None:
+    """Scheduled live push (default OFF). Pushes only acknowledged, non-zero
+    invoices not yet pushed (tracking dedup) so it never re-posts a manual push;
+    idempotent upsert makes a retry safe. Records the run + updates push state."""
+    if not _job_enabled(AUTO_NS_PUSH_SETTING, default="false"):
+        tracking.record_job_run("netsuite_push", "skipped", "disabled"); return
+    with _cache_lock:
+        invoices = list(_cache["invoices"])
+    candidates = [i for i in _reportable(invoices) if i.get("subtotal", 0) > 0]
+    unpushed = set(tracking.get_unpushed_ids([str(i["transaction_id"]) for i in candidates]))
+    to_push = [i for i in candidates if str(i["transaction_id"]) in unpushed]
+    if not to_push:
+        tracking.record_job_run("netsuite_push", "ok", "nothing new to push"); return
+    # _run_netsuite_push reads the cache, pushes just these ids, sanitizes, and
+    # updates _netsuite_push_state (so the dashboard's last-push panel reflects it).
+    result = _run_netsuite_push(True, [str(i["transaction_id"]) for i in to_push], None)
+    s = result["summary"]
+    if result.get("blocked"):
+        tracking.record_job_run("netsuite_push", "blocked", "unresolved ids: " + ", ".join(result["unresolved"]))
+    else:
+        status = "ok" if s["failed"] == 0 else "partial"
+        tracking.record_job_run("netsuite_push", status,
+                                f"{s['sent']} sent, {s['failed']} failed, {s['skipped_no_map']} skipped")
 
 
 @contextlib.asynccontextmanager
@@ -575,24 +654,33 @@ async def lifespan(app: FastAPI):
     # misfire_grace_time=3600 lets a job run up to 1 hour late if the host was
     # paused or the scheduler was down at fire time (LXC snapshots, restarts).
     # Without this, a missed 07:00 refresh silently vanishes until the next day.
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(_refresh_cache, "cron", id="daily_refresh",
-                      hour=7, minute=0, timezone="America/Toronto",
-                      misfire_grace_time=3600, coalesce=True)
-    scheduler.add_job(_generate_netsuite_export, "cron", id="netsuite_export",
-                      hour=4, minute=0, timezone="America/Toronto",
-                      misfire_grace_time=3600, coalesce=True)
+    # Jobs run through toggle-aware wrappers (_run_*_job) that self-check their
+    # on/off setting and record each run in job_runs, so the Automation panel can
+    # show state + history. A disabled job still fires but no-ops and logs "skipped".
+    global _scheduler
+    _scheduler = AsyncIOScheduler()
+    _scheduler.add_job(_run_refresh_job, "cron", id="daily_refresh",
+                       hour=7, minute=0, timezone="America/Toronto",
+                       misfire_grace_time=3600, coalesce=True)
+    _scheduler.add_job(_run_ns_export_job, "cron", id="netsuite_export",
+                       hour=4, minute=0, timezone="America/Toronto",
+                       misfire_grace_time=3600, coalesce=True)
+    # NetSuite auto-push — runs after the 7am refresh, before the 7:15 digest, so
+    # the digest reflects it. OFF by default until accounting turns it on.
+    _scheduler.add_job(_run_netsuite_push_job, "cron", id="netsuite_push",
+                       day_of_week="mon-fri", hour=7, minute=5, timezone="America/Toronto",
+                       misfire_grace_time=3600, coalesce=True)
     # Weekdays only — nobody works the digest queue on Sat/Sun, so a weekend
     # send is just two emails to ignore. Skipping them loses nothing: the digest
     # sends whatever tracking.db still has unemailed, so Monday 07:15 carries
     # Friday's late invoices plus anything Crstl added over the weekend.
-    scheduler.add_job(_run_daily_digest_job, "cron", id="daily_digest",
-                      day_of_week="mon-fri", hour=7, minute=15,
-                      timezone="America/Toronto",
-                      misfire_grace_time=3600, coalesce=True)
-    scheduler.start()
+    _scheduler.add_job(_run_daily_digest_job, "cron", id="daily_digest",
+                       day_of_week="mon-fri", hour=7, minute=15,
+                       timezone="America/Toronto",
+                       misfire_grace_time=3600, coalesce=True)
+    _scheduler.start()
     yield
-    scheduler.shutdown()
+    _scheduler.shutdown()
 
 
 app = FastAPI(title="HD Decorating Invoice Dashboard", lifespan=lifespan)
@@ -860,6 +948,49 @@ def set_auto_digest(body: AutoDigestToggle) -> dict:
     always available, including on weekends."""
     tracking.set_setting(AUTO_DIGEST_SETTING, "true" if body.enabled else "false")
     return {"auto_enabled": body.enabled}
+
+
+@app.get("/api/automation")
+def automation_status() -> dict:
+    """The scheduled jobs with their on/off state, schedule, next run, and last
+    run — drives the Automation panel."""
+    next_runs = {}
+    if _scheduler is not None:
+        for j in _scheduler.get_jobs():
+            nrt = getattr(j, "next_run_time", None)
+            next_runs[j.id] = nrt.isoformat() if nrt else None
+    last = {}
+    for run in tracking.recent_job_runs(300):
+        last.setdefault(run["job"], run)  # first seen = most recent (DESC order)
+    jobs = [{
+        "id": j["id"], "label": j["label"], "schedule": j["schedule"],
+        "enabled": _job_enabled(j["setting"], j["default"]),
+        "next_run": next_runs.get(j["id"]),
+        "last_run": last.get(j["id"]),
+    } for j in AUTOMATION_JOBS]
+    return {"jobs": jobs, "scheduler_running": _scheduler is not None}
+
+
+class AutomationToggle(BaseModel):
+    job: str
+    enabled: bool
+
+
+@app.post("/api/automation")
+def automation_toggle(body: AutomationToggle) -> JSONResponse:
+    """Turn a scheduled job on or off. Persisted in tracking.db (survives
+    restarts). A disabled job still fires on schedule but no-ops and logs it."""
+    job = _JOB_BY_ID.get(body.job)
+    if not job:
+        return JSONResponse(status_code=404, content={"message": f"unknown job {body.job!r}"})
+    tracking.set_setting(job["setting"], "true" if body.enabled else "false")
+    return JSONResponse(content={"job": body.job, "enabled": body.enabled})
+
+
+@app.get("/api/automation/logs")
+def automation_logs(limit: int = 50) -> dict:
+    """Recent scheduled-job runs, newest first (durable — from job_runs)."""
+    return {"runs": tracking.recent_job_runs(min(max(limit, 1), 200))}
 
 
 app.mount("/", StaticFiles(directory="app/static", html=True), name="static")
