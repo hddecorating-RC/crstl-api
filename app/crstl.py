@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from app.products import vendor_items_in
 from app.shipments import asn_date_index
@@ -14,6 +15,8 @@ class CrstlClient:
     # the server's actual page size so the "short page = last page" heuristic works.
     PAGE_SIZE = 20
     MAX_WORKERS = 8  # empirically optimal — more workers get rate-limited by the server
+    RETRY_TOTAL = 4        # up to 4 retries per request on a transient failure
+    RETRY_BACKOFF = 1.5    # exponential: waits ~1.5s, 3s, 6s, 12s between tries
 
     def __init__(self, base_url: str, api_key: str):
         if not api_key:
@@ -22,7 +25,22 @@ class CrstlClient:
         self.api_key = api_key
         self.session = requests.Session()
         self.session.headers.update({"x-crstl-api-key": api_key, "Accept": "application/json"})
-        adapter = HTTPAdapter(pool_connections=self.MAX_WORKERS, pool_maxsize=self.MAX_WORKERS)
+        # Retry transient CRSTL failures (429 rate-limit, 5xx) with exponential
+        # backoff so a blip during the startup / 7am sync doesn't leave the cache
+        # empty for the day (and the 07:15 digest empty). Honors the server's
+        # Retry-After on a 429. Only idempotent GETs are retried (urllib3's
+        # default allowed_methods), which is all our CRSTL reads. raise_on_status
+        # is False so a persistent failure still surfaces via resp.raise_for_status()
+        # as the same HTTPError the callers already handle.
+        retry = Retry(
+            total=self.RETRY_TOTAL,
+            backoff_factor=self.RETRY_BACKOFF,
+            status_forcelist=(429, 500, 502, 503, 504),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry,
+                              pool_connections=self.MAX_WORKERS, pool_maxsize=self.MAX_WORKERS)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 

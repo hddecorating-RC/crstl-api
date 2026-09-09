@@ -296,3 +296,15 @@ def test_extract_preserves_metadata_fields_when_sac_loop_present():
     assert result["trading_partner_flavor"] == "Dropship"
     assert result["status"] == "Accepted"
     assert result["created_at"] == "2026-08-06T12:00:00Z"
+
+
+def test_client_retries_transient_failures():
+    """Transient CRSTL failures (429 rate-limit, 5xx) are retried with backoff so a
+    blip during the startup / 7am sync does not leave the cache empty for the day."""
+    client = CrstlClient(base_url="https://api.crstl.so/v2", api_key="ct_test")
+    retry = client.session.get_adapter("https://api.crstl.so/").max_retries
+    assert retry.total == 4
+    assert retry.backoff_factor == 1.5
+    assert 429 in retry.status_forcelist
+    assert {500, 502, 503, 504}.issubset(set(retry.status_forcelist))
+    assert retry.respect_retry_after_header is True
