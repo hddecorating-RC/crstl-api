@@ -220,6 +220,17 @@ def test_netsuite_push_dry_run(client):
     assert latest["mode"] == "dry" and latest["running"] is False
 
 
+def test_netsuite_push_scoped_by_ids(client):
+    """Single (flyout) and bulk (selected rows) push the same endpoint with ids."""
+    client.post("/api/sync")
+    invoices = client.get("/api/invoices").json()["invoices"]
+    assert invoices
+    tid = invoices[0]["transaction_id"]
+    resp = client.post("/api/netsuite", json={"dry_run": True, "ids": [tid]})
+    assert resp.status_code == 200
+    assert [r["transaction_id"] for r in resp.json()["results"]] == [tid]
+
+
 def test_export_sets_exported_at(client):
     client.post("/api/sync")
     client.post("/api/export", json={})
