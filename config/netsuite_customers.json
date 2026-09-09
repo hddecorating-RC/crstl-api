@@ -36,6 +36,20 @@
     "Allowance": "",
     "Charge": ""
   },
+  "_comment_discount": "Vendor discount per Backward Calculator V5 (== HD Canada Invoice Allowance Spec, confirmed identical rules). Every allowance is a % off GROSS except MET, which is a % off the SUBTOTAL (gross - trade - defective - IBx). Invoice net stops after MET/freight/RDC; coop/rebate + payment terms are Off-PO and do NOT go on the invoice. DSD applies all (=> 6.19%); Dropship drops freight + RDC (=> 5.19%). Rates are VENDOR-SPECIFIC (calculator row 5) -- these are the drapery-panel/'3D Interior Fashion' profile; other products (e.g. warehouse blinds, item 195048) may have different rates -- confirm per product. Accounting's NetSuite invoices are WRONG (dropship posted at 1.25% IBx-only); the calculator is authoritative.",
+  "discount_rates": {
+    "trade": 0.005,
+    "defective": 0.0,
+    "ibx": 0.0125,
+    "met": 0.035,
+    "rdc": 0.01,
+    "freight": 0.0
+  },
+  "discount_channel_rules": {
+    "_note": "Which allowances apply per channel; MET is computed off the subtotal, all others off gross.",
+    "dsd": ["trade", "defective", "ibx", "met", "rdc", "freight"],
+    "dropship": ["trade", "defective", "ibx", "met"]
+  },
   "tax_code_ids": {
     "CA-HST ONT": "468",
     "CA-GST 5%": "321",
