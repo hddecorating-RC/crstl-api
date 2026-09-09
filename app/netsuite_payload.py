@@ -36,6 +36,7 @@ def load_refs() -> dict:
         "tax_code_ids": cfg.get("tax_code_ids", {}),
         "class_id": cfg.get("class_id", ""),
         "subsidiary_id": cfg.get("subsidiary_id", ""),
+        "custom_form_id": cfg.get("custom_form_id", ""),
     }
 
 
@@ -71,7 +72,10 @@ def build_invoice_payload(line_records: list[dict], refs: dict | None = None) ->
         "entity": {"id": head["customer_id"]},
         "tranDate": head["tran_date"],
         "memo": head["memo"],
-        "otherRefNum": head["other_ref_num"],
+        # NetSuite's "LEAD #" field is otherRefNum on form 101. Accounting puts
+        # the INV-prefixed Crstl invoice number there (e.g. INV40861211), so use
+        # invoice_number, falling back to the PO/order number if absent.
+        "otherRefNum": head.get("invoice_number") or head["other_ref_num"],
         "item": {
             "items": [
                 {
@@ -93,4 +97,6 @@ def build_invoice_payload(line_records: list[dict], refs: dict | None = None) ->
         payload["class"] = {"id": refs["class_id"]}
     if refs.get("subsidiary_id"):
         payload["subsidiary"] = {"id": refs["subsidiary_id"]}
+    if refs.get("custom_form_id"):
+        payload["customForm"] = {"id": refs["custom_form_id"]}  # 101 "Custom Service Invoice"
     return payload

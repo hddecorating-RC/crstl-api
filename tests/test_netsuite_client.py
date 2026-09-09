@@ -25,11 +25,11 @@ CREDS = dict(
 # transform_invoice's output shape: two lines sharing one external_id.
 LINES = [
     {"external_id": "TXN-1", "customer_id": "4147", "tran_date": "2026-09-01",
-     "due_date": "2026-10-01", "memo": "INV1 / PO 55", "other_ref_num": "55",
+     "due_date": "2026-10-01", "memo": "INV1 / PO 55", "invoice_number": "INV1", "other_ref_num": "55",
      "currency": "CAD", "tax_code": "CA-HST ONT", "item": "Merchandise Sales",
      "description": "", "quantity": 1, "rate": 100.0, "amount": 100.0, "tax_amount": 13.0},
     {"external_id": "TXN-1", "customer_id": "4147", "tran_date": "2026-09-01",
-     "due_date": "2026-10-01", "memo": "INV1 / PO 55", "other_ref_num": "55",
+     "due_date": "2026-10-01", "memo": "INV1 / PO 55", "invoice_number": "INV1", "other_ref_num": "55",
      "currency": "CAD", "tax_code": "CA-HST ONT", "item": "Allowance",
      "description": "OI10", "quantity": 1, "rate": -5.0, "amount": -5.0, "tax_amount": 0},
 ]
@@ -40,6 +40,7 @@ REFS = {
     "tax_code_ids": {"CA-HST ONT": "17"},
     "class_id": "5",
     "subsidiary_id": "",
+    "custom_form_id": "101",
 }
 
 
@@ -172,9 +173,11 @@ def test_suiteql_posts_read_only_query_with_prefer_header():
 def test_build_invoice_payload_uses_internal_ids():
     body = build_invoice_payload(LINES, REFS)
     assert body["externalId"] == "TXN-1"
+    assert body["otherRefNum"] == "INV1"            # LEAD # = invoice number
     assert body["entity"] == {"id": "4147"}
     assert body["dueDate"] == "2026-10-01"          # invoices carry a due date
     assert body["class"] == {"id": "5"}
+    assert body["customForm"] == {"id": "101"}      # form 101 stamped
     assert "subsidiary" not in body                 # blank -> omitted
     items = body["item"]["items"]
     assert len(items) == 2

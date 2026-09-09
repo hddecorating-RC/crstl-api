@@ -51,6 +51,7 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
             "tran_date":     invoice["invoice_date"],
             "due_date":      invoice["due_date"],
             "memo":          f'{invoice["invoice_number"]} / PO {invoice["po_number"]}',
+            "invoice_number": invoice["invoice_number"],
             "other_ref_num": invoice["po_number"],
             "currency":      config["currency"],
             "tax_code":      mapping["tax_code"],
