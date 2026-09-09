@@ -333,12 +333,11 @@ def test_digest_scheduled_weekdays_only(monkeypatch, tmp_path):
     assert digest["timezone"] == "America/Toronto"
 
 
-def test_refresh_and_export_still_run_every_day(monkeypatch, tmp_path):
-    """Only the email is weekday-gated; the cache refresh and NetSuite export
-    keep running on weekends so Monday's digest has current data."""
+def test_refresh_runs_every_day(monkeypatch, tmp_path):
+    """The cache refresh runs on weekends too so Monday's digest has current data
+    (only the email and the NetSuite push are weekday-gated)."""
     jobs = _scheduled_jobs(monkeypatch, tmp_path)
-    for job_id in ("daily_refresh", "netsuite_export"):
-        assert "day_of_week" not in jobs[job_id]
+    assert "day_of_week" not in jobs["daily_refresh"]
 
 
 # ── Accepted-only reporting ────────────────────────────────────────────────
@@ -468,7 +467,7 @@ def test_automation_status_and_toggle(client):
     resp = client.get("/api/automation")
     assert resp.status_code == 200
     jobs = {j["id"]: j for j in resp.json()["jobs"]}
-    assert set(jobs) == {"daily_refresh", "netsuite_export", "netsuite_push", "daily_digest"}
+    assert set(jobs) == {"daily_refresh", "netsuite_push", "daily_digest"}
     assert jobs["netsuite_push"]["enabled"] is False   # off by default
     assert jobs["daily_digest"]["enabled"] is True
     # toggle push on, verify persisted

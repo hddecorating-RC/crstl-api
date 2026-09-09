@@ -611,10 +611,9 @@ AUTO_NS_PUSH_SETTING = "auto_ns_push_enabled"
 # off until someone turns it on (the NetSuite auto-push stays off until
 # accounting signs off). Keep `id` in sync with the scheduler job ids below.
 AUTOMATION_JOBS = [
-    {"id": "daily_refresh",   "label": "Invoice sync (Crstl)", "schedule": "Daily · 7:00 AM ET",   "setting": AUTO_SYNC_SETTING,      "default": "true"},
-    {"id": "netsuite_export", "label": "NetSuite CSV export",  "schedule": "Daily · 4:00 AM ET",   "setting": AUTO_NS_EXPORT_SETTING, "default": "true"},
-    {"id": "netsuite_push",   "label": "NetSuite auto-push",   "schedule": "Mon–Fri · 7:05 AM ET", "setting": AUTO_NS_PUSH_SETTING,   "default": "false"},
-    {"id": "daily_digest",    "label": "Daily digest email",   "schedule": "Mon–Fri · 7:15 AM ET", "setting": AUTO_DIGEST_SETTING,    "default": "true"},
+    {"id": "daily_refresh", "label": "Invoice sync (Crstl)", "schedule": "Daily · 7:00 AM ET",   "setting": AUTO_SYNC_SETTING,    "default": "true"},
+    {"id": "netsuite_push", "label": "NetSuite auto-push",   "schedule": "Mon–Fri · 7:05 AM ET", "setting": AUTO_NS_PUSH_SETTING, "default": "false"},
+    {"id": "daily_digest",  "label": "Daily digest email",   "schedule": "Mon–Fri · 7:15 AM ET", "setting": AUTO_DIGEST_SETTING,  "default": "true"},
 ]
 _JOB_BY_ID = {j["id"]: j for j in AUTOMATION_JOBS}
 
@@ -701,9 +700,6 @@ async def lifespan(app: FastAPI):
     _scheduler = AsyncIOScheduler()
     _scheduler.add_job(_run_refresh_job, "cron", id="daily_refresh",
                        hour=7, minute=0, timezone="America/Toronto",
-                       misfire_grace_time=3600, coalesce=True)
-    _scheduler.add_job(_run_ns_export_job, "cron", id="netsuite_export",
-                       hour=4, minute=0, timezone="America/Toronto",
                        misfire_grace_time=3600, coalesce=True)
     # NetSuite auto-push — runs after the 7am refresh, before the 7:15 digest, so
     # the digest reflects it. OFF by default until accounting turns it on.

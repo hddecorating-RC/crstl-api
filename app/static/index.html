@@ -27,10 +27,10 @@
     </div>
   </div>
 
-  <div class="px-6 py-5">
+  <div class="px-6 py-5 flex flex-col" style="height: calc(100vh - 48px)">
 
     <!-- Stat cards -->
-    <div class="grid grid-cols-6 gap-4 mb-5">
+    <div class="grid grid-cols-5 gap-4 mb-5">
       <div class="bg-white rounded-lg border border-gray-200 p-4 cursor-pointer hover:border-amber-400 transition"
            :class="activeFilter === 'Draft' ? 'ring-2 ring-amber-400' : ''"
            @click="activeFilter = activeFilter === 'Draft' ? 'All' : 'Draft'; currentPage = 1">
@@ -55,60 +55,27 @@
         <div class="text-sm font-semibold text-slate-800 mt-1" x-text="lastExport ? fmtTime(lastExport) : '—'"></div>
         <div class="text-xs text-green-500 mt-1" x-show="lastExport">✓ Success</div>
       </div>
-      <!-- NetSuite Export -->
+      <!-- Email Digest + Automation -->
       <div class="bg-white rounded-lg border border-gray-200 p-4">
-        <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">NetSuite Export</div>
+        <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Email &amp; Automation</div>
         <div class="text-sm font-semibold text-slate-800 mt-1"
-             x-text="netsuiteExport.last_generated ? fmtTime(netsuiteExport.last_generated) : '—'"></div>
-        <div class="text-xs text-gray-400 mt-1"
-             x-show="netsuiteExport.last_generated"
-             x-text="netsuiteExport.count + ' invoices'"></div>
-        <div class="text-xs text-red-500 mt-1"
-             x-show="netsuiteExport.error"
-             x-text="netsuiteExport.error"></div>
-        <div class="flex gap-2 mt-2">
-          <button @click="generateNetsuite()" :disabled="generatingNetsuite"
-                  class="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 font-medium px-2 py-1 rounded disabled:opacity-50">
-            <span x-show="!generatingNetsuite">⟳ Generate</span>
-            <span x-show="generatingNetsuite">Generating…</span>
-          </button>
-          <a x-show="netsuiteExport.available"
-             href="/api/netsuite-export/download"
-             class="text-xs bg-green-600 hover:bg-green-700 text-white font-medium px-2 py-1 rounded inline-block">
-            ↓ Download
-          </a>
-        </div>
-      </div>
-      <!-- Email Digest -->
-      <div class="bg-white rounded-lg border border-gray-200 p-4">
-        <div class="flex items-start justify-between mb-1">
-          <div class="text-xs uppercase tracking-wide text-gray-400">Email Digest</div>
-          <!-- Auto-send toggle — persists in tracking.db, survives restarts.
-               When off, the scheduled Mon–Fri 07:15 job skips sending. Manual
-               sends below still work. -->
-          <button @click="toggleAutoDigest()" :disabled="togglingAutoDigest"
-                  :class="digest.auto_enabled ? 'bg-green-500' : 'bg-gray-300'"
-                  class="relative inline-flex h-4 w-8 items-center rounded-full transition disabled:opacity-50"
-                  :title="digest.auto_enabled ? 'Auto-send ON — weekdays 07:15, click to disable scheduled digest' : 'Auto-send OFF — scheduled digest will not fire'">
-            <span :class="digest.auto_enabled ? 'translate-x-4' : 'translate-x-0.5'"
-                  class="inline-block h-3 w-3 transform rounded-full bg-white transition"></span>
-          </button>
-        </div>
-        <div class="text-sm font-semibold text-slate-800 mt-1"
-             x-text="digest.last_sent ? fmtTime(digest.last_sent) : '—'"></div>
+             x-text="digest.last_sent ? ('Digest ' + fmtTime(digest.last_sent)) : 'Digest —'"></div>
         <div class="text-xs mt-1"
              :class="digest.auto_enabled ? 'text-gray-400' : 'text-amber-600 font-medium'"
-             x-text="digest.auto_enabled ? ((digest.count || 0) + ' invoice' + (digest.count === 1 ? '' : 's') + ' · Auto: on (Mon–Fri 07:15)') : 'Auto: OFF (Mon–Fri 07:15 job disabled)'"></div>
+             x-text="digest.auto_enabled ? 'Auto-send on · Mon–Fri 07:15' : 'Auto-send OFF'"></div>
         <div class="text-xs text-red-500 mt-1 truncate"
-             x-show="digest.error"
-             :title="digest.error"
-             x-text="digest.error"></div>
+             x-show="digest.error" :title="digest.error" x-text="digest.error"></div>
         <div class="flex gap-2 mt-2">
           <button @click="sendDigest()" :disabled="sendingDigest"
                   class="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 font-medium px-2 py-1 rounded disabled:opacity-50"
                   title="Send digest email of any invoices not yet emailed">
             <span x-show="!sendingDigest">✉ Send Now</span>
             <span x-show="sendingDigest">Sending…</span>
+          </button>
+          <button @click="openAutomation()"
+                  class="text-xs bg-indigo-600 hover:bg-indigo-700 text-white font-medium px-2 py-1 rounded"
+                  title="Turn scheduled jobs (digest, sync, NetSuite push) on/off; see schedule and run logs">
+            ⚙ Automation
           </button>
         </div>
       </div>
@@ -188,7 +155,7 @@
     </div>
 
     <!-- Master list (full width; detail opens as right-side drawer) -->
-    <div style="height: calc(100vh - 320px); min-height: 400px;">
+    <div class="flex-1 min-h-0">
 
       <div class="h-full bg-white border border-gray-200 rounded-lg overflow-hidden flex flex-col">
         <!-- Table header -->
@@ -476,11 +443,6 @@
               class="bg-white border border-gray-200 hover:border-gray-300 text-gray-600 text-sm px-4 py-2 rounded-lg disabled:opacity-50 transition">
         <span x-show="!pushingNetsuite" x-text="selected.size ? ('⬡ Preview selected (' + selected.size + ')') : '⬡ Preview all (dry-run)'"></span>
         <span x-show="pushingNetsuite">Working…</span>
-      </button>
-      <button @click="openAutomation()"
-              title="Turn scheduled jobs on/off, see the schedule and run history"
-              class="bg-white border border-gray-200 hover:border-gray-300 text-gray-600 text-sm px-4 py-2 rounded-lg transition ml-auto">
-        ⚙ Automation
       </button>
     </div>
 
@@ -832,7 +794,11 @@ function dashboard() {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ job: id, enabled }),
         });
-        if (res.ok) { await this.loadAutomation(); this.showToast((enabled ? 'Enabled: ' : 'Paused: ') + id); }
+        if (res.ok) {
+          await this.loadAutomation();
+          if (id === 'daily_digest') await this.loadDigestStatus();  // keep the header card in sync
+          this.showToast((enabled ? 'Enabled: ' : 'Paused: ') + id);
+        }
         else { this.showToast('Toggle failed'); }
       } catch { this.showToast('Toggle failed'); }
       finally { this.togglingJob = null; }
