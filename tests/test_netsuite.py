@@ -17,7 +17,7 @@ SAMPLE_INVOICE = {
 }
 
 SAMPLE_CONFIG = {
-    "wholesale_stores": {
+    "dsd_stores": {
         "VAUGHAN": {"customer_id": "cust-vaughan", "province": "ON", "tax_code": "HST-ON", "tax_rate": 0.13},
         "CALGARY": {"customer_id": "cust-calgary", "province": "AB", "tax_code": "GST", "tax_rate": 0.05},
     },
@@ -38,7 +38,7 @@ def mock_config():
         yield
 
 
-def test_transform_wholesale_vaughan(mock_config):
+def test_transform_dsd_vaughan(mock_config):
     from app.netsuite import transform_invoice
     lines = transform_invoice(SAMPLE_INVOICE, province="ON", store="VAUGHAN")
     assert lines is not None and len(lines) == 1  # only merchandise line — no allowances/charges

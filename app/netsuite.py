@@ -35,7 +35,7 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
     config = _load_config()
 
     if store is not None:
-        mapping = config["wholesale_stores"].get(store.upper())
+        mapping = config["dsd_stores"].get(store.upper())
     elif province is not None:
         mapping = config["dropship_provinces"].get(province.upper())
     else:
