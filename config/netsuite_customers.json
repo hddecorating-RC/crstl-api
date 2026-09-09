@@ -16,7 +16,7 @@
   "dropship_provinces": {
     "AB": {"customer_id": "4145", "tax_code": "CA-GST 5%", "tax_rate": 0.05},
     "BC": {"customer_id": "4150", "tax_code": "CA-GST 5%", "tax_rate": 0.05},
-    "MB": {"customer_id": "4165", "tax_code": "CA-GST 5%", "tax_rate": 0.05},
+    "MB": {"customer_id": "4148", "tax_code": "CA-GST 5%", "tax_rate": 0.05},
     "NB": {"customer_id": "4152", "tax_code": "CA-HST Maritimes", "tax_rate": 0.15},
     "NL": {"customer_id": "4166", "tax_code": "CA-HST Maritimes", "tax_rate": 0.15},
     "NS": {"customer_id": "4151", "tax_code": "HST NS", "tax_rate": 0.14},
