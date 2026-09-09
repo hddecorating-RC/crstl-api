@@ -164,6 +164,12 @@
               <span x-show="!exporting">↓ Export</span>
               <span x-show="exporting">Exporting…</span>
             </button>
+            <button @click="pushNetsuite(true, [...selected])" :disabled="pushingNetsuite"
+                    title="Preview the selected invoices (dry run — nothing is sent)"
+                    class="bg-white border border-gray-200 hover:border-gray-300 text-gray-600 text-xs font-medium px-3 py-2 rounded-full disabled:opacity-50">
+              <span x-show="!pushingNetsuite">⬡ Preview</span>
+              <span x-show="pushingNetsuite">…</span>
+            </button>
             <button @click="pushNetsuite(false, [...selected])" :disabled="pushingNetsuite"
                     title="Push the selected invoices to NetSuite (live). Refused while any id is unresolved."
                     class="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium px-3 py-2 rounded-full disabled:opacity-50">
@@ -465,10 +471,10 @@
         <span x-show="!syncing">↻ Refresh</span>
         <span x-show="syncing">Refreshing…</span>
       </button>
-      <button @click="pushNetsuite(true)" :disabled="pushingNetsuite || invoices.length === 0"
-              title="Builds and reconciles every invoice without sending — preview totals + unresolved ids. Live pushes are per-invoice (open its details) or on the selected rows."
+      <button @click="pushNetsuite(true, selected.size ? [...selected] : null)" :disabled="pushingNetsuite || invoices.length === 0"
+              :title="selected.size ? ('Preview the ' + selected.size + ' selected invoice(s) — nothing sent') : 'Preview every invoice — nothing sent. Select rows first to preview just those.'"
               class="bg-white border border-gray-200 hover:border-gray-300 text-gray-600 text-sm px-4 py-2 rounded-lg disabled:opacity-50 transition">
-        <span x-show="!pushingNetsuite">⬡ Preview NetSuite push (dry-run)</span>
+        <span x-show="!pushingNetsuite" x-text="selected.size ? ('⬡ Preview selected (' + selected.size + ')') : '⬡ Preview all (dry-run)'"></span>
         <span x-show="pushingNetsuite">Working…</span>
       </button>
     </div>
