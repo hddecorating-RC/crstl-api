@@ -135,7 +135,7 @@ def test_upsert_invoice_puts_to_the_external_id_url():
 
     call = client.session.calls[0]
     assert call["method"] == "PUT"
-    assert call["url"].endswith("/services/rest/record/v1/invoice/eid:TXN-123")
+    assert call["url"].endswith("/services/rest/record/v1/invoice/eid:TXN-123?replace=item")
     assert call["headers"]["Authorization"].startswith("OAuth ")
     assert result["location"] == "/record/v1/invoice/987"
 
@@ -174,6 +174,7 @@ def test_build_invoice_payload_uses_internal_ids():
     body = build_invoice_payload(LINES, REFS)
     assert body["externalId"] == "TXN-1"
     assert body["otherRefNum"] == "INV1"            # LEAD # = invoice number
+    assert body["custbodyinvoicepercent"] == 100    # full invoice, not a 50% deposit
     assert body["entity"] == {"id": "4147"}
     assert body["dueDate"] == "2026-10-01"          # invoices carry a due date
     assert body["class"] == {"id": "5"}

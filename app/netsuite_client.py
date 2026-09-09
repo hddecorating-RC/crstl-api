@@ -151,7 +151,11 @@ class NetSuiteClient:
         PUT /record/v1/{record_type}/eid:{external_id}."""
         if not external_id:
             raise ValueError("upsert needs a non-empty external_id")
-        return self._request("PUT", f"/record/v1/{record_type}/eid:{external_id}", json_body=body)
+        # replace=item: overwrite the line sublist on update. Without it NetSuite
+        # MERGES (appends) the lines, so re-pushing an existing invoice doubles
+        # its total. With it, the upsert is truly idempotent -- lines are replaced.
+        return self._request(
+            "PUT", f"/record/v1/{record_type}/eid:{external_id}?replace=item", json_body=body)
 
     def upsert_invoice(self, record: dict) -> dict:
         """Upsert one NetSuite invoice. `record` is a REST invoice body carrying

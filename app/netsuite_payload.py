@@ -76,6 +76,10 @@ def build_invoice_payload(line_records: list[dict], refs: dict | None = None) ->
         # the INV-prefixed Crstl invoice number there (e.g. INV40861211), so use
         # invoice_number, falling back to the PO/order number if absent.
         "otherRefNum": head.get("invoice_number") or head["other_ref_num"],
+        # "INVOICE %" (custbodyinvoicepercent) defaults to 50 on the form -- that
+        # is OMIS's deposit model (50% now, 50% second payment). Home Depot
+        # invoices are billed in full, so set it to 100.
+        "custbodyinvoicepercent": 100,
         "item": {
             "items": [
                 {
