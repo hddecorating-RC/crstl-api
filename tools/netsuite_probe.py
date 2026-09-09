@@ -36,6 +36,8 @@ def main() -> None:
     parser.add_argument("--type", default="invoice",
                         help="record type for --id (default: invoice)")
     parser.add_argument("--sql", help="run a read-only SuiteQL SELECT and print the rows")
+    parser.add_argument("--list", metavar="TYPE", nargs="?", const="invoice",
+                        help="list recent record ids of TYPE (default invoice) -- tests search/list access")
     args = parser.parse_args()
 
     load_env()
@@ -50,6 +52,12 @@ def main() -> None:
             print(f"SuiteQL: {args.sql}")
             result = client.suiteql(args.sql)
             print(json.dumps(result.get("items", result), indent=2, default=str))
+            return
+
+        if args.list:
+            print(f"Listing recent {args.list} ids (tests search/list access)...")
+            result = client.list_records(args.list, limit=10)
+            print(json.dumps([{"id": i.get("id")} for i in result.get("items", [])], indent=2))
             return
 
         if args.id:
