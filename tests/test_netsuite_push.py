@@ -64,7 +64,7 @@ def test_dry_run_builds_and_reconciles_without_sending():
     with patch("app.tracking.record_events") as rec:
         out = push_invoices(INVOICES, live=False, refs=REFS_PARTIAL)
     assert out["mode"] == "dry"
-    assert out["summary"] == {"built": 2, "sent": 0, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0}
+    assert out["summary"] == {"built": 2, "sent": 0, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0}
     dsd = next(r for r in out["results"] if r["transaction_id"] == "T-DSD")
     assert dsd["channel"] == "dsd" and dsd["status"] == "built"
     assert dsd["gross"] == 100.0 and dsd["discount"] == -6.19 and dsd["net"] == 93.81
@@ -94,7 +94,7 @@ def test_live_sends_and_records_tracking():
          patch("app.tracking.record_netsuite_push"):
         out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
     assert out["mode"] == "live"
-    assert out["summary"] == {"built": 2, "sent": 2, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0}
+    assert out["summary"] == {"built": 2, "sent": 2, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0}
     assert len(client.calls) == 2
     sent = [r for r in out["results"] if r["status"] == "sent"]
     assert {r["transaction_id"] for r in sent} == {"T-DSD", "T-DROP"}
@@ -108,7 +108,7 @@ def test_live_one_failure_does_not_stop_the_batch():
          patch("app.tracking.get_netsuite_last_modified", return_value=None), \
          patch("app.tracking.record_netsuite_push"):
         out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
-    assert out["summary"] == {"built": 2, "sent": 1, "failed": 1, "skipped_no_map": 1, "skipped_modified": 0}
+    assert out["summary"] == {"built": 2, "sent": 1, "failed": 1, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0}
     failed = next(r for r in out["results"] if r["status"] == "failed")
     assert failed["transaction_id"] == "T-DROP" and "boom" in failed["error"]
     # only the successful one is logged
@@ -208,3 +208,15 @@ def test_push_invoices_keeps_latest_accepted_per_source_doc():
     out = push_invoices(rows, live=False, refs=REFS_FULL)
     tids = [r["transaction_id"] for r in out["results"]]
     assert tids == ["v2"]   # one record, the latest version
+
+
+def test_push_invoices_skips_unsafe_source_document_id():
+    """H2/L2: an invoice whose source_document_id carries URL metacharacters is
+    skipped (skipped_invalid) and the batch continues -- it never reaches the
+    NetSuite URL."""
+    bad = {**INVOICES[0], "transaction_id": "T-BAD", "source_document_id": "x?replace=none&"}
+    out = push_invoices([dict(INVOICES[0]), bad], live=False, refs=REFS_FULL)
+    st = {r["transaction_id"]: r["status"] for r in out["results"]}
+    assert st["T-BAD"] == "skipped_invalid"
+    assert st["T-DSD"] == "built"
+    assert out["summary"]["skipped_invalid"] == 1

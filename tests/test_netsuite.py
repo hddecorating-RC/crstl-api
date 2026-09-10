@@ -331,3 +331,12 @@ def test_dsd_uses_drapery_item(mock_config):
     inv = {**SAMPLE_INVOICE, "product": "Drape Panel"}
     lines = transform_invoice(inv, province="ON", store="VAUGHAN")
     assert lines[0]["item"] == "Drapery Panels"
+
+
+def test_external_id_rejects_unsafe_source_document_id():
+    from app.netsuite import external_id_for
+    for bad in ["x?replace=none&", "a/b", "has space", "colon:id", "x" * 65]:
+        with pytest.raises(ValueError):
+            external_id_for({"source_document_id": bad})
+    # a clean Mongo-style id is fine
+    assert external_id_for({"source_document_id": "6aa1b5e6956e73c8eaa65c52"}) == "CRSTL-6aa1b5e6956e73c8eaa65c52"

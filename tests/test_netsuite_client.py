@@ -225,3 +225,15 @@ def test_get_by_external_id_returns_none_on_404():
     client = NetSuiteClient(**CREDS)
     client.session = _FakeSession(_FakeResponse(404, content=b'{"detail":"not found"}'))
     assert client.get_by_external_id("invoice", "MISSING") is None
+
+
+def test_upsert_invoice_percent_encodes_the_external_id():
+    """H2 defense-in-depth: a special-char externalId is percent-encoded so it
+    cannot inject query/path into the NetSuite URL (e.g. neutralizing replace=item)."""
+    from app.netsuite_client import NetSuiteClient
+    client = NetSuiteClient(**CREDS)
+    client.session = _FakeSession(_FakeResponse(200, content=b'{"id":"1","lastModifiedDate":"T"}'))
+    client.upsert_invoice({"externalId": "CRSTL-x?replace=none&y"})
+    put = [c for c in client.session.calls if c["method"] == "PUT"][0]
+    assert "?replace=none" not in put["url"]          # the injected query is gone
+    assert "eid:CRSTL-x%3Freplace%3Dnone%26y?replace=item" in put["url"]

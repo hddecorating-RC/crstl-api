@@ -116,11 +116,22 @@ def push_invoices(
     prepared: list[tuple[dict, dict]] = []   # (result-row, payload) for rows to send
     unresolved: list[str] = []
     skipped_no_map = 0
+    skipped_invalid = 0
 
     for inv in invoices:
         tid = str(inv.get("transaction_id", "?"))
         store, province = inv.get("store"), inv.get("province")
-        lines = transform_invoice(inv, province, store)
+        try:
+            lines = transform_invoice(inv, province, store)
+        except ValueError as exc:
+            # Malformed invoice (e.g. an unsafe source_document_id, H2): skip and
+            # flag. One bad row must never abort the whole batch (L2), and an
+            # unsafe id must never reach the NetSuite URL.
+            skipped_invalid += 1
+            results.append({"transaction_id": tid, "invoice_number": inv.get("invoice_number"),
+                            "channel": None, "where": None, "status": "skipped_invalid",
+                            "error": str(exc)})
+            continue
         if not lines:
             skipped_no_map += 1
             results.append({"transaction_id": tid, "invoice_number": inv.get("invoice_number"),
@@ -150,7 +161,8 @@ def push_invoices(
             # Refuse the whole batch; nothing is written.
             return {"mode": mode, "unresolved": unresolved, "results": results,
                     "summary": {"built": len(prepared), "sent": 0, "failed": 0,
-                                "skipped_no_map": skipped_no_map, "skipped_modified": 0},
+                                "skipped_no_map": skipped_no_map, "skipped_modified": 0,
+                                "skipped_invalid": skipped_invalid},
                     "blocked": "unresolved ids"}
         from app.netsuite_client import NetSuiteClient, NetSuiteUnavailable, NetSuiteModifiedOnServer
         from app import tracking
@@ -201,5 +213,6 @@ def push_invoices(
         "unresolved": unresolved,
         "results": results,
         "summary": {"built": len(prepared), "sent": sent, "failed": failed,
-                    "skipped_no_map": skipped_no_map, "skipped_modified": skipped_modified},
+                    "skipped_no_map": skipped_no_map, "skipped_modified": skipped_modified,
+                    "skipped_invalid": skipped_invalid},
     }

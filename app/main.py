@@ -380,7 +380,12 @@ def _generate_netsuite_export() -> None:
 
     records, skipped = [], []
     for inv in invoices:
-        line_items = transform_invoice(inv, province=inv.get("province"), store=inv.get("store"))
+        try:
+            line_items = transform_invoice(inv, province=inv.get("province"), store=inv.get("store"))
+        except ValueError as exc:   # unsafe source_document_id etc. -- skip, never crash the export
+            print(f"NetSuite export: skipped {inv.get('invoice_number', '?')} -- {exc}")
+            skipped.append(inv.get("po_number", "?"))
+            continue
         if line_items is None:
             skipped.append(inv.get("po_number", "?"))
         else:

@@ -1,6 +1,12 @@
 import functools
 import json
 import pathlib
+import re
+
+# A CRSTL source_document_id is a Mongo-style id. We only ever embed it in a
+# NetSuite REST URL, so it must be URL-safe: no ? & / : # space etc. Anything
+# else is refused (H2) rather than pasted into the eid: path.
+_SAFE_SOURCE_DOC_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @functools.lru_cache(maxsize=None)
@@ -27,6 +33,10 @@ def external_id_for(invoice: dict) -> str:
     sid = str(invoice.get("source_document_id") or "").strip()
     if not sid:
         raise ValueError("invoice missing source_document_id (needed for a stable NetSuite externalId)")
+    if not _SAFE_SOURCE_DOC_ID.match(sid):
+        raise ValueError(
+            f"source_document_id {sid!r} is not URL-safe ([A-Za-z0-9_-], <=64); "
+            "refusing to build a NetSuite externalId from it")
     return f"CRSTL-{sid}"
 
 

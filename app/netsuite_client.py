@@ -162,7 +162,7 @@ class NetSuiteClient:
         # MERGES (appends) the lines, so re-pushing an existing invoice doubles
         # its total. With it, the upsert is truly idempotent -- lines are replaced.
         return self._request(
-            "PUT", f"/record/v1/{record_type}/eid:{external_id}?replace=item", json_body=body)
+            "PUT", f"/record/v1/{record_type}/eid:{quote(external_id, safe='')}?replace=item", json_body=body)
 
     def upsert_invoice(self, record: dict, guard_last_modified: str | None = None) -> dict:
         """Upsert one NetSuite invoice. `record` is a REST invoice body carrying
@@ -201,7 +201,7 @@ class NetSuiteClient:
         """The record under our externalId as a dict, or None on 404. Read-only --
         used to decide created-vs-updated and to read lastModifiedDate for the guard."""
         try:
-            return self._request("GET", f"/record/v1/{record_type}/eid:{external_id}")
+            return self._request("GET", f"/record/v1/{record_type}/eid:{quote(external_id, safe='')}")
         except NetSuiteUnavailable as exc:
             if "-> 404" in str(exc):
                 return None
