@@ -286,6 +286,21 @@
               <template x-if="activeInvoice.province">
                 <div><dt class="text-xs text-gray-400">Ship-to Province</dt><dd class="font-medium mt-0.5" x-text="activeInvoice.province"></dd></div>
               </template>
+              <div>
+                <dt class="text-xs text-gray-400">Product</dt>
+                <dd class="font-medium mt-0.5"
+                    :class="activeInvoice.product === 'Blind' ? 'text-sky-700' : (activeInvoice.product === 'Drape Panel' ? 'text-violet-700' : 'text-gray-500')"
+                    x-text="activeInvoice.product || 'Unknown'"></dd>
+              </div>
+              <div class="col-span-2">
+                <dt class="text-xs text-gray-400">NetSuite customer</dt>
+                <template x-if="activeInvoice.netsuite_customer">
+                  <dd class="mt-0.5"><span class="font-semibold" x-text="activeInvoice.netsuite_customer.name || activeInvoice.netsuite_customer.id"></span><span class="text-xs text-gray-400" x-text="' · id ' + activeInvoice.netsuite_customer.id"></span></dd>
+                </template>
+                <template x-if="!activeInvoice.netsuite_customer">
+                  <dd class="mt-0.5 text-amber-600 font-medium">Not routed — will be skipped (unknown product)</dd>
+                </template>
+              </div>
               <template x-if="activeInvoice.allowance_amount">
                 <div><dt class="text-xs text-gray-400">Allowances</dt><dd class="font-medium mt-0.5 text-red-600" x-text="'−' + fmtMoney(activeInvoice.allowance_amount)"></dd></div>
               </template>

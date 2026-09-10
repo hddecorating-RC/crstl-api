@@ -30,6 +30,18 @@
     "AB": "4190", "BC": "4199", "MB": "4192", "NB": "4200", "NL": "4193",
     "NS": "4194", "ON": "4189", "PE": "4201", "QC": "4195", "SK": "4202"
   },
+  "_comment_customer_names": "Display-only: NetSuite customer names by internal id, shown in the dashboard flyout so the blinds-vs-panels routing is verifiable at a glance. Read from NetSuite 2026-09-10.",
+  "customer_names": {
+    "4115": "Home Depot Canada-DSD Vaughan", "4116": "Home Depot Canada-DSD Calgary",
+    "4145": "AB PANELS ON LINE", "4146": "QC PANELS ON LINE", "4147": "ON PANELS ON LINE",
+    "4148": "MB PANELS ON LINE", "4149": "SK PANELS ON LINE", "4150": "BC PANELS ON LINE",
+    "4151": "NS PANELS ON LINE", "4152": "NB PANELS ON LINE", "4153": "PEI PANELS ON LINE",
+    "4166": "NL PANELS ON LINE",
+    "4189": "ON BLINDS ON LINE", "4190": "AB BLINDS ON LINE", "4192": "MB BLINDS ON LINE",
+    "4193": "NL BLINDS ON LINE", "4194": "NS BLINDS ON LINE", "4195": "QC BLINDS ON LINE",
+    "4199": "BC BLINDS ON LINE", "4200": "NB BLINDS ON LINE", "4201": "PEI BLINDS ON LINE",
+    "4202": "SK BLINDS ON LINE"
+  },
   "item": "Drapery Panels",
   "currency": "CAD",
 

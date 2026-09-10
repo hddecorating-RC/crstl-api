@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from app.crstl import CrstlClient
 from app import tracking
 from app.mail import send_mail, MailConfigError
-from app.netsuite import transform_invoice
+from app.netsuite import transform_invoice, resolve_customer
 from app.netsuite_csv import build_netsuite_csv
 from app.netsuite_push import push_invoices, eligible_for_push
 from app.report import (XLSX_MEDIA_TYPE, dates_for, flavor_of, product_for,
@@ -758,11 +758,22 @@ def get_invoices() -> dict:
         tx_ids = [inv["transaction_id"] for inv in invoices]
         events = tracking.get_latest_events(tx_ids)
         invoices = [
-            {**inv, **events.get(inv["transaction_id"], {"exported_at": None, "netsuite_at": None})}
+            {**inv, **events.get(inv["transaction_id"], {"exported_at": None, "netsuite_at": None}),
+             "netsuite_customer": _netsuite_customer(inv)}
             for inv in invoices
         ]
 
     return {"invoices": invoices, "last_synced": last_synced, "status": status}
+
+
+def _netsuite_customer(inv: dict) -> dict | None:
+    """The NetSuite customer this invoice would post to (name + id + channel), or
+    None if it can't be routed. Uses the SAME resolver as the push, so the flyout
+    shows exactly the dry-run/live target."""
+    route = resolve_customer(inv, inv.get("province"), inv.get("store"))
+    if not route or not route.get("customer_id"):
+        return None
+    return {"id": route["customer_id"], "name": route.get("customer_name"), "channel": route["channel"]}
 
 
 @app.post("/api/sync")

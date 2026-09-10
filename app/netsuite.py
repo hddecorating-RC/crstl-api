@@ -30,6 +30,44 @@ def external_id_for(invoice: dict) -> str:
     return f"CRSTL-{sid}"
 
 
+def resolve_customer(invoice: dict, province, store, config: dict | None = None) -> dict | None:
+    """The NetSuite customer + channel this invoice routes to, or None if it can't
+    be routed (no province/store mapping, or a Mixed/Unknown dropship product).
+
+    SINGLE source of truth for customer routing, used by BOTH transform_invoice
+    (the booking) and the dashboard (which shows the target so it matches exactly
+    what will post). DSD is drapery only -> its store customer. Dropship splits by
+    PRODUCT: a blind bills to the province's blinds customer, a drape panel to the
+    existing (panels) customer. Tax always follows the province, not the product.
+    """
+    config = config or _load_config()
+    if store is not None:
+        mapping = config["dsd_stores"].get(store.upper()); channel = "dsd"
+    elif province is not None:
+        mapping = config["dropship_provinces"].get(province.upper()); channel = "dropship"
+    else:
+        return None
+    if not mapping:
+        return None
+    customer_id = mapping["customer_id"]
+    product = invoice.get("product")
+    if channel == "dropship":
+        if product == "Blind":
+            customer_id = (config.get("dropship_blinds") or {}).get(province.upper())
+            if not customer_id:
+                return None
+        elif product != "Drape Panel":
+            return None
+    return {
+        "channel": channel,
+        "product": product,
+        "customer_id": customer_id,
+        "customer_name": (config.get("customer_names") or {}).get(str(customer_id)),
+        "tax_code": mapping["tax_code"],
+        "tax_rate": mapping.get("tax_rate", 0),
+    }
+
+
 def transform_invoice(invoice: dict, province: str | None, store: str | None) -> list[dict] | None:
     """
     Transform a Crstl invoice into the NetSuite line-item records for one invoice.
@@ -57,46 +95,23 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
     """
     config = _load_config()
 
-    if store is not None:
-        mapping = config["dsd_stores"].get(store.upper())
-        channel = "dsd"
-    elif province is not None:
-        mapping = config["dropship_provinces"].get(province.upper())
-        channel = "dropship"
-    else:
+    route = resolve_customer(invoice, province, store, config)
+    if route is None:
         return None
-
-    if not mapping:
-        return None
-
-    # Customer routing. DSD is drapery only -> its one store customer. Dropship
-    # splits by PRODUCT: a blind bills to the province's blinds customer, a drape
-    # panel to the existing (panels) customer. Tax always follows the province,
-    # not the product. Mixed/Unknown can't be routed, so skip (return None) rather
-    # than guess a customer -- classification lives in app/products.py.
-    customer_id = mapping["customer_id"]
-    if channel == "dropship":
-        product = invoice.get("product")
-        if product == "Blind":
-            customer_id = (config.get("dropship_blinds") or {}).get(province.upper())
-            if not customer_id:
-                return None
-        elif product != "Drape Panel":
-            return None
-
+    channel = route["channel"]
     discount = config["channel_discounts"][channel]
 
     try:
         base = {
             "external_id":    external_id_for(invoice),
-            "customer_id":    customer_id,
+            "customer_id":    route["customer_id"],
             "tran_date":      invoice["invoice_date"],
             "due_date":       invoice["due_date"],
             "memo":           f'{invoice["invoice_number"]} / PO {invoice["po_number"]}',
             "invoice_number": invoice["invoice_number"],
             "other_ref_num":  invoice["po_number"],
             "currency":       config["currency"],
-            "tax_code":       mapping["tax_code"],
+            "tax_code":       route["tax_code"],
         }
 
         gross = round(invoice["subtotal"], 2)
@@ -105,7 +120,7 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
         # stored rate, so NetSuite recomputing it changes nothing.
         discount_amount = -round(gross * discount["rate"], 2)
         net = round(gross + discount_amount, 2)
-        tax = round(net * mapping.get("tax_rate", 0), 2)
+        tax = round(net * route["tax_rate"], 2)
 
         return [
             {
