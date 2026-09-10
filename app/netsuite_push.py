@@ -68,6 +68,15 @@ def select_latest_accepted(invoices: list[dict]) -> list[dict]:
     return list(best.values())
 
 
+def eligible_for_push(invoices: list[dict]) -> list[dict]:
+    """The SINGLE definition of what the connector may push: Accepted, one (latest)
+    version per logical invoice (source_document_id), non-zero gross. Enforced
+    inside push_invoices() so EVERY caller -- the web button, the dry-run preview,
+    the 5am scheduled job AND the CLI -- gets it; no path can push a Draft, a stale
+    resubmission, or a zero-value row by going around it."""
+    return [i for i in select_latest_accepted(invoices) if (i.get("subtotal") or 0) > 0]
+
+
 def _select(invoices: list[dict], only: list[str] | None, limit: int | None) -> list[dict]:
     if only:
         wanted = {str(x) for x in only}
@@ -99,7 +108,9 @@ def push_invoices(
     if limit is not None and limit < 1:
         raise ValueError("limit must be >= 1")
     refs = refs or load_refs()
-    invoices = _select(invoices, only, limit)
+    # Enforce eligibility HERE so no caller (esp. the CLI) can push ineligible
+    # invoices. only/limit then apply to the eligible set.
+    invoices = _select(eligible_for_push(invoices), only, limit)
 
     results: list[dict] = []
     prepared: list[tuple[dict, dict]] = []   # (result-row, payload) for rows to send

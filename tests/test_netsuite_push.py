@@ -31,13 +31,13 @@ REFS_FULL = {**REFS_PARTIAL,
              "item_ids": {**REFS_PARTIAL["item_ids"], "-5.19% vendor discounts": "999999"}}
 
 INVOICES = [
-    {"transaction_id": "T-DSD", "source_document_id": "S-DSD", "invoice_number": "INV1", "product": "Drape Panel", "po_number": "PO1",
+    {"transaction_id": "T-DSD", "source_document_id": "S-DSD", "invoice_number": "INV1", "product": "Drape Panel", "status": "Accepted", "po_number": "PO1",
      "invoice_date": "2026-09-01", "due_date": "2026-10-01", "subtotal": 100.00,
      "total_amount": 106.00, "store": "VAUGHAN", "province": "ON"},
-    {"transaction_id": "T-DROP", "source_document_id": "S-DROP", "invoice_number": "INV2", "product": "Drape Panel", "po_number": "PO2",
+    {"transaction_id": "T-DROP", "source_document_id": "S-DROP", "invoice_number": "INV2", "product": "Drape Panel", "status": "Accepted", "po_number": "PO2",
      "invoice_date": "2026-09-01", "due_date": "2026-10-01", "subtotal": 200.00,
      "total_amount": 210.00, "store": None, "province": "ON"},
-    {"transaction_id": "T-NOMAP", "source_document_id": "S-NOMAP", "invoice_number": "INV3", "po_number": "PO3",
+    {"transaction_id": "T-NOMAP", "source_document_id": "S-NOMAP", "invoice_number": "INV3", "product": "Drape Panel", "status": "Accepted", "po_number": "PO3",
      "invoice_date": "2026-09-01", "due_date": "", "subtotal": 50.00,
      "total_amount": 50.00, "store": None, "province": "XX"},
 ]
@@ -169,3 +169,42 @@ def test_modified_on_server_is_skipped_not_overwritten():
     assert out["summary"]["skipped_modified"] == 1
     assert out["summary"]["sent"] == 1
     rec.assert_called_once_with(["T-DSD"], "netsuite")   # only the sent one logged
+
+
+def test_push_invoices_enforces_eligibility_itself():
+    """M1 regression: the Accepted/latest/non-zero filter lives INSIDE
+    push_invoices, so the CLI (which calls it directly) cannot push a Draft, a
+    stale version, or a zero-value row by going around _run_netsuite_push."""
+    rows = [
+        dict(INVOICES[0]),  # T-DSD, Accepted, non-zero -> eligible
+        {"transaction_id": "T-DRAFT", "source_document_id": "S-DRAFT", "status": "Draft",
+         "invoice_number": "INVd", "product": "Drape Panel", "po_number": "PO9",
+         "invoice_date": "2026-09-01", "due_date": "", "subtotal": 500.0,
+         "total_amount": 500.0, "store": "VAUGHAN", "province": "ON"},
+        {"transaction_id": "T-ZERO", "source_document_id": "S-ZERO", "status": "Accepted",
+         "invoice_number": "INVz", "product": "Drape Panel", "po_number": "PO8",
+         "invoice_date": "2026-09-01", "due_date": "", "subtotal": 0.0,
+         "total_amount": 0.0, "store": "VAUGHAN", "province": "ON"},
+    ]
+    out = push_invoices(rows, live=False, refs=REFS_FULL)
+    tids = {r["transaction_id"] for r in out["results"]}
+    assert "T-DSD" in tids            # eligible
+    assert "T-DRAFT" not in tids      # Draft filtered by the engine
+    assert "T-ZERO" not in tids       # zero-value filtered by the engine
+
+
+def test_push_invoices_keeps_latest_accepted_per_source_doc():
+    """Two Accepted versions of one logical invoice -> only the latest is pushed,
+    even calling push_invoices directly (the CLI path)."""
+    base = {"store": "VAUGHAN", "province": "ON", "product": "Drape Panel",
+            "status": "Accepted", "subtotal": 100.0, "total_amount": 106.0,
+            "po_number": "PO1", "due_date": ""}
+    rows = [
+        {**base, "transaction_id": "v1", "source_document_id": "SAME",
+         "invoice_number": "INVx", "invoice_date": "2026-09-01"},
+        {**base, "transaction_id": "v2", "source_document_id": "SAME",
+         "invoice_number": "INVx", "invoice_date": "2026-09-05"},   # latest
+    ]
+    out = push_invoices(rows, live=False, refs=REFS_FULL)
+    tids = [r["transaction_id"] for r in out["results"]]
+    assert tids == ["v2"]   # one record, the latest version

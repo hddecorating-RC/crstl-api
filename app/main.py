@@ -18,7 +18,7 @@ from app import tracking
 from app.mail import send_mail, MailConfigError
 from app.netsuite import transform_invoice
 from app.netsuite_csv import build_netsuite_csv
-from app.netsuite_push import push_invoices, select_latest_accepted
+from app.netsuite_push import push_invoices, eligible_for_push
 from app.report import (XLSX_MEDIA_TYPE, dates_for, flavor_of, product_for,
                         rows_for_transactions, window_label, workbook_bytes)
 from app.finale import FinaleClient
@@ -672,7 +672,7 @@ def _run_netsuite_push_job() -> None:
         tracking.record_job_run("netsuite_push", "skipped", "disabled"); return
     with _cache_lock:
         invoices = list(_cache["invoices"])
-    candidates = [i for i in select_latest_accepted(invoices) if i.get("subtotal", 0) > 0]
+    candidates = eligible_for_push(invoices)
     unpushed = set(tracking.get_unpushed_ids([str(i["transaction_id"]) for i in candidates]))
     to_push = [i for i in candidates if str(i["transaction_id"]) in unpushed]
     if not to_push:
@@ -841,11 +841,10 @@ def _run_netsuite_push(live: bool, ids: Optional[list[str]], limit: Optional[int
     a worker thread (the upsert loop is blocking network I/O)."""
     with _cache_lock:
         invoices = list(_cache["invoices"])
-    # Only Accepted invoices, one (latest) per logical invoice, non-zero. This is
-    # the ONE place that decides what is eligible to push, so the manual button,
-    # the dry-run preview and the scheduled job all agree.
-    pushable = [i for i in select_latest_accepted(invoices) if i.get("subtotal", 0) > 0]
-    result = _sanitize_push_result(push_invoices(pushable, live=live, only=ids, limit=limit))
+    # Eligibility (Accepted + latest-per-invoice + non-zero) is enforced INSIDE
+    # push_invoices, so the manual button, dry-run, scheduled job and CLI all get
+    # the same filter -- no caller can bypass it.
+    result = _sanitize_push_result(push_invoices(invoices, live=live, only=ids, limit=limit))
     with _netsuite_push_lock:
         _netsuite_push_state.update({
             "last_run": datetime.now(timezone.utc).isoformat(),

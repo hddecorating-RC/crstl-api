@@ -9,6 +9,11 @@ Chain (inside the engine): transform_invoice -> build_invoice_payload ->
 NetSuiteClient.upsert_invoice. Internal ids come from config/netsuite_customers.json;
 any still blank are reported here and BLOCK a --live send.
 
+Eligibility is enforced INSIDE push_invoices (app.netsuite_push.eligible_for_push):
+only ACCEPTED invoices, one (latest) version per logical invoice, non-zero gross.
+So --live from here can never book a Draft, a stale resubmission, or a $0 row --
+the CLI gets exactly the same filter as the scheduled job and the dashboard.
+
 Usage:
     python tools/push_invoices_to_netsuite.py            # dry run: build + reconcile, send nothing
     python tools/push_invoices_to_netsuite.py --live     # upsert (needs creds + filled ids)
