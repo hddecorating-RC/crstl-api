@@ -50,6 +50,12 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
             ran_at  TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_job_runs_ran_at ON job_runs(ran_at);
+        CREATE TABLE IF NOT EXISTS netsuite_records (
+            external_id   TEXT PRIMARY KEY,
+            netsuite_id   TEXT,
+            last_modified TEXT,
+            updated_at    TEXT NOT NULL
+        );
     """)
 
     if row is None:
@@ -264,3 +270,38 @@ def recent_job_runs(limit: int = 50, job: str | None = None) -> list[dict]:
     except Exception as exc:
         print(f"WARNING: job_runs read failed: {exc}")
         return []
+
+
+def record_netsuite_push(external_id: str, netsuite_id: str | None, last_modified: str | None) -> None:
+    """Remember what we last wrote to NetSuite under this externalId: the record's
+    internal id and its lastModifiedDate. The lastModifiedDate is the guard the
+    NEXT push compares against (optimistic lock -- see NetSuiteClient.upsert_invoice
+    and OMIS's NetsuiteTransaction). Best-effort; a failure never fails a send."""
+    if not external_id:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with contextlib.closing(_connect()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO netsuite_records (external_id, netsuite_id, last_modified, updated_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(external_id) DO UPDATE SET "
+                    "netsuite_id = excluded.netsuite_id, last_modified = excluded.last_modified, "
+                    "updated_at = excluded.updated_at",
+                    (external_id, netsuite_id, last_modified, now))
+    except Exception as exc:
+        print(f"ERROR: netsuite_records write failed for {external_id!r}: {exc}")
+
+
+def get_netsuite_last_modified(external_id: str) -> str | None:
+    """The lastModifiedDate recorded the last time we wrote this externalId, or
+    None if we have never pushed it (no guard baseline -> the update proceeds)."""
+    try:
+        with contextlib.closing(_connect()) as conn:
+            row = conn.execute(
+                "SELECT last_modified FROM netsuite_records WHERE external_id = ?",
+                (external_id,)).fetchone()
+        return row[0] if row else None
+    except Exception as exc:
+        print(f"WARNING: netsuite_records read failed for {external_id!r}: {exc}")
+        return None

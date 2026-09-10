@@ -130,16 +130,17 @@ def push_invoices(
         prepared.append((row, build_invoice_payload(lines, refs)))
 
     mode = "live" if live else "dry"
-    sent = failed = 0
+    sent = failed = skipped_modified = 0
 
     if live:
         if unresolved:
             # Refuse the whole batch; nothing is written.
             return {"mode": mode, "unresolved": unresolved, "results": results,
                     "summary": {"built": len(prepared), "sent": 0, "failed": 0,
-                                "skipped_no_map": skipped_no_map},
+                                "skipped_no_map": skipped_no_map, "skipped_modified": 0},
                     "blocked": "unresolved ids"}
-        from app.netsuite_client import NetSuiteClient, NetSuiteUnavailable
+        from app.netsuite_client import NetSuiteClient, NetSuiteUnavailable, NetSuiteModifiedOnServer
+        from app import tracking
         if client is None:
             if not NetSuiteClient.configured():
                 raise NetSuiteUnavailable("NETSUITE_* credentials not set")
@@ -148,16 +149,28 @@ def push_invoices(
 
         pushed_ids: list[str] = []
         for row, payload in prepared:
+            eid = payload.get("externalId")
             try:
-                result = client.upsert_invoice(payload)
+                # Optimistic lock: pass the lastModifiedDate we recorded when we
+                # last wrote this record; the client aborts if NetSuite's copy has
+                # changed since (someone edited our invoice) rather than overwrite.
+                guard = tracking.get_netsuite_last_modified(eid) if eid else None
+                result = client.upsert_invoice(payload, guard_last_modified=guard)
                 row["status"] = "sent"
                 row["location"] = result.get("location") or result
-                # "created" vs "updated" from the client's pre-write existence
-                # check -- the audit trail that proves a re-push UPDATED our own
-                # record and never created a duplicate or touched another source.
+                # "created" vs "updated" -- proves a re-push UPDATED our own record
+                # and never created a duplicate or touched another source.
                 row["action"] = result.get("action") if isinstance(result, dict) else None
+                if isinstance(result, dict) and eid:
+                    # Store the new lastModifiedDate as the next push's guard.
+                    tracking.record_netsuite_push(eid, result.get("netsuite_id"), result.get("last_modified"))
                 sent += 1
                 pushed_ids.append(row["transaction_id"])
+            except NetSuiteModifiedOnServer as exc:
+                # OMIS's "Record modified on server!" -- do NOT overwrite; flag it.
+                row["status"] = "skipped_modified"
+                row["error"] = str(exc)
+                skipped_modified += 1
             except Exception as exc:  # one bad invoice must not stop the batch
                 row["status"] = "failed"
                 row["error"] = str(exc)
@@ -166,7 +179,6 @@ def push_invoices(
         if pushed_ids:
             # Best-effort per-invoice log; never let a tracking hiccup fail a send.
             try:
-                from app import tracking
                 tracking.record_events(pushed_ids, "netsuite")
             except Exception as exc:  # noqa: BLE001
                 print(f"WARNING: netsuite push succeeded but tracking failed: {exc}")
@@ -176,5 +188,5 @@ def push_invoices(
         "unresolved": unresolved,
         "results": results,
         "summary": {"built": len(prepared), "sent": sent, "failed": failed,
-                    "skipped_no_map": skipped_no_map},
+                    "skipped_no_map": skipped_no_map, "skipped_modified": skipped_modified},
     }

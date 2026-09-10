@@ -129,19 +129,18 @@ class _FakeSession:
 
 def test_upsert_invoice_puts_to_the_external_id_url():
     client = NetSuiteClient(**CREDS)
-    client.session = _FakeSession(_FakeResponse(204, {"Location": "/record/v1/invoice/987"}))
+    client.session = _FakeSession(_FakeResponse(200, content=b'{"id":"987","lastModifiedDate":"2026-09-10T12:00:00Z"}'))
 
     result = client.upsert_invoice({"externalId": "TXN-123", "entity": {"id": "4147"}})
 
-    # upsert_invoice first GETs by eid (the created-vs-updated check), then PUTs.
-    get_call, put_call = client.session.calls[0], client.session.calls[1]
-    assert get_call["method"] == "GET"
-    assert get_call["url"].endswith("/record/v1/invoice/eid:TXN-123")
-    assert put_call["method"] == "PUT"
+    # GET (pre: exists + guard) -> PUT (write) -> GET (post: new baseline)
+    assert [c["method"] for c in client.session.calls] == ["GET", "PUT", "GET"]
+    put_call = client.session.calls[1]
     assert put_call["url"].endswith("/services/rest/record/v1/invoice/eid:TXN-123?replace=item")
     assert put_call["headers"]["Authorization"].startswith("OAuth ")
-    assert result["location"] == "/record/v1/invoice/987"
-    assert result["action"] == "updated"   # the GET returned 204 -> record already existed
+    assert result["action"] == "updated"          # the record already existed
+    assert result["netsuite_id"] == "987"
+    assert result["last_modified"] == "2026-09-10T12:00:00Z"
 
 
 def test_get_record_is_read_only_with_expand():
@@ -209,3 +208,20 @@ def test_unresolved_ids_flags_blank_refs():
 def test_build_invoice_payload_rejects_empty():
     with pytest.raises(ValueError):
         build_invoice_payload([])
+
+
+def test_upsert_invoice_aborts_when_modified_on_server():
+    """Optimistic lock: if the record's lastModifiedDate no longer matches the
+    guard we recorded, the write is aborted (no PUT) -- we never overwrite."""
+    from app.netsuite_client import NetSuiteModifiedOnServer
+    client = NetSuiteClient(**CREDS)
+    client.session = _FakeSession(_FakeResponse(200, content=b'{"id":"987","lastModifiedDate":"NEW"}'))
+    with pytest.raises(NetSuiteModifiedOnServer):
+        client.upsert_invoice({"externalId": "TXN-123"}, guard_last_modified="OLD")
+    assert [c["method"] for c in client.session.calls] == ["GET"]   # only the pre-check, no PUT
+
+
+def test_get_by_external_id_returns_none_on_404():
+    client = NetSuiteClient(**CREDS)
+    client.session = _FakeSession(_FakeResponse(404, content=b'{"detail":"not found"}'))
+    assert client.get_by_external_id("invoice", "MISSING") is None

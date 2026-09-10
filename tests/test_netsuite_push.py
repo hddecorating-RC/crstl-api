@@ -47,7 +47,7 @@ class FakeClient:
     def __init__(self, fail_on=None):
         self.calls = []
         self.fail_on = fail_on or set()
-    def upsert_invoice(self, payload):
+    def upsert_invoice(self, payload, guard_last_modified=None):
         self.calls.append(payload)
         if payload["externalId"] in self.fail_on:
             raise RuntimeError("boom")
@@ -64,7 +64,7 @@ def test_dry_run_builds_and_reconciles_without_sending():
     with patch("app.tracking.record_events") as rec:
         out = push_invoices(INVOICES, live=False, refs=REFS_PARTIAL)
     assert out["mode"] == "dry"
-    assert out["summary"] == {"built": 2, "sent": 0, "failed": 0, "skipped_no_map": 1}
+    assert out["summary"] == {"built": 2, "sent": 0, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0}
     dsd = next(r for r in out["results"] if r["transaction_id"] == "T-DSD")
     assert dsd["channel"] == "dsd" and dsd["status"] == "built"
     assert dsd["gross"] == 100.0 and dsd["discount"] == -6.19 and dsd["net"] == 93.81
@@ -89,10 +89,12 @@ def test_live_is_refused_while_ids_unresolved():
 
 def test_live_sends_and_records_tracking():
     client = FakeClient()
-    with patch("app.tracking.record_events") as rec:
+    with patch("app.tracking.record_events") as rec, \
+         patch("app.tracking.get_netsuite_last_modified", return_value=None), \
+         patch("app.tracking.record_netsuite_push"):
         out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
     assert out["mode"] == "live"
-    assert out["summary"] == {"built": 2, "sent": 2, "failed": 0, "skipped_no_map": 1}
+    assert out["summary"] == {"built": 2, "sent": 2, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0}
     assert len(client.calls) == 2
     sent = [r for r in out["results"] if r["status"] == "sent"]
     assert {r["transaction_id"] for r in sent} == {"T-DSD", "T-DROP"}
@@ -102,9 +104,11 @@ def test_live_sends_and_records_tracking():
 
 def test_live_one_failure_does_not_stop_the_batch():
     client = FakeClient(fail_on={"CRSTL-S-DROP"})  # payload externalId = CRSTL-<source_document_id>
-    with patch("app.tracking.record_events") as rec:
+    with patch("app.tracking.record_events") as rec, \
+         patch("app.tracking.get_netsuite_last_modified", return_value=None), \
+         patch("app.tracking.record_netsuite_push"):
         out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
-    assert out["summary"] == {"built": 2, "sent": 1, "failed": 1, "skipped_no_map": 1}
+    assert out["summary"] == {"built": 2, "sent": 1, "failed": 1, "skipped_no_map": 1, "skipped_modified": 0}
     failed = next(r for r in out["results"] if r["status"] == "failed")
     assert failed["transaction_id"] == "T-DROP" and "boom" in failed["error"]
     # only the successful one is logged
@@ -138,3 +142,30 @@ def test_select_latest_accepted_dedups_by_source_doc():
     out = select_latest_accepted(rows)
     assert {r["source_document_id"] for r in out} == {"S1"}
     assert len(out) == 1 and out[0]["transaction_id"] == "b"
+
+
+def test_modified_on_server_is_skipped_not_overwritten():
+    """OMIS's optimistic-lock guard: if NetSuite raises modified-on-server for one
+    invoice, that one is SKIPPED (not overwritten) and the batch continues."""
+    from app.netsuite_client import NetSuiteModifiedOnServer
+
+    class GuardClient:
+        def __init__(self):
+            self.calls = []
+        def upsert_invoice(self, payload, guard_last_modified=None):
+            self.calls.append(payload["externalId"])
+            if payload["externalId"] == "CRSTL-S-DROP":
+                raise NetSuiteModifiedOnServer("changed on server")
+            return {"location": "/x", "action": "created", "netsuite_id": "1", "last_modified": "T1"}
+
+    client = GuardClient()
+    with patch("app.tracking.record_events") as rec, \
+         patch("app.tracking.get_netsuite_last_modified", return_value="OLD"), \
+         patch("app.tracking.record_netsuite_push"):
+        out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
+    st = {r["transaction_id"]: r["status"] for r in out["results"]}
+    assert st["T-DROP"] == "skipped_modified"    # not overwritten
+    assert st["T-DSD"] == "sent"
+    assert out["summary"]["skipped_modified"] == 1
+    assert out["summary"]["sent"] == 1
+    rec.assert_called_once_with(["T-DSD"], "netsuite")   # only the sent one logged

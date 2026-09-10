@@ -65,6 +65,13 @@ def signature_base_string(method: str, url: str, oauth_params: dict) -> str:
     return "&".join([method.upper(), _pct(base_url), _pct(normalized)])
 
 
+class NetSuiteModifiedOnServer(RuntimeError):
+    """Raised when a record we were about to update has changed in NetSuite since
+    we last wrote it (optimistic lock, mirroring OMIS's NetsuiteTransaction
+    last_modified_date guard). The write is aborted and the invoice flagged for
+    manual review, rather than overwriting whatever changed."""
+
+
 class NetSuiteClient:
     """Minimal TBA-signed REST client for NetSuite record upserts.
 
@@ -157,7 +164,7 @@ class NetSuiteClient:
         return self._request(
             "PUT", f"/record/v1/{record_type}/eid:{external_id}?replace=item", json_body=body)
 
-    def upsert_invoice(self, record: dict) -> dict:
+    def upsert_invoice(self, record: dict, guard_last_modified: str | None = None) -> dict:
         """Upsert one NetSuite invoice. `record` is a REST invoice body carrying
         an externalId (build it with app.netsuite_payload.build_invoice_payload
         from the line records app.netsuite.transform_invoice emits). Accounting
@@ -166,25 +173,38 @@ class NetSuiteClient:
         external_id = record.get("externalId") or record.get("external_id")
         if not external_id:
             raise ValueError("invoice record needs an externalId")
-        # Look before we write: is there already a record under OUR externalId?
-        # Purely to label the result created-vs-updated for the audit trail; the
-        # write below (PUT .../eid:) targets our externalId either way, so it can
-        # only update a record we created and never one from another source.
-        existed = self._exists_by_external_id("invoice", external_id)
+        # Look before we write. The PUT (.../eid:) targets OUR externalId, so it
+        # can only ever touch a record we created -- never another source's. The
+        # guard adds OMIS's second layer: if the record exists and its current
+        # lastModifiedDate no longer matches `guard_last_modified` (what we
+        # recorded when WE last wrote it), it was changed in NetSuite since -- so
+        # we ABORT rather than clobber that change.
+        existing = self.get_by_external_id("invoice", external_id)
+        if existing is not None and guard_last_modified is not None:
+            current = existing.get("lastModifiedDate")
+            if current != guard_last_modified:
+                raise NetSuiteModifiedOnServer(
+                    f"invoice {external_id} changed in NetSuite since our last push "
+                    f"(recorded {guard_last_modified!r}, now {current!r}); not overwriting")
         result = self.upsert_record("invoice", external_id, record)
         if isinstance(result, dict):
-            result["action"] = "updated" if existed else "created"
+            result["action"] = "updated" if existing is not None else "created"
+            # Read the record back so the caller can store the NEW lastModifiedDate
+            # as the next push's guard (OMIS does the same via update_from_netsuite!).
+            after = self.get_by_external_id("invoice", external_id)
+            if after is not None:
+                result["netsuite_id"] = after.get("id")
+                result["last_modified"] = after.get("lastModifiedDate")
         return result
 
-    def _exists_by_external_id(self, record_type: str, external_id: str) -> bool:
-        """True if a record already exists under our externalId (GET eid: -> 200),
-        False on 404. Read-only; used only to label an upsert created/updated."""
+    def get_by_external_id(self, record_type: str, external_id: str):
+        """The record under our externalId as a dict, or None on 404. Read-only --
+        used to decide created-vs-updated and to read lastModifiedDate for the guard."""
         try:
-            self._request("GET", f"/record/v1/{record_type}/eid:{external_id}")
-            return True
+            return self._request("GET", f"/record/v1/{record_type}/eid:{external_id}")
         except NetSuiteUnavailable as exc:
             if "-> 404" in str(exc):
-                return False
+                return None
             raise
 
     def get_record(self, record_type: str, record_id: str, expand: bool = True) -> dict:
