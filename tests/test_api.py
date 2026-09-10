@@ -496,3 +496,15 @@ def test_netsuite_push_runs_before_business_hours(monkeypatch, tmp_path):
     assert (push["hour"], push["minute"]) == (5, 0)
     assert (refresh["hour"], refresh["minute"]) == (4, 45)
     assert refresh["hour"] < push["hour"]        # sync precedes the push
+
+
+def test_reportable_defers_send_success_without_warning(capsys):
+    """Send_Success is a transient CRSTL state (810 transmitted to HD, not yet
+    acknowledged) -- deferred like a Draft, and NOT warned about. We only book
+    invoices HD has Accepted."""
+    from app.main import _reportable
+    rows = [{"status": "Send_Success", "transaction_id": "t1"},
+            {"status": "Accepted", "transaction_id": "t2"}]
+    kept = _reportable(rows)
+    assert [r["transaction_id"] for r in kept] == ["t2"]      # Send_Success deferred
+    assert "Send_Success" not in capsys.readouterr().out      # known state -> no warning

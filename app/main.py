@@ -413,9 +413,12 @@ def _generate_netsuite_export() -> None:
 # This is an allowlist, not a "skip Draft" rule: an unrecognised state must not
 # quietly reach accounting. The trade-off is that a NEW good state would be
 # filtered out instead, so _reportable logs anything it drops that is not a
-# known Draft. Only "Draft" and "Accepted" have ever been observed.
+# known non-terminal state. Observed: "Accepted" (terminal, reportable), "Draft"
+# and "Send_Success" (both non-terminal -- a Send_Success 810 has been transmitted
+# to HD but not yet acknowledged, so it is deferred like a Draft until it becomes
+# Accepted). We only book invoices HD has ACCEPTED.
 REPORTABLE_STATUSES = frozenset({"Accepted"})
-_KNOWN_UNREPORTABLE = frozenset({"Draft"})
+_KNOWN_UNREPORTABLE = frozenset({"Draft", "Send_Success"})
 
 
 def _reportable(invoices: list[dict]) -> list[dict]:
