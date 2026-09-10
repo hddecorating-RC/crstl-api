@@ -114,12 +114,14 @@
                  etc., without losing the Draft/Sent status filter. -->
             <select x-model="exportStateFilter" @change="currentPage = 1"
                     class="px-3 py-1.5 text-xs border border-gray-200 rounded-full bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-600"
-                    title="Filter by workbook download / email digest history">
-              <option value="Any">All export states</option>
+                    title="Filter by NetSuite push / email / CSV export history">
+              <option value="Any">All states</option>
+              <option value="Pushed">Pushed to NetSuite ⬡</option>
+              <option value="NotPushed">Not pushed to NetSuite</option>
               <option value="Emailed">Emailed ✉</option>
               <option value="NotEmailed">Not emailed</option>
-              <option value="Exported">Exported ↓</option>
-              <option value="NotExported">Not exported</option>
+              <option value="Exported">CSV exported ↓</option>
+              <option value="NotExported">Not CSV exported</option>
             </select>
           </div>
         </template>
@@ -160,7 +162,7 @@
       <div class="h-full bg-white border border-gray-200 rounded-lg overflow-hidden flex flex-col">
         <!-- Table header -->
         <div class="grid text-xs font-semibold text-gray-400 uppercase tracking-wide px-4 py-2 border-b border-gray-100 bg-gray-50"
-             style="grid-template-columns: 32px 1fr 1fr 100px 80px 90px 70px">
+             style="grid-template-columns: 32px 1fr 1fr 100px 80px 90px 100px 70px">
           <span><input type="checkbox" @change="toggleAll($event)" class="w-3.5 h-3.5"></span>
           <button @click="toggleSort('invoice_number')" class="text-left hover:text-slate-700 flex items-center gap-1">
             Invoice #<span class="text-[10px]" x-text="sortArrow('invoice_number')"></span>
@@ -177,8 +179,11 @@
           <button @click="toggleSort('status')" class="text-left hover:text-slate-700 flex items-center gap-1">
             Status<span class="text-[10px]" x-text="sortArrow('status')"></span>
           </button>
+          <button @click="toggleSort('netsuite_at')" class="text-left hover:text-slate-700 flex items-center gap-1">
+            NetSuite<span class="text-[10px]" x-text="sortArrow('netsuite_at')"></span>
+          </button>
           <button @click="toggleSort('exported_at')" class="text-left hover:text-slate-700 flex items-center gap-1">
-            Exported<span class="text-[10px]" x-text="sortArrow('exported_at')"></span>
+            CSV<span class="text-[10px]" x-text="sortArrow('exported_at')"></span>
           </button>
         </div>
         <!-- Rows -->
@@ -196,7 +201,7 @@
                the fallback is cheap insurance. -->
           <template x-for="(inv, i) in pagedInvoices" :key="inv.transaction_id || i">
             <div class="grid items-center px-4 py-2.5 border-b border-gray-50 cursor-pointer hover:bg-gray-50 text-sm transition"
-                 style="grid-template-columns: 32px 1fr 1fr 100px 80px 90px 70px"
+                 style="grid-template-columns: 32px 1fr 1fr 100px 80px 90px 100px 70px"
                  :class="{'row-selected': selected.has(inv.transaction_id), 'row-active border-l-2 border-l-blue-500': activeInvoice?.transaction_id === inv.transaction_id}"
                  @click.self="selectInvoice(inv)">
               <span><input type="checkbox" :checked="selected.has(inv.transaction_id)"
@@ -207,6 +212,13 @@
               <span class="font-medium" @click="selectInvoice(inv)" x-text="fmtMoney(inv.total_amount)"></span>
               <span @click="selectInvoice(inv)">
                 <span :class="statusClass(inv.status)" class="px-2 py-0.5 rounded-full text-xs font-medium" x-text="inv.status || '—'"></span>
+              </span>
+              <span @click="selectInvoice(inv)">
+                <span x-show="inv.netsuite_at"
+                      class="px-1.5 py-0.5 rounded text-xs bg-green-50 text-green-700 font-medium"
+                      :title="inv.netsuite_at ? 'Pushed to NetSuite ' + fmtTime(inv.netsuite_at) : ''"
+                      x-text="inv.netsuite_at ? '⬡ ' + fmtDate(inv.netsuite_at) : ''"></span>
+                <span x-show="!inv.netsuite_at" class="text-gray-300 text-xs">—</span>
               </span>
               <span @click="selectInvoice(inv)">
                 <span x-show="inv.exported_at"
@@ -602,7 +614,7 @@ function dashboard() {
     selected: new Set(),
     activeFilter: 'Sent',   // default view = Sent; a saved choice overrides in init()
     // Export-state dimension, independent of status filter above.
-    // 'Any' | 'Emailed' | 'NotEmailed' | 'Exported' | 'NotExported'
+    // 'Any' | 'Pushed' | 'NotPushed' | 'Emailed' | 'NotEmailed' | 'Exported' | 'NotExported'
     exportStateFilter: 'Any',
     search: '',
     dateFrom: '',
@@ -944,6 +956,8 @@ function dashboard() {
         const es = this.exportStateFilter;
         const matchExport =
           es === 'Any' ||
+          (es === 'Pushed'       && !!inv.netsuite_at) ||
+          (es === 'NotPushed'    && !inv.netsuite_at) ||
           (es === 'Emailed'      && !!inv.emailed_at) ||
           (es === 'NotEmailed'   && !inv.emailed_at) ||
           (es === 'Exported'     && !!inv.exported_at) ||
@@ -985,7 +999,7 @@ function dashboard() {
         this.sortKey = key;
         // Sensible defaults: dates and totals go desc first (most recent / biggest);
         // text columns go asc first (A→Z).
-        this.sortDir = (key === 'invoice_date' || key === 'total_amount' || key === 'exported_at') ? 'desc' : 'asc';
+        this.sortDir = (key === 'invoice_date' || key === 'total_amount' || key === 'exported_at' || key === 'netsuite_at') ? 'desc' : 'asc';
       }
       this.currentPage = 1;
     },
