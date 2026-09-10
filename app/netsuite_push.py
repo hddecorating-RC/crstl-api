@@ -20,7 +20,7 @@ Results are plain JSON-serialisable dicts so the API can return them directly.
 """
 from __future__ import annotations
 
-from app.netsuite import transform_invoice
+from app.netsuite import transform_invoice, amount_flag
 from app.netsuite_payload import build_invoice_payload, load_refs, unresolved_ids
 
 
@@ -148,6 +148,7 @@ def push_invoices(
             "status": "built",
             **_reconcile(inv, lines),
         }
+        row["amount_flag"] = amount_flag(row.get("gross"), row["channel"])
         for tag in unresolved_ids(lines, refs):
             if tag not in unresolved:
                 unresolved.append(tag)

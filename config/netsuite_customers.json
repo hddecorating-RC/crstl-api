@@ -46,6 +46,11 @@
   "_comment_product_items": "Merchandise item by product. Dropship blinds book to the blinds item (its own revenue GL 40800 Sales: Blinds); drape panels + DSD (drapery) book to Drapery Panels (GL 40700). `item` above is the fallback for Unknown/unmapped.",
   "product_items": {"Blind": "warehouse Blinds", "Drape Panel": "Drapery Panels"},
   "currency": "CAD",
+  "_comment_amount_guards": "SOFT per-channel gross bounds -- ADVISORY only, never blocks a push; flags outliers for review before they hit the GL. STARTER values with headroom over observed data (DSD ~$50-45k, dropship ~$10-3.6k as of 2026-09-10). Tighten to your risk tolerance.",
+  "amount_guards": {
+    "dsd": {"floor": 10, "ceiling": 75000},
+    "dropship": {"floor": 2, "ceiling": 10000}
+  },
 
   "_comment_discount": "Vendor discount per Backward Calculator V5 (== HD Canada Invoice Allowance Spec). Booked in NetSuite as a percentage DISCOUNT item (itemType Discount) that carries the rate on the item itself; the connector emits one gross merchandise line + one discount-item line, both under the province tax code so NetSuite taxes the NET. DSD applies trade+IBx+RDC off gross and MET off the post-(trade+def+IBx) subtotal => 6.19% off gross (NetSuite item 194744, rate 6.19, verified 2026-09-09). Dropship drops freight+RDC => 5.19% (item to be created, rate 5.19). `rate` here must equal the NetSuite item's stored rate; it is used to compute the line amount (and drives the interim CSV path, which cannot recompute a percentage item).",
   "channel_discounts": {

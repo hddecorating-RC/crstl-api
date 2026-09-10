@@ -340,3 +340,17 @@ def test_external_id_rejects_unsafe_source_document_id():
             external_id_for({"source_document_id": bad})
     # a clean Mongo-style id is fine
     assert external_id_for({"source_document_id": "6aa1b5e6956e73c8eaa65c52"}) == "CRSTL-6aa1b5e6956e73c8eaa65c52"
+
+
+def test_amount_flag_soft_per_channel_bounds():
+    from app.netsuite import amount_flag
+    cfg = {"amount_guards": {"dsd": {"floor": 10, "ceiling": 75000},
+                             "dropship": {"floor": 2, "ceiling": 10000}}}
+    assert amount_flag(50000, "dsd", cfg) is None            # within DSD range
+    assert amount_flag(200000, "dsd", cfg) == "above_ceiling"
+    assert amount_flag(5, "dsd", cfg) == "below_floor"
+    assert amount_flag(50000, "dropship", cfg) == "above_ceiling"  # huge for dropship
+    assert amount_flag(1, "dropship", cfg) == "below_floor"
+    assert amount_flag(100, "dropship", cfg) is None
+    assert amount_flag(100, "nochannel", cfg) is None        # no bounds -> no flag
+    assert amount_flag(None, "dsd", cfg) is None

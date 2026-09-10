@@ -18,6 +18,8 @@ CONFIG = {
         "dsd": {"item": "-6.19% vendor discounts", "rate": 0.0619, "note": "n"},
         "dropship": {"item": "-5.19% vendor discounts", "rate": 0.0519, "note": "n"},
     },
+    "amount_guards": {"dsd": {"floor": 1, "ceiling": 100000},
+                      "dropship": {"floor": 1, "ceiling": 100000}},
 }
 
 # refs with the dropship discount item still UNRESOLVED (blank id)
@@ -246,3 +248,14 @@ def test_push_invoices_skips_no_baseline_never_overwrites():
     assert st["T-DSD"] == "sent"
     assert out["summary"]["skipped_no_baseline"] == 1
     rec.assert_called_once_with(["T-DSD"], "netsuite")
+
+
+def test_amount_flag_is_advisory_not_blocking():
+    """H3: an out-of-range gross is FLAGGED on the row but still built/pushed --
+    soft guard, never blocks."""
+    big = {**INVOICES[1], "transaction_id": "T-BIG", "source_document_id": "S-BIG",
+           "subtotal": 999999.0, "total_amount": 999999.0}   # dropship, way over ceiling
+    out = push_invoices([big], live=False, refs=REFS_FULL)
+    r = out["results"][0]
+    assert r["status"] == "built"              # NOT blocked
+    assert r["amount_flag"] == "above_ceiling"

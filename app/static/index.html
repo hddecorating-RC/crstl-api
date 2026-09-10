@@ -524,7 +524,9 @@
                 <td class="pr-2 text-gray-500" x-text="r.where || ''"></td>
                 <td class="pr-3 text-slate-600" :title="r.customer_id ? ('id ' + r.customer_id) : ''"
                     x-text="r.customer_name || (r.customer_id ? ('id ' + r.customer_id) : '—')"></td>
-                <td class="pr-3 text-right tabular-nums" x-text="r.gross != null ? fmtMoney(r.gross) : ''"></td>
+                <td class="pr-3 text-right tabular-nums" :class="r.amount_flag ? 'text-amber-600 font-semibold' : ''"
+                    :title="r.amount_flag === 'above_ceiling' ? 'Above the channel ceiling — review' : (r.amount_flag === 'below_floor' ? 'Below the channel floor — review' : '')"
+                    x-text="(r.amount_flag ? '⚠ ' : '') + (r.gross != null ? fmtMoney(r.gross) : '')"></td>
                 <td class="pr-3 text-right tabular-nums text-gray-500" x-text="r.discount != null ? fmtMoney(r.discount) : ''"></td>
                 <td class="pr-3 text-right tabular-nums" x-text="r.net != null ? fmtMoney(r.net) : ''"></td>
                 <td class="pr-3 text-right tabular-nums text-gray-500" x-text="r.tax != null ? fmtMoney(r.tax) : ''"></td>

@@ -40,6 +40,24 @@ def external_id_for(invoice: dict) -> str:
     return f"CRSTL-{sid}"
 
 
+def amount_flag(gross, channel: str, config: dict | None = None) -> str | None:
+    """Soft per-channel bounds check on the invoice gross. Returns None if within
+    the channel's [floor, ceiling], else "below_floor" / "above_ceiling". ADVISORY
+    only -- it never blocks a push; it flags outliers for review, since DSD and
+    dropship live in very different ranges and a wildly off amount is worth a look
+    before it books to the GL (config: amount_guards)."""
+    if gross is None or not channel:
+        return None
+    g = (config or _load_config()).get("amount_guards", {}).get(channel)
+    if not g:
+        return None
+    if g.get("floor") is not None and gross < g["floor"]:
+        return "below_floor"
+    if g.get("ceiling") is not None and gross > g["ceiling"]:
+        return "above_ceiling"
+    return None
+
+
 def resolve_customer(invoice: dict, province, store, config: dict | None = None) -> dict | None:
     """The NetSuite customer + channel this invoice routes to, or None if it can't
     be routed (no province/store mapping, or a Mixed/Unknown dropship product).
