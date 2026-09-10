@@ -32,12 +32,12 @@
   "channel_discounts": {
     "dsd": {
       "item": "-6.19% vendor discounts",
-      "rate": 0.0619,
+      "rate": 0.0618875,
       "note": "Base price - (0.50% trade + 1.25% IBx + 1.00% RDC off gross) - 3.5% MET off subtotal = 6.19% off gross (Backward Calculator V5)."
     },
     "dropship": {
       "item": "-5.19% dropship discount",
-      "rate": 0.0519,
+      "rate": 0.0518875,
       "note": "Base price - (0.50% trade + 1.25% IBx off gross) - 3.5% MET off subtotal = 5.19% off gross; drops freight + RDC (Backward Calculator V5)."
     }
   },
