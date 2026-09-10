@@ -72,6 +72,14 @@ class NetSuiteModifiedOnServer(RuntimeError):
     manual review, rather than overwriting whatever changed."""
 
 
+class NetSuiteNoBaseline(RuntimeError):
+    """Raised when a record already EXISTS in NetSuite under our externalId but we
+    have NO local baseline (lastModifiedDate) for it -- e.g. tracking.db was lost
+    or restored from an old backup. We refuse to overwrite something we have no
+    memory of writing (it could carry manual edits); the invoice is flagged for a
+    deliberate reseed instead."""
+
+
 class NetSuiteClient:
     """Minimal TBA-signed REST client for NetSuite record upserts.
 
@@ -180,7 +188,13 @@ class NetSuiteClient:
         # recorded when WE last wrote it), it was changed in NetSuite since -- so
         # we ABORT rather than clobber that change.
         existing = self.get_by_external_id("invoice", external_id)
-        if existing is not None and guard_last_modified is not None:
+        if existing is not None:
+            if guard_last_modified is None:
+                # The record exists but we have no memory of writing it (tracking.db
+                # lost/reset). Refuse to overwrite -- it may hold manual edits. (M2)
+                raise NetSuiteNoBaseline(
+                    f"invoice {external_id} exists in NetSuite but we have no local baseline "
+                    "for it (tracking.db lost or reset?); refusing to overwrite -- reseed required")
             current = existing.get("lastModifiedDate")
             if current != guard_last_modified:
                 raise NetSuiteModifiedOnServer(

@@ -459,6 +459,7 @@ def _netsuite_push_digest_html() -> str:
     sent = [r for r in results if r.get("status") == "sent"]
     failed = [r for r in results if r.get("status") == "failed"]
     skipped_mod = [r for r in results if r.get("status") == "skipped_modified"]
+    skipped_nb = [r for r in results if r.get("status") == "skipped_no_baseline"]
     created = sum(1 for r in sent if r.get("action") == "created")
     updated = sum(1 for r in sent if r.get("action") == "updated")
     total = sum((r.get("total") or 0) for r in sent)
@@ -470,6 +471,7 @@ def _netsuite_push_digest_html() -> str:
               f"&middot; total ${total:,.2f} CAD"
               + (f" &middot; <span style='color:#b32020'>{len(failed)} failed</span>" if failed else "")
               + (f" &middot; <span style='color:#b45309'>{len(skipped_mod)} skipped (changed on server)</span>" if skipped_mod else "")
+              + (f" &middot; <span style='color:#b32020'>{len(skipped_nb)} skipped (NO BASELINE -- tracking.db lost?)</span>" if skipped_nb else "")
               + "</p>")
     if st.get("blocked"):
         header += f"<p style='color:#b45309'><strong>Blocked:</strong> {html.escape(str(st['blocked']))}</p>"

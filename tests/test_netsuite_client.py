@@ -131,7 +131,7 @@ def test_upsert_invoice_puts_to_the_external_id_url():
     client = NetSuiteClient(**CREDS)
     client.session = _FakeSession(_FakeResponse(200, content=b'{"id":"987","lastModifiedDate":"2026-09-10T12:00:00Z"}'))
 
-    result = client.upsert_invoice({"externalId": "TXN-123", "entity": {"id": "4147"}})
+    result = client.upsert_invoice({"externalId": "TXN-123", "entity": {"id": "4147"}}, guard_last_modified="2026-09-10T12:00:00Z")
 
     # GET (pre: exists + guard) -> PUT (write) -> GET (post: new baseline)
     assert [c["method"] for c in client.session.calls] == ["GET", "PUT", "GET"]
@@ -233,7 +233,18 @@ def test_upsert_invoice_percent_encodes_the_external_id():
     from app.netsuite_client import NetSuiteClient
     client = NetSuiteClient(**CREDS)
     client.session = _FakeSession(_FakeResponse(200, content=b'{"id":"1","lastModifiedDate":"T"}'))
-    client.upsert_invoice({"externalId": "CRSTL-x?replace=none&y"})
+    client.upsert_invoice({"externalId": "CRSTL-x?replace=none&y"}, guard_last_modified="T")
     put = [c for c in client.session.calls if c["method"] == "PUT"][0]
     assert "?replace=none" not in put["url"]          # the injected query is gone
     assert "eid:CRSTL-x%3Freplace%3Dnone%26y?replace=item" in put["url"]
+
+
+def test_upsert_invoice_refuses_when_record_exists_but_no_baseline():
+    """M2: a record exists in NetSuite but we have no local baseline (guard None,
+    e.g. tracking.db lost) -> refuse to overwrite (no PUT)."""
+    from app.netsuite_client import NetSuiteClient, NetSuiteNoBaseline
+    client = NetSuiteClient(**CREDS)
+    client.session = _FakeSession(_FakeResponse(200, content=b'{"id":"9","lastModifiedDate":"X"}'))
+    with pytest.raises(NetSuiteNoBaseline):
+        client.upsert_invoice({"externalId": "TXN-123"})   # no guard
+    assert [c["method"] for c in client.session.calls] == ["GET"]   # only the pre-check, no PUT

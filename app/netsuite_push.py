@@ -117,6 +117,7 @@ def push_invoices(
     unresolved: list[str] = []
     skipped_no_map = 0
     skipped_invalid = 0
+    skipped_no_baseline = 0
 
     for inv in invoices:
         tid = str(inv.get("transaction_id", "?"))
@@ -162,9 +163,9 @@ def push_invoices(
             return {"mode": mode, "unresolved": unresolved, "results": results,
                     "summary": {"built": len(prepared), "sent": 0, "failed": 0,
                                 "skipped_no_map": skipped_no_map, "skipped_modified": 0,
-                                "skipped_invalid": skipped_invalid},
+                                "skipped_invalid": skipped_invalid, "skipped_no_baseline": skipped_no_baseline},
                     "blocked": "unresolved ids"}
-        from app.netsuite_client import NetSuiteClient, NetSuiteUnavailable, NetSuiteModifiedOnServer
+        from app.netsuite_client import NetSuiteClient, NetSuiteUnavailable, NetSuiteModifiedOnServer, NetSuiteNoBaseline
         from app import tracking
         if client is None:
             if not NetSuiteClient.configured():
@@ -191,6 +192,12 @@ def push_invoices(
                     tracking.record_netsuite_push(eid, result.get("netsuite_id"), result.get("last_modified"))
                 sent += 1
                 pushed_ids.append(row["transaction_id"])
+            except NetSuiteNoBaseline as exc:
+                # Record exists but we have no baseline (tracking.db lost). Do NOT
+                # overwrite -- flag for a deliberate reseed. (M2)
+                row["status"] = "skipped_no_baseline"
+                row["error"] = str(exc)
+                skipped_no_baseline += 1
             except NetSuiteModifiedOnServer as exc:
                 # OMIS's "Record modified on server!" -- do NOT overwrite; flag it.
                 row["status"] = "skipped_modified"
@@ -214,5 +221,5 @@ def push_invoices(
         "results": results,
         "summary": {"built": len(prepared), "sent": sent, "failed": failed,
                     "skipped_no_map": skipped_no_map, "skipped_modified": skipped_modified,
-                    "skipped_invalid": skipped_invalid},
+                    "skipped_invalid": skipped_invalid, "skipped_no_baseline": skipped_no_baseline},
     }

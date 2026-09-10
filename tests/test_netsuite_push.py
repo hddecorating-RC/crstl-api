@@ -64,7 +64,7 @@ def test_dry_run_builds_and_reconciles_without_sending():
     with patch("app.tracking.record_events") as rec:
         out = push_invoices(INVOICES, live=False, refs=REFS_PARTIAL)
     assert out["mode"] == "dry"
-    assert out["summary"] == {"built": 2, "sent": 0, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0}
+    assert out["summary"] == {"built": 2, "sent": 0, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0, "skipped_no_baseline": 0}
     dsd = next(r for r in out["results"] if r["transaction_id"] == "T-DSD")
     assert dsd["channel"] == "dsd" and dsd["status"] == "built"
     assert dsd["gross"] == 100.0 and dsd["discount"] == -6.19 and dsd["net"] == 93.81
@@ -94,7 +94,7 @@ def test_live_sends_and_records_tracking():
          patch("app.tracking.record_netsuite_push"):
         out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
     assert out["mode"] == "live"
-    assert out["summary"] == {"built": 2, "sent": 2, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0}
+    assert out["summary"] == {"built": 2, "sent": 2, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0, "skipped_no_baseline": 0}
     assert len(client.calls) == 2
     sent = [r for r in out["results"] if r["status"] == "sent"]
     assert {r["transaction_id"] for r in sent} == {"T-DSD", "T-DROP"}
@@ -108,7 +108,7 @@ def test_live_one_failure_does_not_stop_the_batch():
          patch("app.tracking.get_netsuite_last_modified", return_value=None), \
          patch("app.tracking.record_netsuite_push"):
         out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
-    assert out["summary"] == {"built": 2, "sent": 1, "failed": 1, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0}
+    assert out["summary"] == {"built": 2, "sent": 1, "failed": 1, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0, "skipped_no_baseline": 0}
     failed = next(r for r in out["results"] if r["status"] == "failed")
     assert failed["transaction_id"] == "T-DROP" and "boom" in failed["error"]
     # only the successful one is logged
@@ -220,3 +220,29 @@ def test_push_invoices_skips_unsafe_source_document_id():
     assert st["T-BAD"] == "skipped_invalid"
     assert st["T-DSD"] == "built"
     assert out["summary"]["skipped_invalid"] == 1
+
+
+def test_push_invoices_skips_no_baseline_never_overwrites():
+    """M2: if the client reports a record exists with no baseline, the engine skips
+    it (skipped_no_baseline) and continues -- it never overwrites."""
+    from app.netsuite_client import NetSuiteNoBaseline
+
+    class NoBaseClient:
+        def __init__(self):
+            self.calls = []
+        def upsert_invoice(self, payload, guard_last_modified=None):
+            self.calls.append(payload["externalId"])
+            if payload["externalId"] == "CRSTL-S-DROP":
+                raise NetSuiteNoBaseline("no baseline for this record")
+            return {"location": "/x", "action": "created", "netsuite_id": "1", "last_modified": "T"}
+
+    client = NoBaseClient()
+    with patch("app.tracking.record_events") as rec, \
+         patch("app.tracking.get_netsuite_last_modified", return_value=None), \
+         patch("app.tracking.record_netsuite_push"):
+        out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
+    st = {r["transaction_id"]: r["status"] for r in out["results"]}
+    assert st["T-DROP"] == "skipped_no_baseline"    # not overwritten
+    assert st["T-DSD"] == "sent"
+    assert out["summary"]["skipped_no_baseline"] == 1
+    rec.assert_called_once_with(["T-DSD"], "netsuite")
