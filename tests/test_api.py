@@ -10,6 +10,7 @@ from app.report import XLSX_MEDIA_TYPE
 MOCK_INVOICES = [
     {
         "transaction_id": "tx-001",
+        "source_document_id": "src-tx-001",
         "invoice_number": "INV-001",
         "po_number": "PO-123",
         "trading_partner": "Home Depot",

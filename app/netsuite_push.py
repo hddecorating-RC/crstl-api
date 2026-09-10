@@ -44,6 +44,30 @@ def _reconcile(inv: dict, lines: list[dict]) -> dict:
     }
 
 
+def select_latest_accepted(invoices: list[dict]) -> list[dict]:
+    """One invoice per logical invoice (source_document_id), Accepted only.
+
+    CRSTL sends many rows per invoice -- drafts plus resubmissions -- each with
+    its own transaction_id but a shared source_document_id. We push only rows HD
+    has Accepted, and when several Accepted versions exist we keep the LATEST (by
+    invoice_date, then transaction_id, whose ObjectId embeds creation time) so a
+    stale version can't win the upsert. Rows that are not Accepted, or carry no
+    source_document_id, are dropped. Order of the returned list is not defined.
+    """
+    best: dict[str, dict] = {}
+    for inv in invoices:
+        if (inv.get("status") or "") != "Accepted":
+            continue
+        sid = str(inv.get("source_document_id") or "").strip()
+        if not sid:
+            continue
+        key = (str(inv.get("invoice_date") or ""), str(inv.get("transaction_id") or ""))
+        cur = best.get(sid)
+        if cur is None or key > (str(cur.get("invoice_date") or ""), str(cur.get("transaction_id") or "")):
+            best[sid] = inv
+    return list(best.values())
+
+
 def _select(invoices: list[dict], only: list[str] | None, limit: int | None) -> list[dict]:
     if only:
         wanted = {str(x) for x in only}
@@ -128,6 +152,10 @@ def push_invoices(
                 result = client.upsert_invoice(payload)
                 row["status"] = "sent"
                 row["location"] = result.get("location") or result
+                # "created" vs "updated" from the client's pre-write existence
+                # check -- the audit trail that proves a re-push UPDATED our own
+                # record and never created a duplicate or touched another source.
+                row["action"] = result.get("action") if isinstance(result, dict) else None
                 sent += 1
                 pushed_ids.append(row["transaction_id"])
             except Exception as exc:  # one bad invoice must not stop the batch

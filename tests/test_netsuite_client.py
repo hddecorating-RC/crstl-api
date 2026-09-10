@@ -133,11 +133,15 @@ def test_upsert_invoice_puts_to_the_external_id_url():
 
     result = client.upsert_invoice({"externalId": "TXN-123", "entity": {"id": "4147"}})
 
-    call = client.session.calls[0]
-    assert call["method"] == "PUT"
-    assert call["url"].endswith("/services/rest/record/v1/invoice/eid:TXN-123?replace=item")
-    assert call["headers"]["Authorization"].startswith("OAuth ")
+    # upsert_invoice first GETs by eid (the created-vs-updated check), then PUTs.
+    get_call, put_call = client.session.calls[0], client.session.calls[1]
+    assert get_call["method"] == "GET"
+    assert get_call["url"].endswith("/record/v1/invoice/eid:TXN-123")
+    assert put_call["method"] == "PUT"
+    assert put_call["url"].endswith("/services/rest/record/v1/invoice/eid:TXN-123?replace=item")
+    assert put_call["headers"]["Authorization"].startswith("OAuth ")
     assert result["location"] == "/record/v1/invoice/987"
+    assert result["action"] == "updated"   # the GET returned 204 -> record already existed
 
 
 def test_get_record_is_read_only_with_expand():

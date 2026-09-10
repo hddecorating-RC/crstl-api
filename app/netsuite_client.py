@@ -166,7 +166,26 @@ class NetSuiteClient:
         external_id = record.get("externalId") or record.get("external_id")
         if not external_id:
             raise ValueError("invoice record needs an externalId")
-        return self.upsert_record("invoice", external_id, record)
+        # Look before we write: is there already a record under OUR externalId?
+        # Purely to label the result created-vs-updated for the audit trail; the
+        # write below (PUT .../eid:) targets our externalId either way, so it can
+        # only update a record we created and never one from another source.
+        existed = self._exists_by_external_id("invoice", external_id)
+        result = self.upsert_record("invoice", external_id, record)
+        if isinstance(result, dict):
+            result["action"] = "updated" if existed else "created"
+        return result
+
+    def _exists_by_external_id(self, record_type: str, external_id: str) -> bool:
+        """True if a record already exists under our externalId (GET eid: -> 200),
+        False on 404. Read-only; used only to label an upsert created/updated."""
+        try:
+            self._request("GET", f"/record/v1/{record_type}/eid:{external_id}")
+            return True
+        except NetSuiteUnavailable as exc:
+            if "-> 404" in str(exc):
+                return False
+            raise
 
     def get_record(self, record_type: str, record_id: str, expand: bool = True) -> dict:
         """Read one record by internal id. Read-only -- used to inspect the exact

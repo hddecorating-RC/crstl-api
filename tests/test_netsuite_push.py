@@ -31,13 +31,13 @@ REFS_FULL = {**REFS_PARTIAL,
              "item_ids": {**REFS_PARTIAL["item_ids"], "-5.19% vendor discounts": "999999"}}
 
 INVOICES = [
-    {"transaction_id": "T-DSD", "invoice_number": "INV1", "po_number": "PO1",
+    {"transaction_id": "T-DSD", "source_document_id": "S-DSD", "invoice_number": "INV1", "po_number": "PO1",
      "invoice_date": "2026-09-01", "due_date": "2026-10-01", "subtotal": 100.00,
      "total_amount": 106.00, "store": "VAUGHAN", "province": "ON"},
-    {"transaction_id": "T-DROP", "invoice_number": "INV2", "po_number": "PO2",
+    {"transaction_id": "T-DROP", "source_document_id": "S-DROP", "invoice_number": "INV2", "po_number": "PO2",
      "invoice_date": "2026-09-01", "due_date": "2026-10-01", "subtotal": 200.00,
      "total_amount": 210.00, "store": None, "province": "ON"},
-    {"transaction_id": "T-NOMAP", "invoice_number": "INV3", "po_number": "PO3",
+    {"transaction_id": "T-NOMAP", "source_document_id": "S-NOMAP", "invoice_number": "INV3", "po_number": "PO3",
      "invoice_date": "2026-09-01", "due_date": "", "subtotal": 50.00,
      "total_amount": 50.00, "store": None, "province": "XX"},
 ]
@@ -101,7 +101,7 @@ def test_live_sends_and_records_tracking():
 
 
 def test_live_one_failure_does_not_stop_the_batch():
-    client = FakeClient(fail_on={"T-DROP"})
+    client = FakeClient(fail_on={"CRSTL-S-DROP"})  # payload externalId = CRSTL-<source_document_id>
     with patch("app.tracking.record_events") as rec:
         out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
     assert out["summary"] == {"built": 2, "sent": 1, "failed": 1, "skipped_no_map": 1}
@@ -124,3 +124,17 @@ def test_limit_must_be_positive():
         push_invoices(INVOICES, live=False, refs=REFS_FULL, limit=0)
     with pytest.raises(ValueError):
         push_invoices(INVOICES, live=False, refs=REFS_FULL, limit=-1)
+
+
+def test_select_latest_accepted_dedups_by_source_doc():
+    from app.netsuite_push import select_latest_accepted
+    rows = [
+        {"source_document_id": "S1", "status": "Accepted", "invoice_date": "2026-09-01", "transaction_id": "a"},
+        {"source_document_id": "S1", "status": "Accepted", "invoice_date": "2026-09-05", "transaction_id": "b"},  # latest accepted
+        {"source_document_id": "S1", "status": "Draft",    "invoice_date": "2026-09-09", "transaction_id": "c"},  # draft ignored, even if newer
+        {"source_document_id": "S2", "status": "Draft",    "invoice_date": "2026-09-01", "transaction_id": "d"},  # no accepted -> dropped
+        {"source_document_id": "",   "status": "Accepted", "invoice_date": "2026-09-01", "transaction_id": "e"},  # no source doc -> dropped
+    ]
+    out = select_latest_accepted(rows)
+    assert {r["source_document_id"] for r in out} == {"S1"}
+    assert len(out) == 1 and out[0]["transaction_id"] == "b"

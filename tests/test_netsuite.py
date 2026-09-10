@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 SAMPLE_INVOICE = {
     "transaction_id": "tx-001",
+    "source_document_id": "src-001",
     "invoice_number": "INV-001",
     "po_number": "PO-12345",
     "invoice_date": "2026-07-07",
@@ -48,7 +49,7 @@ def test_transform_dsd_vaughan(mock_config):
     assert lines is not None and len(lines) == 2
     merch, disc = lines
 
-    assert merch["external_id"] == "tx-001"  # transaction_id — the only unique field
+    assert merch["external_id"] == "CRSTL-src-001"  # namespaced source_document_id
     assert merch["customer_id"] == "cust-vaughan"
     assert merch["tax_code"] == "HST-ON"
     assert merch["tran_date"] == "2026-07-07"
@@ -67,7 +68,7 @@ def test_transform_dsd_vaughan(mock_config):
     assert disc["tax_amount"] == 0
     assert disc["tax_code"] == "HST-ON"          # same code => reduces the taxable base
     assert disc["description"] == "DSD note"
-    assert disc["external_id"] == "tx-001"       # shares the invoice
+    assert disc["external_id"] == "CRSTL-src-001" # shares the invoice
 
 
 def test_transform_dropship_quebec(mock_config):
@@ -230,3 +231,26 @@ def test_fetch_po_provinces_still_drops_a_po_with_neither():
         result = client.fetch_po_provinces()
 
     assert result == {}
+
+
+def test_external_id_is_namespaced_source_document_id():
+    from app.netsuite import external_id_for
+    assert external_id_for({"source_document_id": "abc"}) == "CRSTL-abc"
+
+
+def test_external_id_requires_source_document_id():
+    from app.netsuite import external_id_for
+    with pytest.raises(ValueError):
+        external_id_for({"source_document_id": ""})
+
+
+def test_resubmission_shares_external_id(mock_config):
+    """Two CRSTL versions of one invoice (different transaction_id, same
+    source_document_id) map to the SAME NetSuite externalId, so a re-push updates
+    the existing record instead of creating a duplicate."""
+    from app.netsuite import transform_invoice
+    v1 = {**SAMPLE_INVOICE, "transaction_id": "tx-A", "source_document_id": "SD"}
+    v2 = {**SAMPLE_INVOICE, "transaction_id": "tx-B", "source_document_id": "SD"}
+    l1 = transform_invoice(v1, province="ON", store="VAUGHAN")
+    l2 = transform_invoice(v2, province="ON", store="VAUGHAN")
+    assert l1[0]["external_id"] == l2[0]["external_id"] == "CRSTL-SD"

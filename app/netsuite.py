@@ -9,6 +9,27 @@ def _load_config() -> dict:
     return json.loads(path.read_text())
 
 
+def external_id_for(invoice: dict) -> str:
+    """Stable NetSuite externalId for a logical HD invoice.
+
+    Keyed on CRSTL's `source_document_id`, NOT `transaction_id`. CRSTL issues a
+    NEW transaction_id for every draft / resubmission / correction of the SAME
+    invoice, but all of them share one source_document_id (verified: 235 rows =>
+    176 source docs, never spanning two POs). Keying on it means a re-pushed
+    correction UPDATES the same NetSuite invoice instead of creating a duplicate
+    -- the old transaction_id key created one NetSuite record per version.
+
+    The `CRSTL-` prefix namespaces it as ours: invoices are entered into this
+    NetSuite account from several sources, and our upsert (PUT .../eid:{id}) can
+    only ever match a record WE created. Another source's manual invoice carries
+    no such externalId, so we can never overwrite it by accident.
+    """
+    sid = str(invoice.get("source_document_id") or "").strip()
+    if not sid:
+        raise ValueError("invoice missing source_document_id (needed for a stable NetSuite externalId)")
+    return f"CRSTL-{sid}"
+
+
 def transform_invoice(invoice: dict, province: str | None, store: str | None) -> list[dict] | None:
     """
     Transform a Crstl invoice into the NetSuite line-item records for one invoice.
@@ -29,9 +50,10 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
     REST path lets NetSuite recompute, the CSV path may too) is the net * the
     province rate, placed on the merchandise line, 0 on the discount line.
 
-    `external_id` is the Crstl transaction_id -- the only field observed unique
-    per invoice (PO numbers and invoice_numbers both collide). The human-friendly
-    invoice_number rides in `memo` and (as the LEAD #) in the payload.
+    `external_id` is derived from the Crstl `source_document_id` (see
+    external_id_for): stable across a logical invoice's drafts and resubmissions,
+    so a re-push updates rather than duplicates. The human-friendly invoice_number
+    rides in `memo` and (as the LEAD #) in the payload.
     """
     config = _load_config()
 
@@ -51,7 +73,7 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
 
     try:
         base = {
-            "external_id":    invoice["transaction_id"],
+            "external_id":    external_id_for(invoice),
             "customer_id":    mapping["customer_id"],
             "tran_date":      invoice["invoice_date"],
             "due_date":       invoice["due_date"],
