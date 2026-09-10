@@ -131,6 +131,8 @@ def push_invoices(
             "invoice_number": inv.get("invoice_number"),
             "channel": "dsd" if store else "dropship",
             "where": store or province,
+            "customer_id": lines[0].get("customer_id"),
+            "customer_name": lines[0].get("customer_name"),
             "status": "built",
             **_reconcile(inv, lines),
         }

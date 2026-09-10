@@ -105,6 +105,7 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
         base = {
             "external_id":    external_id_for(invoice),
             "customer_id":    route["customer_id"],
+            "customer_name":  route["customer_name"],
             "tran_date":      invoice["invoice_date"],
             "due_date":       invoice["due_date"],
             "memo":           f'{invoice["invoice_number"]} / PO {invoice["po_number"]}',

@@ -495,7 +495,7 @@
         <table class="w-full text-xs">
           <thead class="text-gray-400 text-left">
             <tr class="border-b border-gray-200">
-              <th class="py-1.5 pr-3">Invoice</th><th class="pr-2">Ch</th><th class="pr-2">Loc</th>
+              <th class="py-1.5 pr-3">Invoice</th><th class="pr-2">Ch</th><th class="pr-2">Loc</th><th class="pr-3">Store (NetSuite)</th>
               <th class="pr-3 text-right">Gross</th><th class="pr-3 text-right">Discount</th>
               <th class="pr-3 text-right">Net</th><th class="pr-3 text-right">Tax</th>
               <th class="pr-3 text-right">Total</th>
@@ -510,6 +510,8 @@
                 <td class="py-1 pr-3 font-medium text-slate-700" x-text="r.invoice_number || r.transaction_id"></td>
                 <td class="pr-2 uppercase text-gray-500" x-text="r.channel === 'dsd' ? 'DSD' : (r.channel === 'dropship' ? 'DS' : '—')"></td>
                 <td class="pr-2 text-gray-500" x-text="r.where || ''"></td>
+                <td class="pr-3 text-slate-600" :title="r.customer_id ? ('id ' + r.customer_id) : ''"
+                    x-text="r.customer_name || (r.customer_id ? ('id ' + r.customer_id) : '—')"></td>
                 <td class="pr-3 text-right tabular-nums" x-text="r.gross != null ? fmtMoney(r.gross) : ''"></td>
                 <td class="pr-3 text-right tabular-nums text-gray-500" x-text="r.discount != null ? fmtMoney(r.discount) : ''"></td>
                 <td class="pr-3 text-right tabular-nums" x-text="r.net != null ? fmtMoney(r.net) : ''"></td>
@@ -598,7 +600,7 @@ function dashboard() {
     invoices: [],
     activeInvoice: null,
     selected: new Set(),
-    activeFilter: 'All',
+    activeFilter: 'Sent',   // default view = Sent; a saved choice overrides in init()
     // Export-state dimension, independent of status filter above.
     // 'Any' | 'Emailed' | 'NotEmailed' | 'Exported' | 'NotExported'
     exportStateFilter: 'Any',
@@ -650,6 +652,16 @@ function dashboard() {
       ['activeFilter', 'exportStateFilter', 'search', 'dateFrom', 'dateTo'].forEach(
         prop => this.$watch(prop, pruneSelection)
       );
+      // Remember the status filter across reloads. Default is Sent (set above);
+      // a previously saved choice wins. localStorage can throw (private window /
+      // storage disabled), so guard every access and fall back to the default.
+      try {
+        const saved = localStorage.getItem('crstl.activeFilter');
+        if (['All', 'Draft', 'Sent'].includes(saved)) this.activeFilter = saved;
+      } catch (e) {}
+      this.$watch('activeFilter', v => {
+        try { localStorage.setItem('crstl.activeFilter', v); } catch (e) {}
+      });
       await this.loadInvoices();
       await this.loadNetsuiteStatus();
       await this.loadNetsuitePush();
