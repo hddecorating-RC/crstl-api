@@ -5,6 +5,7 @@ from unittest.mock import patch
 SAMPLE_INVOICE = {
     "transaction_id": "tx-001",
     "source_document_id": "src-001",
+    "product": "Drape Panel",
     "invoice_number": "INV-001",
     "po_number": "PO-12345",
     "invoice_date": "2026-07-07",
@@ -26,6 +27,7 @@ SAMPLE_CONFIG = {
         "QC": {"customer_id": "cust-qc", "tax_code": "GST+QST", "tax_rate": 0.14975},
         "ON": {"customer_id": "cust-on-ds", "tax_code": "HST-ON", "tax_rate": 0.13},
     },
+    "dropship_blinds": {"QC": "blind-qc", "ON": "blind-on"},
     "item": "Drapery Panels",
     "currency": "CAD",
     "channel_discounts": {
@@ -254,3 +256,53 @@ def test_resubmission_shares_external_id(mock_config):
     l1 = transform_invoice(v1, province="ON", store="VAUGHAN")
     l2 = transform_invoice(v2, province="ON", store="VAUGHAN")
     assert l1[0]["external_id"] == l2[0]["external_id"] == "CRSTL-SD"
+
+
+def test_dropship_blind_routes_to_blinds_customer(mock_config):
+    """A dropship BLIND bills to the province's blinds customer; tax still follows
+    the province (unchanged)."""
+    from app.netsuite import transform_invoice
+    inv = {**SAMPLE_INVOICE, "product": "Blind"}
+    lines = transform_invoice(inv, province="QC", store=None)
+    assert lines is not None
+    assert lines[0]["customer_id"] == "blind-qc"     # blinds customer, not cust-qc
+    assert lines[0]["tax_code"] == "GST+QST"          # tax unchanged -- by province
+
+
+def test_dropship_panel_routes_to_panels_customer(mock_config):
+    from app.netsuite import transform_invoice
+    inv = {**SAMPLE_INVOICE, "product": "Drape Panel"}
+    lines = transform_invoice(inv, province="QC", store=None)
+    assert lines[0]["customer_id"] == "cust-qc"      # existing (panels) customer
+
+
+def test_dropship_unknown_product_is_skipped(mock_config):
+    """Mixed/Unknown can't be routed to a blinds-vs-panels customer -> skipped."""
+    from app.netsuite import transform_invoice
+    for prod in ("Unknown", "Mixed", "", None):
+        inv = {**SAMPLE_INVOICE, "product": prod}
+        assert transform_invoice(inv, province="QC", store=None) is None
+
+
+def test_dsd_ignores_product_routing(mock_config):
+    """DSD is drapery only -- it always uses its store customer regardless of the
+    product field."""
+    from app.netsuite import transform_invoice
+    inv = {**SAMPLE_INVOICE, "product": "Blind"}   # even if mislabeled
+    lines = transform_invoice(inv, province="ON", store="VAUGHAN")
+    assert lines[0]["customer_id"] == "cust-vaughan"
+
+
+def test_dropship_blind_without_blinds_customer_is_skipped(mock_config):
+    """A blind in a province that has no blinds customer configured is skipped,
+    not booked to the panels customer by accident."""
+    from app.netsuite import transform_invoice
+    inv = {**SAMPLE_INVOICE, "product": "Blind"}
+    # SAMPLE_CONFIG has no BC in dropship_blinds; add BC dropship province first
+    import app.netsuite as ns
+    cfg = dict(SAMPLE_CONFIG)
+    cfg["dropship_provinces"] = {**cfg["dropship_provinces"],
+                                 "BC": {"customer_id": "cust-bc", "tax_code": "GST", "tax_rate": 0.05}}
+    from unittest.mock import patch
+    with patch("app.netsuite._load_config", return_value=cfg):
+        assert transform_invoice(inv, province="BC", store=None) is None

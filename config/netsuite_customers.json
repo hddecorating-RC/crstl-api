@@ -25,6 +25,11 @@
     "QC": {"customer_id": "4146", "tax_code": "CA-S-QST", "tax_rate": 0.14975},
     "SK": {"customer_id": "4149", "tax_code": "CA-GST 5%", "tax_rate": 0.05}
   },
+  "_comment_dropship_blinds": "Dropship BLINDS bill to a per-province blinds customer (verified NetSuite names 'ON BLINDS ON LINE' etc., 2026-09-10). Dropship DRAPE PANELS keep the dropship_provinces (panels) customers above; DSD is drapery only. Tax always follows the province, never the product. Product is classified from the 850 vendor item number (app/products.py); Mixed/Unknown are skipped, not guessed.",
+  "dropship_blinds": {
+    "AB": "4190", "BC": "4199", "MB": "4192", "NB": "4200", "NL": "4193",
+    "NS": "4194", "ON": "4189", "PE": "4201", "QC": "4195", "SK": "4202"
+  },
   "item": "Drapery Panels",
   "currency": "CAD",
 

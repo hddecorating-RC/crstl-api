@@ -69,12 +69,27 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
     if not mapping:
         return None
 
+    # Customer routing. DSD is drapery only -> its one store customer. Dropship
+    # splits by PRODUCT: a blind bills to the province's blinds customer, a drape
+    # panel to the existing (panels) customer. Tax always follows the province,
+    # not the product. Mixed/Unknown can't be routed, so skip (return None) rather
+    # than guess a customer -- classification lives in app/products.py.
+    customer_id = mapping["customer_id"]
+    if channel == "dropship":
+        product = invoice.get("product")
+        if product == "Blind":
+            customer_id = (config.get("dropship_blinds") or {}).get(province.upper())
+            if not customer_id:
+                return None
+        elif product != "Drape Panel":
+            return None
+
     discount = config["channel_discounts"][channel]
 
     try:
         base = {
             "external_id":    external_id_for(invoice),
-            "customer_id":    mapping["customer_id"],
+            "customer_id":    customer_id,
             "tran_date":      invoice["invoice_date"],
             "due_date":       invoice["due_date"],
             "memo":           f'{invoice["invoice_number"]} / PO {invoice["po_number"]}',

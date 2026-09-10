@@ -31,10 +31,10 @@ REFS_FULL = {**REFS_PARTIAL,
              "item_ids": {**REFS_PARTIAL["item_ids"], "-5.19% vendor discounts": "999999"}}
 
 INVOICES = [
-    {"transaction_id": "T-DSD", "source_document_id": "S-DSD", "invoice_number": "INV1", "po_number": "PO1",
+    {"transaction_id": "T-DSD", "source_document_id": "S-DSD", "invoice_number": "INV1", "product": "Drape Panel", "po_number": "PO1",
      "invoice_date": "2026-09-01", "due_date": "2026-10-01", "subtotal": 100.00,
      "total_amount": 106.00, "store": "VAUGHAN", "province": "ON"},
-    {"transaction_id": "T-DROP", "source_document_id": "S-DROP", "invoice_number": "INV2", "po_number": "PO2",
+    {"transaction_id": "T-DROP", "source_document_id": "S-DROP", "invoice_number": "INV2", "product": "Drape Panel", "po_number": "PO2",
      "invoice_date": "2026-09-01", "due_date": "2026-10-01", "subtotal": 200.00,
      "total_amount": 210.00, "store": None, "province": "ON"},
     {"transaction_id": "T-NOMAP", "source_document_id": "S-NOMAP", "invoice_number": "INV3", "po_number": "PO3",

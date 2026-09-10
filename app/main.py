@@ -190,6 +190,9 @@ def _attach_provinces(invoices: list[dict], po_provinces: dict[str, dict]) -> No
         loc = po_provinces.get(inv.get("po_number", ""), {})
         inv["province"] = loc.get("province")
         inv["store"] = loc.get("store")
+        # Product (Blind / Drape Panel / Mixed / Unknown) from the 850 vendor item
+        # numbers -- drives dropship customer routing (blinds vs panels store).
+        inv["product"] = product_for(flavor_of(inv), loc)
 
 
 # What we charge HD per ship-to province, used ONLY to annotate an
