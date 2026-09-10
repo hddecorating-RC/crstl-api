@@ -126,7 +126,7 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
         return [
             {
                 **base,
-                "item":        config["item"],
+                "item":        (config.get("product_items") or {}).get(route["product"]) or config["item"],
                 "description": "",
                 "quantity":    1,
                 "rate":        gross,

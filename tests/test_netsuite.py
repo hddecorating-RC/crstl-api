@@ -29,6 +29,7 @@ SAMPLE_CONFIG = {
     },
     "dropship_blinds": {"QC": "blind-qc", "ON": "blind-on"},
     "item": "Drapery Panels",
+    "product_items": {"Blind": "Blinds Item", "Drape Panel": "Drapery Panels"},
     "currency": "CAD",
     "channel_discounts": {
         "dsd": {"item": "-6.19% vendor discounts", "rate": 0.0619, "note": "DSD note"},
@@ -306,3 +307,27 @@ def test_dropship_blind_without_blinds_customer_is_skipped(mock_config):
     from unittest.mock import patch
     with patch("app.netsuite._load_config", return_value=cfg):
         assert transform_invoice(inv, province="BC", store=None) is None
+
+
+def test_dropship_blind_uses_blinds_merchandise_item(mock_config):
+    """A blind books the blinds merchandise item, not Drapery Panels (so blinds
+    revenue lands in the blinds GL account)."""
+    from app.netsuite import transform_invoice
+    inv = {**SAMPLE_INVOICE, "product": "Blind"}
+    lines = transform_invoice(inv, province="QC", store=None)
+    assert lines[0]["item"] == "Blinds Item"
+
+
+def test_dropship_panel_uses_drapery_item(mock_config):
+    from app.netsuite import transform_invoice
+    inv = {**SAMPLE_INVOICE, "product": "Drape Panel"}
+    lines = transform_invoice(inv, province="QC", store=None)
+    assert lines[0]["item"] == "Drapery Panels"
+
+
+def test_dsd_uses_drapery_item(mock_config):
+    """DSD is drapery -> Drapery Panels item regardless."""
+    from app.netsuite import transform_invoice
+    inv = {**SAMPLE_INVOICE, "product": "Drape Panel"}
+    lines = transform_invoice(inv, province="ON", store="VAUGHAN")
+    assert lines[0]["item"] == "Drapery Panels"
