@@ -437,7 +437,7 @@ def _reportable(invoices: list[dict]) -> list[dict]:
 
 def _netsuite_push_digest_html() -> str:
     """HTML section for the daily digest summarising the most recent NetSuite
-    push. The auto-push job runs at 7:05, before the 7:15 digest, so this reflects
+    push. The auto-push job runs at 5:00, before the 7:15 digest, so this reflects
     it; a manual push later in the day would show instead."""
     with _netsuite_push_lock:
         st = dict(_netsuite_push_state)
@@ -447,10 +447,18 @@ def _netsuite_push_digest_html() -> str:
     results = st.get("results") or []
     sent = [r for r in results if r.get("status") == "sent"]
     failed = [r for r in results if r.get("status") == "failed"]
+    skipped_mod = [r for r in results if r.get("status") == "skipped_modified"]
+    created = sum(1 for r in sent if r.get("action") == "created")
+    updated = sum(1 for r in sent if r.get("action") == "updated")
     total = sum((r.get("total") or 0) for r in sent)
-    header = (heading + f"<p><strong>{len(sent)} invoice(s) pushed</strong> &middot; total "
-              f"${total:,.2f} CAD"
+    # Created vs updated is the audit signal: a run that suddenly CREATES many
+    # where it should UPDATE is an early warning (e.g. the keying broke). skipped
+    # (changed on server) means the optimistic lock refused to overwrite an edit.
+    header = (heading + f"<p><strong>{len(sent)} invoice(s) pushed</strong> "
+              f"&middot; {created} created &middot; {updated} updated "
+              f"&middot; total ${total:,.2f} CAD"
               + (f" &middot; <span style='color:#b32020'>{len(failed)} failed</span>" if failed else "")
+              + (f" &middot; <span style='color:#b45309'>{len(skipped_mod)} skipped (changed on server)</span>" if skipped_mod else "")
               + "</p>")
     if st.get("blocked"):
         header += f"<p style='color:#b45309'><strong>Blocked:</strong> {html.escape(str(st['blocked']))}</p>"
@@ -612,8 +620,8 @@ AUTO_NS_PUSH_SETTING = "auto_ns_push_enabled"
 # off until someone turns it on (the NetSuite auto-push stays off until
 # accounting signs off). Keep `id` in sync with the scheduler job ids below.
 AUTOMATION_JOBS = [
-    {"id": "daily_refresh", "label": "Invoice sync (Crstl)", "schedule": "Daily · 7:00 AM ET",   "setting": AUTO_SYNC_SETTING,    "default": "true"},
-    {"id": "netsuite_push", "label": "NetSuite auto-push",   "schedule": "Mon–Fri · 7:05 AM ET", "setting": AUTO_NS_PUSH_SETTING, "default": "false"},
+    {"id": "daily_refresh", "label": "Invoice sync (Crstl)", "schedule": "Daily · 4:45 AM ET",   "setting": AUTO_SYNC_SETTING,    "default": "true"},
+    {"id": "netsuite_push", "label": "NetSuite auto-push",   "schedule": "Mon–Fri · 5:00 AM ET", "setting": AUTO_NS_PUSH_SETTING, "default": "false"},
     {"id": "daily_digest",  "label": "Daily digest email",   "schedule": "Mon–Fri · 7:15 AM ET", "setting": AUTO_DIGEST_SETTING,  "default": "true"},
 ]
 _JOB_BY_ID = {j["id"]: j for j in AUTOMATION_JOBS}
@@ -700,12 +708,14 @@ async def lifespan(app: FastAPI):
     global _scheduler
     _scheduler = AsyncIOScheduler()
     _scheduler.add_job(_run_refresh_job, "cron", id="daily_refresh",
-                       hour=7, minute=0, timezone="America/Toronto",
+                       hour=4, minute=45, timezone="America/Toronto",
                        misfire_grace_time=3600, coalesce=True)
-    # NetSuite auto-push — runs after the 7am refresh, before the 7:15 digest, so
-    # the digest reflects it. OFF by default until accounting turns it on.
+    # NetSuite auto-push — 5:00 AM ET, before anyone in accounting is entering
+    # invoices, so our writes never collide with a manual entry. Runs after the
+    # 4:45 refresh (fresh data) and before the 7:15 digest (which reports it).
+    # OFF by default until accounting turns it on.
     _scheduler.add_job(_run_netsuite_push_job, "cron", id="netsuite_push",
-                       day_of_week="mon-fri", hour=7, minute=5, timezone="America/Toronto",
+                       day_of_week="mon-fri", hour=5, minute=0, timezone="America/Toronto",
                        misfire_grace_time=3600, coalesce=True)
     # Weekdays only — nobody works the digest queue on Sat/Sun, so a weekend
     # send is just two emails to ignore. Skipping them loses nothing: the digest

@@ -484,3 +484,15 @@ def test_automation_logs(client):
     resp = client.get("/api/automation/logs")
     assert resp.status_code == 200
     assert "runs" in resp.json()
+
+
+def test_netsuite_push_runs_before_business_hours(monkeypatch, tmp_path):
+    """Auto-push fires 5:00 AM ET (before accounting works), AFTER the 4:45 sync
+    (fresh data) and before the 7:15 digest (which reports it), so a scheduled
+    push never collides with a manual NetSuite entry."""
+    jobs = _scheduled_jobs(monkeypatch, tmp_path)
+    push, refresh = jobs["netsuite_push"], jobs["daily_refresh"]
+    assert push["day_of_week"] == "mon-fri"
+    assert (push["hour"], push["minute"]) == (5, 0)
+    assert (refresh["hour"], refresh["minute"]) == (4, 45)
+    assert refresh["hour"] < push["hour"]        # sync precedes the push
