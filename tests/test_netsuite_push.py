@@ -286,3 +286,39 @@ def test_push_builds_sales_order_when_configured():
     assert p["orderStatus"] == {"id": "A"}          # Pending Approval carried through
     assert p["customForm"] == {"id": "231"}
     assert "custbodyinvoicepercent" not in p        # invoice-only field never leaks onto the SO
+
+
+def test_select_for_automation_applies_cutoff_and_dedup():
+    """Automation-only guard: drops invoices dated before the go-live cutoff (and
+    undated ones), keeps the cutoff date itself (inclusive), and only pushes the
+    not-yet-pushed set. Manual pushes never call this."""
+    from app.netsuite_push import select_for_automation
+    cand = [
+        {"transaction_id": "old",    "invoice_date": "2026-03-10"},  # pre-cutoff -> drop
+        {"transaction_id": "day0",   "invoice_date": "2026-09-10"},  # cutoff day  -> keep
+        {"transaction_id": "new",    "invoice_date": "2026-09-14"},  # after       -> keep
+        {"transaction_id": "nodate", "invoice_date": ""},            # undated     -> drop
+        {"transaction_id": "pushed", "invoice_date": "2026-09-12"},  # already pushed -> drop
+    ]
+    unpushed = {"old", "day0", "new", "nodate"}   # 'pushed' not in unpushed
+    to_push, blocked = select_for_automation(cand, unpushed, go_live_after="2026-09-10", max_per_run=75)
+    assert blocked is None
+    assert {i["transaction_id"] for i in to_push} == {"day0", "new"}
+
+
+def test_select_for_automation_refuses_over_cap():
+    """A run larger than max_per_run is REFUSED whole (not truncated), so a scope
+    slip can't blast -- a human reviews and runs it manually."""
+    from app.netsuite_push import select_for_automation
+    cand = [{"transaction_id": str(n), "invoice_date": "2026-09-14"} for n in range(10)]
+    unpushed = {str(n) for n in range(10)}
+    to_push, blocked = select_for_automation(cand, unpushed, go_live_after="2026-09-10", max_per_run=5)
+    assert to_push == []
+    assert "exceeds max_per_run 5" in blocked
+
+
+def test_select_for_automation_no_guards_is_passthrough():
+    from app.netsuite_push import select_for_automation
+    cand = [{"transaction_id": "a", "invoice_date": "2026-01-01"}]
+    to_push, blocked = select_for_automation(cand, {"a"})   # no cutoff, no cap
+    assert blocked is None and [i["transaction_id"] for i in to_push] == ["a"]

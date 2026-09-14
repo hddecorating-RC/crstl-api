@@ -42,6 +42,9 @@ def load_refs() -> dict:
         # old config with no push block behaves exactly as before.
         "record_type": cfg.get("record_type", "invoice"),
         "sales_order": cfg.get("sales_order", {}),
+        # Scheduled-job-only guards (go-live cutoff + per-run cap). Read by the
+        # push job; the shared push path ignores it so manual pushes are unlimited.
+        "automation": cfg.get("automation", {}),
     }
 
 

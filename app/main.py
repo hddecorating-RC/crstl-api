@@ -18,7 +18,8 @@ from app import tracking
 from app.mail import send_mail, MailConfigError
 from app.netsuite import transform_invoice, resolve_customer
 from app.netsuite_csv import build_netsuite_csv
-from app.netsuite_push import push_invoices, eligible_for_push
+from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation
+from app.netsuite_payload import load_refs
 from app.report import (XLSX_MEDIA_TYPE, dates_for, flavor_of, product_for,
                         rows_for_transactions, window_label, workbook_bytes)
 from app.finale import FinaleClient
@@ -676,16 +677,33 @@ def _run_ns_export_job() -> None:
 def _run_netsuite_push_job() -> None:
     """Scheduled live push (default OFF). Pushes only acknowledged, non-zero
     invoices not yet pushed (tracking dedup) so it never re-posts a manual push;
-    idempotent upsert makes a retry safe. Records the run + updates push state."""
+    idempotent upsert makes a retry safe. Records the run + updates push state.
+
+    Two AUTOMATION-ONLY guards from config `automation` (select_for_automation):
+    a go-live DATE cutoff (nothing dated before it is ever auto-pushed -- the
+    149-incident guard) and a per-run hard CAP (an oversized set is REFUSED, not
+    truncated -- review and run manually to override). Manual pushes from the app
+    are NOT subject to either."""
     if not _job_enabled(AUTO_NS_PUSH_SETTING, default="false"):
         tracking.record_job_run("netsuite_push", "skipped", "disabled"); return
+    auto = load_refs().get("automation") or {}
+    cutoff = str(auto.get("go_live_after") or "") or None
+    cap = auto.get("max_per_run")
     with _cache_lock:
         invoices = list(_cache["invoices"])
     candidates = eligible_for_push(invoices)
-    unpushed = set(tracking.get_unpushed_ids([str(i["transaction_id"]) for i in candidates]))
-    to_push = [i for i in candidates if str(i["transaction_id"]) in unpushed]
+    unpushed = tracking.get_unpushed_ids([str(i["transaction_id"]) for i in candidates])
+    to_push, blocked = select_for_automation(candidates, unpushed,
+                                              go_live_after=cutoff, max_per_run=cap)
+    if blocked:
+        tracking.record_job_run("netsuite_push", "blocked",
+                                f"{blocked} -- refusing; run manually from the app to override")
+        return
     if not to_push:
-        tracking.record_job_run("netsuite_push", "ok", "nothing new to push"); return
+        tracking.record_job_run(
+            "netsuite_push", "ok",
+            f"nothing new to push (on/after {cutoff})" if cutoff else "nothing new to push")
+        return
     # _run_netsuite_push reads the cache, pushes just these ids, sanitizes, and
     # updates _netsuite_push_state (so the dashboard's last-push panel reflects it).
     result = _run_netsuite_push(True, [str(i["transaction_id"]) for i in to_push], None)

@@ -92,5 +92,11 @@
     "_comment_order_status": "A = Pending Approval. ONLY honored if SO approval routing is enabled in NetSuite; if it is OFF, NetSuite silently creates the SO as B (Pending Fulfillment). Confirm with accounting before the first live run.",
     "custom_form_id": "102",
     "_comment_custom_form": "102 = 'Custom Sales Order', the SAME form OMIS stamps on its own sales orders (accounting's request). Read off OMIS SO491442 (internal id 22694781) 2026-09-11: its OMIS-created SOs use customForm 102 and sit in orderStatus A / Pending Approval -- which also confirms SO approval routing IS enabled, so our order_status_id 'A' will be honored. (The invoice path used form 101.)"
+  },
+
+  "_comment_automation": "Guards on the SCHEDULED push job ONLY (app.main._run_netsuite_push_job). Manual pushes from the dashboard/CLI are deliberately NOT limited by these -- a human can push anything, incl. pre-cutoff, on purpose. go_live_after: automation never pushes an invoice dated before this (positive cutoff -- the 2026-09-11 149-incident guard; keeps the pre-09/10 backlog untouched regardless of tracking state). max_per_run: if the post-cutoff, not-yet-pushed set exceeds this, the job REFUSES the whole run and logs 'blocked' rather than risk a blast (a day that large signals something unexpected, incl. the first catch-up run) -- review it and run manually from the app to override.",
+  "automation": {
+    "go_live_after": "2026-09-10",
+    "max_per_run": 75
   }
 }

@@ -79,6 +79,34 @@ def eligible_for_push(invoices: list[dict]) -> list[dict]:
     return [i for i in select_latest_accepted(invoices) if (i.get("subtotal") or 0) > 0]
 
 
+def select_for_automation(candidates: list[dict], unpushed_ids, *,
+                          go_live_after: str | None = None,
+                          max_per_run: int | None = None) -> tuple[list[dict], str | None]:
+    """AUTOMATION-ONLY selection for the scheduled push job, layered on top of
+    eligible_for_push. NOT used by push_invoices, so manual pushes (dashboard/CLI)
+    are never limited by this -- a human can deliberately push anything, including
+    pre-cutoff invoices.
+
+    Applies two guards and returns (to_push, blocked_reason):
+      * go_live_after -- a positive DATE cutoff: drop anything with invoice_date
+        before it (the 2026-09-11 149-incident guard). Protects the pre-cutoff
+        backlog from a scope slip regardless of tracking state; an undated invoice
+        is treated as before the cutoff (excluded).
+      * max_per_run -- a hard per-run CAP: if the resulting set exceeds it, REFUSE
+        the whole run (return [] and a reason) rather than risk a blast. A day that
+        large -- including the first catch-up run -- should be reviewed and run
+        manually. `blocked_reason` is None when the run may proceed.
+    """
+    if go_live_after:
+        candidates = [i for i in candidates
+                      if str(i.get("invoice_date") or "")[:10] >= go_live_after]
+    unpushed = {str(x) for x in unpushed_ids}
+    to_push = [i for i in candidates if str(i.get("transaction_id")) in unpushed]
+    if max_per_run is not None and len(to_push) > max_per_run:
+        return [], f"{len(to_push)} to push exceeds max_per_run {max_per_run}"
+    return to_push, None
+
+
 def _select(invoices: list[dict], only: list[str] | None, limit: int | None) -> list[dict]:
     if only:
         wanted = {str(x) for x in only}
