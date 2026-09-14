@@ -24,7 +24,7 @@ SAMPLE_CONFIG = {
         "CALGARY": {"customer_id": "cust-calgary", "province": "AB", "tax_code": "GST", "tax_rate": 0.05},
     },
     "dropship_provinces": {
-        "QC": {"customer_id": "cust-qc", "tax_code": "GST+QST", "tax_rate": 0.14975},
+        "QC": {"customer_id": "cust-qc", "tax_code": "GST+QST", "tax_rate": 0.14975, "tax_components": [0.05, 0.09975]},
         "ON": {"customer_id": "cust-on-ds", "tax_code": "HST-ON", "tax_rate": 0.13},
     },
     "dropship_blinds": {"QC": "blind-qc", "ON": "blind-on"},
@@ -377,3 +377,16 @@ def test_transform_falls_back_to_rate_when_no_crstl_reduction(mock_config):
     inv = {**SAMPLE_INVOICE, "subtotal": 1000.0, "allowance_amount": 0.0}  # no discount_amount
     _, disc = transform_invoice(inv, province="ON", store="VAUGHAN")
     assert disc["amount"] == -round(1000.0 * 0.0619, 2)                    # 61.90 rate fallback
+
+
+def test_transform_quebec_rounds_tax_components_separately(mock_config):
+    """QC (GST 5% + QST 9.975%) rounds EACH component to cents then sums -- matching
+    CRSTL and NetSuite's tax group -- not one combined 14.975% (a cent high on small
+    invoices). Real case INV538815118: net 22.09 -> 1.10 + 2.20 = 3.30 (not 3.31)."""
+    from app.netsuite import transform_invoice
+    inv = {**SAMPLE_INVOICE, "product": "Blind", "subtotal": 23.30,
+           "allowance_amount": 1.21, "discount_amount": 0.0, "total_amount": 25.39}
+    merch, disc = transform_invoice(inv, province="QC", store=None)   # dropship QC blind
+    assert merch["tax_amount"] == 3.30                                 # not 22.09*0.14975 = 3.31
+    total = round(sum(l["amount"] for l in (merch, disc)) + merch["tax_amount"], 2)
+    assert total == inv["total_amount"] == 25.39                       # ties to the 810 exactly

@@ -93,6 +93,11 @@ def resolve_customer(invoice: dict, province, store, config: dict | None = None)
         "customer_name": (config.get("customer_names") or {}).get(str(customer_id)),
         "tax_code": mapping["tax_code"],
         "tax_rate": mapping.get("tax_rate", 0),
+        # Compound-tax provinces (QC GST+QST, SK GST+PST) list their component rates
+        # so tax is computed the way CRSTL and NetSuite's tax GROUP do -- each
+        # component rounded to cents, then summed -- which differs from one combined
+        # rate by up to a cent. Single-tax provinces omit it and use tax_rate.
+        "tax_components": mapping.get("tax_components"),
     }
 
 
@@ -156,7 +161,13 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
                                 + (invoice.get("discount_amount") or 0), 2)
         discount_amount = -crstl_reduction if crstl_reduction > 0 else -round(gross * discount["rate"], 2)
         net = round(gross + discount_amount, 2)
-        tax = round(net * route["tax_rate"], 2)
+        # Compound provinces round EACH tax component to cents then sum (matches
+        # CRSTL's 810 and NetSuite's tax group); single-tax provinces use one rate.
+        comps = route.get("tax_components")
+        if comps:
+            tax = round(sum(round(net * c, 2) for c in comps), 2)
+        else:
+            tax = round(net * route["tax_rate"], 2)
 
         return [
             {
