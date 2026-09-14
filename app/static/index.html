@@ -615,12 +615,14 @@ function dashboard() {
     activeInvoice: null,
     selected: new Set(),
     activeFilter: 'Accepted',   // default view = Accepted (push-eligible); a saved choice overrides in init()
-    // Export-state dimension, independent of status filter above.
+    // Export-state dimension, independent of status filter above. Default to
+    // NotPushed (the working view); a saved choice overrides in init().
     // 'Any' | 'Pushed' | 'NotPushed' | 'Emailed' | 'NotEmailed' | 'Exported' | 'NotExported'
-    exportStateFilter: 'Any',
+    exportStateFilter: 'NotPushed',
     search: '',
     dateFrom: '',
     dateTo: '',
+    goLiveAfter: '',            // go-live cutoff (from backend); seeds dateFrom to hide the old backlog
     currentPage: 1,
     pageSize: 25,
     loading: true,
@@ -666,17 +668,30 @@ function dashboard() {
       ['activeFilter', 'exportStateFilter', 'search', 'dateFrom', 'dateTo'].forEach(
         prop => this.$watch(prop, pruneSelection)
       );
-      // Remember the status filter across reloads. Default is Sent (set above);
-      // a previously saved choice wins. localStorage can throw (private window /
-      // storage disabled), so guard every access and fall back to the default.
-      try {
-        const saved = localStorage.getItem('crstl.activeFilter');
-        if (['All', 'Draft', 'Sent', 'Accepted'].includes(saved)) this.activeFilter = saved;
-      } catch (e) {}
-      this.$watch('activeFilter', v => {
-        try { localStorage.setItem('crstl.activeFilter', v); } catch (e) {}
+      // Persist the whole working view (status + export-state + date filters)
+      // across reloads, so Accepted / Not-pushed / recent sticks instead of
+      // resetting each time. localStorage can throw (private window / storage
+      // disabled), so guard every access and fall back to the default.
+      const ALLOWED = {
+        activeFilter: ['All', 'Draft', 'Sent', 'Accepted'],
+        exportStateFilter: ['Any', 'Pushed', 'NotPushed', 'Emailed', 'NotEmailed', 'Exported', 'NotExported'],
+      };
+      ['activeFilter', 'exportStateFilter', 'dateFrom', 'dateTo'].forEach(k => {
+        try {
+          const saved = localStorage.getItem('crstl.' + k);
+          if (saved !== null && (!ALLOWED[k] || ALLOWED[k].includes(saved))) this[k] = saved;
+        } catch (e) {}
+        this.$watch(k, v => { try { localStorage.setItem('crstl.' + k, v ?? ''); } catch (e) {} });
       });
       await this.loadInvoices();
+      // Hide the pre-go-live backlog by default: if the user has never set a
+      // dateFrom, seed it to the go-live cutoff so old invoices don't clutter the
+      // 'not pushed' view. A saved value (including an explicit clear) always wins.
+      try {
+        if (localStorage.getItem('crstl.dateFrom') === null && this.goLiveAfter) {
+          this.dateFrom = this.goLiveAfter;
+        }
+      } catch (e) {}
       await this.loadNetsuiteStatus();
       await this.loadNetsuitePush();
       await this.loadDigestStatus();
@@ -689,6 +704,7 @@ function dashboard() {
         const data = await res.json();
         this.invoices = data.invoices || [];
         this.lastSynced = data.last_synced;
+        this.goLiveAfter = data.go_live_after || this.goLiveAfter;
         this.syncStatus = data.status === 'ok' ? 'ok' : 'error';
       } catch {
         this.syncStatus = 'error';

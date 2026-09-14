@@ -790,7 +790,12 @@ def get_invoices() -> dict:
             for inv in invoices
         ]
 
-    return {"invoices": invoices, "last_synced": last_synced, "status": status}
+    # The go-live cutoff (automation config) so the dashboard can hide the
+    # pre-cutoff backlog by default -- those older invoices are handled and only
+    # clutter the "not pushed" view.
+    go_live_after = (load_refs().get("automation") or {}).get("go_live_after") or ""
+    return {"invoices": invoices, "last_synced": last_synced, "status": status,
+            "go_live_after": go_live_after}
 
 
 def _netsuite_customer(inv: dict) -> dict | None:
