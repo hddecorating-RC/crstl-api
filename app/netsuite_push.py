@@ -186,11 +186,14 @@ def push_invoices(
             **_reconcile(inv, lines),
         }
         row["amount_flag"] = amount_flag(row.get("gross"), row["channel"])
-        # Reconcile guard: our total MUST equal CRSTL's 810 total (hd_total). A
-        # non-zero delta means the record would not match the invoice HD pays --
-        # surface it loudly rather than book a wrong number silently.
+        # Reconcile guard: our total should equal CRSTL's 810 total (hd_total).
+        # Flag only STRUCTURAL mismatches (> 1 cent) -- a 1c delta is expected on
+        # compound-tax provinces (QC GST+QST, SK GST+PST): CRSTL and NetSuite's tax
+        # GROUP round each component separately, while our single-rate reconcile
+        # rounds the combined rate. The real errors (e.g. a missing PST) are dollars,
+        # never a cent, so a 1c tolerance keeps the guard sharp without false alarms.
         d = row.get("delta")
-        row["reconcile_flag"] = None if (d is None or d == 0) else f"total off CRSTL 810 by {d:+.2f}"
+        row["reconcile_flag"] = None if (d is None or abs(d) <= 0.01) else f"total off CRSTL 810 by {d:+.2f}"
         for tag in unresolved_ids(lines, refs):
             if tag not in unresolved:
                 unresolved.append(tag)

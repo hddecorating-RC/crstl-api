@@ -404,3 +404,15 @@ def test_skips_on_external_id_type_conflict():
         out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
     assert client.upserts == []
     assert out["summary"]["skipped_conflict"] == 2 and out["summary"]["sent"] == 0
+
+
+def test_reconcile_flag_ignores_penny_rounding():
+    """A <=1c delta (compound-tax component rounding: QC GST+QST, SK GST+PST) is NOT
+    flagged; only structural (>1c) mismatches are."""
+    inv = {"transaction_id": "T-1C", "source_document_id": "S-1C", "invoice_number": "INV1C",
+           "product": "Drape Panel", "status": "Accepted", "po_number": "PO1C",
+           "invoice_date": "2026-09-11", "due_date": "", "subtotal": 100.0,
+           "allowance_amount": 6.0, "discount_amount": 0.0, "total_amount": 106.23,  # 1c over our 106.22
+           "store": "VAUGHAN", "province": "ON"}
+    r = push_invoices([inv], live=False, refs=REFS_FULL)["results"][0]
+    assert round(r["delta"], 2) == -0.01 and r["reconcile_flag"] is None
