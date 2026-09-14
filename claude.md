@@ -1,3 +1,9 @@
+# crstl-api
+
+This repo is the **CRSTL EDI invoicing** piece of the HD platform — CRSTL/Rithum (Home Depot Canada) invoices → NetSuite, so accounting stops keying sales orders by hand. For how it fits with OMIS, Finale and the other repos, see the **"HD platform" map at the top of `~/.claude/CLAUDE.md`** (loaded every session). This repo also holds the working Finale (read) and NetSuite (stub, REST/TBA) clients that other builds reuse — use the modern REST/TBA path, never OMIS's legacy SOAP.
+
+---
+
 # Agent Instructions
 You're working inside the **WAT framework** (Workflows, Agents, Tools). This architecture separates concerns so that probabilistic AI handles reasoning while deterministic code handles execution. That separation is what makes this system reliable.
 ## The WAT Architecture

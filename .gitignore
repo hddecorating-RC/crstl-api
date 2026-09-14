@@ -10,3 +10,13 @@ __pycache__/
 *.egg-info/
 .superpowers/
 
+
+# Local data / exports / customer records — never commit (real HD & CRSTL data)
+*.xlsx
+*.csv
+*.docx
+*.pdf
+rithum-invoices/
+openapi.json
+# agent / local tooling config
+.claude/

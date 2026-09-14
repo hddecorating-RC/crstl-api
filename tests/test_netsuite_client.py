@@ -11,7 +11,12 @@ from app.netsuite_client import (
     NetSuiteUnavailable,
     signature_base_string,
 )
-from app.netsuite_payload import build_invoice_payload, unresolved_ids
+from app.netsuite_payload import (
+    build_invoice_payload,
+    build_payload,
+    build_sales_order_payload,
+    unresolved_ids,
+)
 
 
 CREDS = dict(
@@ -208,6 +213,55 @@ def test_unresolved_ids_flags_blank_refs():
 def test_build_invoice_payload_rejects_empty():
     with pytest.raises(ValueError):
         build_invoice_payload([])
+
+
+# ---- payload (salesOrder -- accounting's current record type) ----
+
+SO_REFS = {
+    **REFS,
+    "record_type": "salesOrder",
+    "sales_order": {"order_status_id": "A", "custom_form_id": "231"},
+}
+
+
+def test_build_sales_order_payload_shape():
+    body = build_sales_order_payload(LINES, SO_REFS)
+    # Shared with the invoice body: customer, Lead #, item sublist, tax.
+    assert body["externalId"] == "TXN-1"
+    assert body["entity"] == {"id": "4147"}
+    assert body["otherRefNum"] == "INV1"            # LEAD # = invoice number
+    items = body["item"]["items"]
+    assert len(items) == 2
+    assert items[0]["item"] == {"id": "201"} and items[0]["taxCode"] == {"id": "17"}
+    assert items[1]["amount"] == -5.0
+    # SO-specific header.
+    assert body["orderStatus"] == {"id": "A"}       # Pending Approval -- approval-queue gate
+    assert body["customForm"] == {"id": "231"}      # the SO form, NOT invoice form 101
+    assert body["class"] == {"id": "5"}
+    # Invoice-only fields must NOT leak onto an SO.
+    assert "custbodyinvoicepercent" not in body     # invoice deposit field
+    assert "dueDate" not in body                     # SO carries terms, not a due date
+
+
+def test_build_sales_order_payload_omits_blank_custom_form_and_status():
+    refs = {**REFS, "record_type": "salesOrder", "sales_order": {}}
+    body = build_sales_order_payload(LINES, refs)
+    assert "customForm" not in body                  # blank -> NetSuite account default
+    assert "orderStatus" not in body                 # unset -> NetSuite default status
+
+
+def test_build_payload_dispatches_on_record_type():
+    so = build_payload(LINES, SO_REFS)               # record_type from refs
+    assert "orderStatus" in so and "custbodyinvoicepercent" not in so
+    inv = build_payload(LINES, REFS)                 # no record_type -> defaults to invoice
+    assert "custbodyinvoicepercent" in inv and "orderStatus" not in inv
+    forced = build_payload(LINES, SO_REFS, record_type="invoice")   # explicit wins over refs
+    assert "custbodyinvoicepercent" in forced and "orderStatus" not in forced
+
+
+def test_build_sales_order_payload_rejects_empty():
+    with pytest.raises(ValueError):
+        build_sales_order_payload([])
 
 
 def test_upsert_invoice_aborts_when_modified_on_server():

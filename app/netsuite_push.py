@@ -1,13 +1,15 @@
 """
-Shared engine for pushing Crstl invoices into NetSuite as INVOICE records via the
-TBA REST connector. One code path, used by both the CLI (tools/push_invoices_to_
+Shared engine for pushing Crstl invoices into NetSuite via the TBA REST connector.
+The record type is config-driven (config/netsuite_customers.json: record_type) --
+"salesOrder" (accounting's current preference; their team converts SO -> invoice)
+or "invoice". One code path, used by both the CLI (tools/push_invoices_to_
 netsuite.py) and the web app (POST /api/netsuite), so a dry run and a live send
 are always built the same way.
 
 Pipeline per invoice:
     transform_invoice(...)      app.netsuite      -- business mapping (2 lines)
-    build_invoice_payload(...)  app.netsuite_payload -- REST body, internal-id refs
-    NetSuiteClient.upsert_invoice(...)               -- TBA transport (PUT eid:)
+    build_payload(...)          app.netsuite_payload -- REST body for record_type
+    NetSuiteClient.upsert(...)                        -- TBA transport (PUT eid:)
 
 Safety:
   * dry run (live=False) builds and reconciles but sends nothing.
@@ -21,7 +23,7 @@ Results are plain JSON-serialisable dicts so the API can return them directly.
 from __future__ import annotations
 
 from app.netsuite import transform_invoice, amount_flag
-from app.netsuite_payload import build_invoice_payload, load_refs, unresolved_ids
+from app.netsuite_payload import build_payload, load_refs, unresolved_ids
 
 
 def _reconcile(inv: dict, lines: list[dict]) -> dict:
@@ -108,6 +110,10 @@ def push_invoices(
     if limit is not None and limit < 1:
         raise ValueError("limit must be >= 1")
     refs = refs or load_refs()
+    # Which NetSuite record this run creates ("invoice" or "salesOrder"), from
+    # config. Threaded to the payload builder, the connection check and the upsert
+    # so all three agree -- a dry run and a live send build the same record type.
+    record_type = refs.get("record_type") or "invoice"
     # Enforce eligibility HERE so no caller (esp. the CLI) can push ineligible
     # invoices. only/limit then apply to the eligible set.
     invoices = _select(eligible_for_push(invoices), only, limit)
@@ -153,7 +159,7 @@ def push_invoices(
             if tag not in unresolved:
                 unresolved.append(tag)
         results.append(row)
-        prepared.append((row, build_invoice_payload(lines, refs)))
+        prepared.append((row, build_payload(lines, refs, record_type)))
 
     mode = "live" if live else "dry"
     sent = failed = skipped_modified = 0
@@ -172,7 +178,7 @@ def push_invoices(
             if not NetSuiteClient.configured():
                 raise NetSuiteUnavailable("NETSUITE_* credentials not set")
             client = NetSuiteClient()
-            client.test_connection()
+            client.test_connection(record_type)
 
         pushed_ids: list[str] = []
         for row, payload in prepared:
@@ -180,9 +186,9 @@ def push_invoices(
             try:
                 # Optimistic lock: pass the lastModifiedDate we recorded when we
                 # last wrote this record; the client aborts if NetSuite's copy has
-                # changed since (someone edited our invoice) rather than overwrite.
+                # changed since (someone edited our record) rather than overwrite.
                 guard = tracking.get_netsuite_last_modified(eid) if eid else None
-                result = client.upsert_invoice(payload, guard_last_modified=guard)
+                result = client.upsert(payload, record_type, guard_last_modified=guard)
                 row["status"] = "sent"
                 row["location"] = result.get("location") or result
                 # "created" vs "updated" -- proves a re-push UPDATED our own record

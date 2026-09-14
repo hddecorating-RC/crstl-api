@@ -49,7 +49,7 @@ class FakeClient:
     def __init__(self, fail_on=None):
         self.calls = []
         self.fail_on = fail_on or set()
-    def upsert_invoice(self, payload, guard_last_modified=None):
+    def upsert(self, payload, record_type="invoice", guard_last_modified=None):
         self.calls.append(payload)
         if payload["externalId"] in self.fail_on:
             raise RuntimeError("boom")
@@ -154,7 +154,7 @@ def test_modified_on_server_is_skipped_not_overwritten():
     class GuardClient:
         def __init__(self):
             self.calls = []
-        def upsert_invoice(self, payload, guard_last_modified=None):
+        def upsert(self, payload, record_type="invoice", guard_last_modified=None):
             self.calls.append(payload["externalId"])
             if payload["externalId"] == "CRSTL-S-DROP":
                 raise NetSuiteModifiedOnServer("changed on server")
@@ -232,7 +232,7 @@ def test_push_invoices_skips_no_baseline_never_overwrites():
     class NoBaseClient:
         def __init__(self):
             self.calls = []
-        def upsert_invoice(self, payload, guard_last_modified=None):
+        def upsert(self, payload, record_type="invoice", guard_last_modified=None):
             self.calls.append(payload["externalId"])
             if payload["externalId"] == "CRSTL-S-DROP":
                 raise NetSuiteNoBaseline("no baseline for this record")
@@ -259,3 +259,30 @@ def test_amount_flag_is_advisory_not_blocking():
     r = out["results"][0]
     assert r["status"] == "built"              # NOT blocked
     assert r["amount_flag"] == "above_ceiling"
+
+
+def test_push_builds_sales_order_when_configured():
+    """record_type=salesOrder in refs -> the engine builds an SO body (orderStatus,
+    no invoice-only fields) and hands the client record_type='salesOrder', so a
+    config flip is all it takes to switch what the connector creates."""
+    refs_so = {**REFS_FULL, "record_type": "salesOrder",
+               "sales_order": {"order_status_id": "A", "custom_form_id": "231"}}
+
+    class RecordingClient:
+        def __init__(self):
+            self.calls = []
+        def upsert(self, payload, record_type="invoice", guard_last_modified=None):
+            self.calls.append((record_type, payload))
+            return {"location": "/x", "action": "created", "netsuite_id": "1", "last_modified": "T"}
+
+    client = RecordingClient()
+    with patch("app.tracking.record_events"), \
+         patch("app.tracking.get_netsuite_last_modified", return_value="OLD"), \
+         patch("app.tracking.record_netsuite_push"):
+        out = push_invoices(INVOICES, live=True, refs=refs_so, client=client)
+    assert out["summary"]["sent"] == 2
+    assert client.calls and all(rt == "salesOrder" for rt, _ in client.calls)
+    p = client.calls[0][1]
+    assert p["orderStatus"] == {"id": "A"}          # Pending Approval carried through
+    assert p["customForm"] == {"id": "231"}
+    assert "custbodyinvoicepercent" not in p        # invoice-only field never leaks onto the SO

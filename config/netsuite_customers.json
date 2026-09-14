@@ -80,7 +80,17 @@
     "HST NS": "194234",
     "CA-S-QST": "476"
   },
-  "class_id": "",
+  "_comment_class": "NetSuite classification for HD Canada revenue = STOCK-PRODUCTS (id 7), created 2026-09-14. Distinguishes HD Canada stock products from OMIS cutdown (class 5 = OMIS-3DIF, which we must NOT reuse). Applied to the SO header (and invoice, if that path is ever used). Verified read-only: active, top-level; behaves like class 5 which is live on real SOs.",
+  "class_id": "7",
   "subsidiary_id": "1",
-  "custom_form_id": "101"
+  "custom_form_id": "101",
+
+  "_comment_push": "Which NetSuite record the connector creates. Accounting pivoted to Sales Orders (2026-09-11): their team converts SO -> invoice themselves, and an SO created in Pending Approval parks in an approval queue -- a human gate before anything posts to the GL. Flip record_type back to \"invoice\" to restore the direct-invoice path (custom_form_id above is the invoice form, 101).",
+  "record_type": "salesOrder",
+  "sales_order": {
+    "order_status_id": "A",
+    "_comment_order_status": "A = Pending Approval. ONLY honored if SO approval routing is enabled in NetSuite; if it is OFF, NetSuite silently creates the SO as B (Pending Fulfillment). Confirm with accounting before the first live run.",
+    "custom_form_id": "102",
+    "_comment_custom_form": "102 = 'Custom Sales Order', the SAME form OMIS stamps on its own sales orders (accounting's request). Read off OMIS SO491442 (internal id 22694781) 2026-09-11: its OMIS-created SOs use customForm 102 and sit in orderStatus A / Pending Approval -- which also confirms SO approval routing IS enabled, so our order_status_id 'A' will be honored. (The invoice path used form 101.)"
+  }
 }

@@ -172,44 +172,53 @@ class NetSuiteClient:
         return self._request(
             "PUT", f"/record/v1/{record_type}/eid:{quote(external_id, safe='')}?replace=item", json_body=body)
 
-    def upsert_invoice(self, record: dict, guard_last_modified: str | None = None) -> dict:
-        """Upsert one NetSuite invoice. `record` is a REST invoice body carrying
-        an externalId (build it with app.netsuite_payload.build_invoice_payload
-        from the line records app.netsuite.transform_invoice emits). Accounting
-        books this Home Depot revenue as an invoice; refs are internal ids, the
-        convention OMIS uses in this same account."""
+    def upsert(self, record: dict, record_type: str = "invoice",
+               guard_last_modified: str | None = None) -> dict:
+        """Upsert one NetSuite record (invoice OR salesOrder) addressed by our own
+        externalId. `record` is the REST body (build it with
+        app.netsuite_payload.build_payload from the line records
+        app.netsuite.transform_invoice emits). Refs are internal ids, the
+        convention OMIS uses in this same account.
+
+        Same safety on both record types: the PUT (.../eid:) targets OUR externalId,
+        so it can only ever touch a record we created -- never another source's; and
+        the optimistic lock (guard_last_modified) aborts rather than clobber if the
+        record changed in NetSuite since we last wrote it."""
         external_id = record.get("externalId") or record.get("external_id")
         if not external_id:
-            raise ValueError("invoice record needs an externalId")
-        # Look before we write. The PUT (.../eid:) targets OUR externalId, so it
-        # can only ever touch a record we created -- never another source's. The
-        # guard adds OMIS's second layer: if the record exists and its current
-        # lastModifiedDate no longer matches `guard_last_modified` (what we
-        # recorded when WE last wrote it), it was changed in NetSuite since -- so
-        # we ABORT rather than clobber that change.
-        existing = self.get_by_external_id("invoice", external_id)
+            raise ValueError(f"{record_type} record needs an externalId")
+        # Look before we write. The guard adds OMIS's second layer: if the record
+        # exists and its current lastModifiedDate no longer matches
+        # `guard_last_modified` (what we recorded when WE last wrote it), it was
+        # changed in NetSuite since -- so we ABORT rather than clobber that change.
+        existing = self.get_by_external_id(record_type, external_id)
         if existing is not None:
             if guard_last_modified is None:
                 # The record exists but we have no memory of writing it (tracking.db
                 # lost/reset). Refuse to overwrite -- it may hold manual edits. (M2)
                 raise NetSuiteNoBaseline(
-                    f"invoice {external_id} exists in NetSuite but we have no local baseline "
+                    f"{record_type} {external_id} exists in NetSuite but we have no local baseline "
                     "for it (tracking.db lost or reset?); refusing to overwrite -- reseed required")
             current = existing.get("lastModifiedDate")
             if current != guard_last_modified:
                 raise NetSuiteModifiedOnServer(
-                    f"invoice {external_id} changed in NetSuite since our last push "
+                    f"{record_type} {external_id} changed in NetSuite since our last push "
                     f"(recorded {guard_last_modified!r}, now {current!r}); not overwriting")
-        result = self.upsert_record("invoice", external_id, record)
+        result = self.upsert_record(record_type, external_id, record)
         if isinstance(result, dict):
             result["action"] = "updated" if existing is not None else "created"
             # Read the record back so the caller can store the NEW lastModifiedDate
             # as the next push's guard (OMIS does the same via update_from_netsuite!).
-            after = self.get_by_external_id("invoice", external_id)
+            after = self.get_by_external_id(record_type, external_id)
             if after is not None:
                 result["netsuite_id"] = after.get("id")
                 result["last_modified"] = after.get("lastModifiedDate")
         return result
+
+    def upsert_invoice(self, record: dict, guard_last_modified: str | None = None) -> dict:
+        """Back-compat alias: upsert an INVOICE record. New code passes the record
+        type to upsert() directly (the connector now creates salesOrder)."""
+        return self.upsert(record, "invoice", guard_last_modified)
 
     def get_by_external_id(self, record_type: str, external_id: str):
         """The record under our externalId as a dict, or None on 404. Read-only --
@@ -244,10 +253,12 @@ class NetSuiteClient:
             json_body={"q": query}, extra_headers={"Prefer": "transient"},
         )
 
-    def test_connection(self) -> dict:
-        """Auth check that does NOT need search/list permission: fetch the invoice
-        record's metadata schema. Proves the credentials, signing, and invoice
-        access without reading customer data or creating anything. (A collection
-        GET is a search, which some roles refuse -- observed on this account.)"""
-        return self._request("GET", "/record/v1/metadata-catalog/invoice",
+    def test_connection(self, record_type: str = "invoice") -> dict:
+        """Auth check that does NOT need search/list permission: fetch the record
+        type's metadata schema. Proves the credentials, signing, and access to that
+        record type without reading customer data or creating anything. (A
+        collection GET is a search, which some roles refuse -- observed on this
+        account.) Pass the record type the push will actually write (salesOrder) so
+        a role that lacks SO access fails HERE, before any write is attempted."""
+        return self._request("GET", f"/record/v1/metadata-catalog/{record_type}",
                              extra_headers={"Accept": "application/schema+json"})
