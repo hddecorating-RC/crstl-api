@@ -296,39 +296,84 @@ def test_push_builds_sales_order_when_configured():
     assert p["custbodyinvoicepercent"] == 100        # INVOICE % forced to 100 (form default is 50)
 
 
-def test_select_for_automation_applies_cutoff_and_dedup():
-    """Automation-only guard: drops invoices dated before the go-live cutoff (and
-    undated ones), keeps the cutoff date itself (inclusive), and only pushes the
-    not-yet-pushed set. Manual pushes never call this."""
+def _dt(s):
+    from datetime import datetime, timezone
+    return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+
+
+def test_select_for_automation_floor_keys_on_created_at_not_invoice_date():
+    """The floor guard drops rows CREATED before created_after (and undated ones),
+    keeps the floor date itself (inclusive), and only pushes the not-yet-pushed set.
+    It reads created_at, NOT invoice_date -- proven by the garbage-invoice_date row,
+    which is kept because CRSTL created it after the floor. Manual pushes never call
+    this. `now` far in the future so the rolling window doesn't bind here."""
     from app.netsuite_push import select_for_automation
     cand = [
-        {"transaction_id": "old",    "invoice_date": "2026-03-10"},  # pre-cutoff -> drop
-        {"transaction_id": "day0",   "invoice_date": "2026-09-10"},  # cutoff day  -> keep
-        {"transaction_id": "new",    "invoice_date": "2026-09-14"},  # after       -> keep
-        {"transaction_id": "nodate", "invoice_date": ""},            # undated     -> drop
-        {"transaction_id": "pushed", "invoice_date": "2026-09-12"},  # already pushed -> drop
+        {"transaction_id": "old",     "created_at": "2026-03-10T09:00:00Z"},  # pre-floor -> drop
+        {"transaction_id": "day0",    "created_at": "2026-09-11T00:30:00Z"},  # floor day  -> keep
+        {"transaction_id": "new",     "created_at": "2026-09-14T20:00:00Z"},  # after      -> keep
+        {"transaction_id": "nocreat", "created_at": ""},                      # undated    -> drop
+        {"transaction_id": "garbage", "created_at": "2026-09-12T10:00:00Z",   # bogus invoice_date
+                                      "invoice_date": "2008-11-10"},          #   -> keep (by created_at)
+        {"transaction_id": "pushed",  "created_at": "2026-09-13T10:00:00Z"},  # already pushed -> drop
     ]
-    unpushed = {"old", "day0", "new", "nodate"}   # 'pushed' not in unpushed
-    to_push, blocked = select_for_automation(cand, unpushed, go_live_after="2026-09-10", max_per_run=75)
+    unpushed = {"old", "day0", "new", "nocreat", "garbage"}   # 'pushed' not in unpushed
+    to_push, blocked = select_for_automation(
+        cand, unpushed, created_after="2026-09-11", max_per_run=75, now=_dt("2026-12-01"))
     assert blocked is None
-    assert {i["transaction_id"] for i in to_push} == {"day0", "new"}
+    assert {i["transaction_id"] for i in to_push} == {"day0", "new", "garbage"}
+
+
+def test_select_for_automation_rolling_window_excludes_old_backlog():
+    """The created_within_days window is the self-scaling guard: on a given run it
+    admits only recent inflow, so an Accepted-but-never-pushed backlog created weeks
+    ago is never dredged up -- even though the fixed floor would still admit it. The
+    effective lower bound is the LATER of created_after and (now - N days)."""
+    from app.netsuite_push import select_for_automation
+    cand = [
+        {"transaction_id": "backlog", "created_at": "2026-09-11T10:00:00Z"},  # > floor, but old
+        {"transaction_id": "recent",  "created_at": "2026-09-24T10:00:00Z"},  # within 7d of now
+    ]
+    unpushed = {"backlog", "recent"}
+    to_push, blocked = select_for_automation(
+        cand, unpushed, created_after="2026-09-11", created_within_days=7,
+        max_per_run=75, now=_dt("2026-09-25"))
+    assert blocked is None
+    assert {i["transaction_id"] for i in to_push} == {"recent"}   # backlog aged out
+
+
+def test_select_for_automation_floor_beats_window_when_window_is_wider():
+    """A window wider than the time since go-live must not relax the floor below
+    created_after -- the pre-go-live backlog stays out no matter how wide N is."""
+    from app.netsuite_push import select_for_automation
+    cand = [
+        {"transaction_id": "pre",  "created_at": "2026-09-05T10:00:00Z"},  # before floor
+        {"transaction_id": "post", "created_at": "2026-09-12T10:00:00Z"},  # after floor
+    ]
+    unpushed = {"pre", "post"}
+    to_push, blocked = select_for_automation(
+        cand, unpushed, created_after="2026-09-11", created_within_days=365,
+        max_per_run=75, now=_dt("2026-09-13"))
+    assert blocked is None
+    assert {i["transaction_id"] for i in to_push} == {"post"}
 
 
 def test_select_for_automation_refuses_over_cap():
     """A run larger than max_per_run is REFUSED whole (not truncated), so a scope
     slip can't blast -- a human reviews and runs it manually."""
     from app.netsuite_push import select_for_automation
-    cand = [{"transaction_id": str(n), "invoice_date": "2026-09-14"} for n in range(10)]
+    cand = [{"transaction_id": str(n), "created_at": "2026-09-14T10:00:00Z"} for n in range(10)]
     unpushed = {str(n) for n in range(10)}
-    to_push, blocked = select_for_automation(cand, unpushed, go_live_after="2026-09-10", max_per_run=5)
+    to_push, blocked = select_for_automation(
+        cand, unpushed, created_after="2026-09-11", max_per_run=5, now=_dt("2026-09-15"))
     assert to_push == []
     assert "exceeds max_per_run 5" in blocked
 
 
 def test_select_for_automation_no_guards_is_passthrough():
     from app.netsuite_push import select_for_automation
-    cand = [{"transaction_id": "a", "invoice_date": "2026-01-01"}]
-    to_push, blocked = select_for_automation(cand, {"a"})   # no cutoff, no cap
+    cand = [{"transaction_id": "a", "created_at": "2026-01-01T10:00:00Z"}]
+    to_push, blocked = select_for_automation(cand, {"a"})   # no floor, no window, no cap
     assert blocked is None and [i["transaction_id"] for i in to_push] == ["a"]
 
 

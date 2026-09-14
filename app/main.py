@@ -750,30 +750,38 @@ def _run_netsuite_push_job() -> None:
     invoices not yet pushed (tracking dedup) so it never re-posts a manual push;
     idempotent upsert makes a retry safe. Records the run + updates push state.
 
-    Two AUTOMATION-ONLY guards from config `automation` (select_for_automation):
-    a go-live DATE cutoff (nothing dated before it is ever auto-pushed -- the
-    149-incident guard) and a per-run hard CAP (an oversized set is REFUSED, not
-    truncated -- review and run manually to override). Manual pushes from the app
-    are NOT subject to either."""
+    AUTOMATION-ONLY guards from config `automation` (select_for_automation), all
+    keyed on created_at (when CRSTL created the record), not invoice_date: an
+    absolute go-live FLOOR (nothing created before it is ever auto-pushed -- the
+    149-incident backstop), a ROLLING created_within_days window (only recent
+    inflow auto-pushes, so the old backlog can never be dredged up and the guard
+    self-scales with volume), and a per-run hard CAP (an oversized set is REFUSED,
+    not truncated -- review and run manually to override). Manual pushes from the
+    app are NOT subject to any of these."""
     if not _job_enabled(AUTO_NS_PUSH_SETTING, default="false"):
         tracking.record_job_run("netsuite_push", "skipped", "disabled"); return
     auto = load_refs().get("automation") or {}
     cutoff = str(auto.get("go_live_after") or "") or None
+    within = auto.get("created_within_days")
     cap = auto.get("max_per_run")
     with _cache_lock:
         invoices = list(_cache["invoices"])
     candidates = eligible_for_push(invoices)
     unpushed = tracking.get_unpushed_ids([str(i["transaction_id"]) for i in candidates])
     to_push, blocked = select_for_automation(candidates, unpushed,
-                                              go_live_after=cutoff, max_per_run=cap)
+                                              created_after=cutoff,
+                                              created_within_days=within,
+                                              max_per_run=cap)
     if blocked:
         tracking.record_job_run("netsuite_push", "blocked",
                                 f"{blocked} -- refusing; run manually from the app to override")
         return
     if not to_push:
-        tracking.record_job_run(
-            "netsuite_push", "ok",
-            f"nothing new to push (on/after {cutoff})" if cutoff else "nothing new to push")
+        window = f" (created on/after {cutoff}" if cutoff else ""
+        if within is not None:
+            window = f"{window or ' (created'}, within {within}d"
+        window = f"{window})" if window else ""
+        tracking.record_job_run("netsuite_push", "ok", f"nothing new to push{window}")
         return
     # _run_netsuite_push reads the cache, pushes just these ids, sanitizes, and
     # updates _netsuite_push_state (so the dashboard's last-push panel reflects it).

@@ -22,6 +22,8 @@ Results are plain JSON-serialisable dicts so the API can return them directly.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from app.netsuite import transform_invoice, amount_flag
 from app.netsuite_payload import build_payload, load_refs, unresolved_ids
 
@@ -80,26 +82,44 @@ def eligible_for_push(invoices: list[dict]) -> list[dict]:
 
 
 def select_for_automation(candidates: list[dict], unpushed_ids, *,
-                          go_live_after: str | None = None,
-                          max_per_run: int | None = None) -> tuple[list[dict], str | None]:
+                          created_after: str | None = None,
+                          created_within_days: int | None = None,
+                          max_per_run: int | None = None,
+                          now: datetime | None = None) -> tuple[list[dict], str | None]:
     """AUTOMATION-ONLY selection for the scheduled push job, layered on top of
     eligible_for_push. NOT used by push_invoices, so manual pushes (dashboard/CLI)
     are never limited by this -- a human can deliberately push anything, including
-    pre-cutoff invoices.
+    old or pre-cutoff invoices.
 
-    Applies two guards and returns (to_push, blocked_reason):
-      * go_live_after -- a positive DATE cutoff: drop anything with invoice_date
-        before it (the 2026-09-11 149-incident guard). Protects the pre-cutoff
-        backlog from a scope slip regardless of tracking state; an undated invoice
-        is treated as before the cutoff (excluded).
+    The date guards key on `created_at` -- WHEN CRSTL created the record -- NOT
+    invoice_date. invoice_date can be back-dated or garbage (we have live rows
+    stamped invoice_date 2008 that CRSTL actually created in 2025), whereas
+    created_at is a reliable server timestamp present on every row. Comparison is
+    lexical on the YYYY-MM-DD prefix; a row with no created_at is treated as before
+    the floor (excluded).
+
+    Applies three guards and returns (to_push, blocked_reason):
+      * created_after -- an absolute FLOOR on created_at: nothing created before
+        this date is ever auto-pushed (the 2026-09-11 149-incident backstop).
+      * created_within_days -- a ROLLING recency window: only auto-push invoices
+        created within the last N days. This is the self-scaling guard -- it tracks
+        real inflow, so it needs no retuning as daily volume grows, and a scope slip
+        that dredges up the old backlog (created weeks/months ago) falls outside the
+        window and is never touched. The effective lower bound is the LATER of
+        created_after and (now - N days), so the floor is never relaxed below it.
       * max_per_run -- a hard per-run CAP: if the resulting set exceeds it, REFUSE
         the whole run (return [] and a reason) rather than risk a blast. A day that
-        large -- including the first catch-up run -- should be reviewed and run
-        manually. `blocked_reason` is None when the run may proceed.
+        large should be reviewed and run manually. `blocked_reason` is None when the
+        run may proceed.
     """
-    if go_live_after:
+    now = now or datetime.now(timezone.utc)
+    floor = created_after or ""
+    if created_within_days is not None:
+        window_start = (now - timedelta(days=created_within_days)).strftime("%Y-%m-%d")
+        floor = max(floor, window_start)   # the tighter (later) bound wins
+    if floor:
         candidates = [i for i in candidates
-                      if str(i.get("invoice_date") or "")[:10] >= go_live_after]
+                      if str(i.get("created_at") or "")[:10] >= floor]
     unpushed = {str(x) for x in unpushed_ids}
     to_push = [i for i in candidates if str(i.get("transaction_id")) in unpushed]
     if max_per_run is not None and len(to_push) > max_per_run:
