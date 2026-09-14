@@ -487,8 +487,14 @@ def _so_digest_data() -> dict:
         except Exception:
             pass
     ns_ids = tracking.get_netsuite_ids(list(eids.values()))
+    # invoice_number -> (SO-created date, direct SO link) for the Excel's SO column.
+    so_map = {}
+    for i in new_sos:
+        tx = str(i["transaction_id"])
+        created = (events.get(tx, {}).get("netsuite_at") or "")[:10]
+        so_map[str(i.get("invoice_number"))] = (created, _so_link(ns_ids.get(eids.get(tx))))
     return {"cutoff": cutoff, "new_sos": new_sos, "gaps": gaps,
-            "row_by_tx": row_by_tx, "eids": eids, "ns_ids": ns_ids}
+            "row_by_tx": row_by_tx, "eids": eids, "ns_ids": ns_ids, "so_map": so_map}
 
 
 def _so_digest_rows(data: dict) -> list[dict]:
@@ -513,35 +519,28 @@ def _so_digest_rows(data: dict) -> list[dict]:
 
 
 def _so_digest_html(data: dict, rows: list[dict]) -> str:
-    """The accounting email: a SUMMARY (by province, by product) as styled tables --
-    the per-SO detail lives in the attached Excel, not here -- plus an issues section
-    ONLY when there is something to flag (invoiced-but-no-SO, or SOs off the 810)."""
+    """The accounting email: a short headline + a Blinds-vs-Drapes summary table
+    (the one cut not in the Excel). The full per-SO detail -- each row linking to
+    its SO -- lives in the attached Excel. An Issues section renders ONLY when there
+    is something to flag (invoiced-but-no-SO, or an SO that doesn't tie to its 810),
+    and lists the specifics."""
     total = sum((r["total"] or 0) for r in rows)
-    prov: dict[str, list] = {}
     prod: dict[str, list] = {}
     for r in rows:
-        p = r["province"] or "—"
-        prov.setdefault(p, [0, 0.0]); prov[p][0] += 1; prov[p][1] += (r["total"] or 0)
         d = r["product"] or "—"
         prod.setdefault(d, [0, 0.0]); prod[d][0] += 1; prod[d][1] += (r["total"] or 0)
+    product_table = (
+        '<table cellpadding="6" cellspacing="0" border="1" '
+        'style="border-collapse:collapse;font-size:13px;margin:6px 0 14px">'
+        '<tr style="background:#1f3a5f;color:#ffffff"><th align="left">Product</th>'
+        '<th align="right">SOs</th><th align="right">Value (CAD)</th></tr>'
+        + "".join(f'<tr><td>{html.escape(k)}</td><td align="right">{cnt}</td>'
+                  f'<td align="right">${val:,.2f}</td></tr>'
+                  for k, (cnt, val) in sorted(prod.items()))
+        + f'<tr style="background:#eef2f7;font-weight:bold"><td>Total</td>'
+          f'<td align="right">{len(rows)}</td><td align="right">${total:,.2f}</td></tr></table>')
 
-    def summary_table(label: str, mapping: dict) -> str:
-        head = ('<table cellpadding="6" cellspacing="0" border="1" '
-                'style="border-collapse:collapse;font-size:13px;margin:6px 0 14px">'
-                f'<tr style="background:#1f3a5f;color:#ffffff">'
-                f'<th align="left">{html.escape(label)}</th>'
-                '<th align="right">SOs</th><th align="right">Value (CAD)</th></tr>')
-        body = "".join(
-            f'<tr><td>{html.escape(k)}</td><td align="right">{cnt}</td>'
-            f'<td align="right">${val:,.2f}</td></tr>'
-            for k, (cnt, val) in sorted(mapping.items()))
-        foot = (f'<tr style="background:#eef2f7;font-weight:bold"><td>Total</td>'
-                f'<td align="right">{len(rows)}</td><td align="right">${total:,.2f}</td></tr>')
-        return head + body + foot + "</table>"
-
-    h = (f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite, ready for invoice "
-         f"generation. Full list — each row links to its SO — is in the attached Excel.</p>"
-         + summary_table("Province", prov) + summary_table("Product", prod))
+    h = f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite.</p>" + product_table
 
     gaps = data["gaps"]
     mism = [r for r in rows if r["reconcile_flag"]]
@@ -562,29 +561,37 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
     return h
 
 
-def _so_digest_workbook(rows: list[dict], gaps: list[dict]) -> bytes:
-    """Excel of the SO list with a clickable NetSuite link per row (so accounting
-    opens each SO without searching), plus an Issues sheet for the gaps."""
-    from io import BytesIO
-    from openpyxl import Workbook
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Sales Orders"
-    ws.append(["CRSTL Invoice", "PO", "Customer", "Province", "Product", "Total (CAD)", "NetSuite SO"])
-    for r in rows:
-        ws.append([r["invoice_number"], r["po_number"], r["customer"], r["province"],
-                   r["product"], r["total"], "Open SO" if r["so_link"] else "search by Lead #"])
-        if r["so_link"]:
-            cell = ws.cell(row=ws.max_row, column=7)
-            cell.hyperlink = r["so_link"]
+def _so_digest_workbook(new_sos: list[dict], so_map: dict) -> bytes:
+    """The accounting Excel: the SAME export workbook (built from the 810s, so the
+    figures match the Export button exactly) PLUS a 'Netsuite SO created' column whose
+    cell links straight to each SO. so_map is {invoice_number: (created_date, so_url)}."""
+    import io
+    import re
+    from openpyxl import load_workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = load_workbook(io.BytesIO(_workbook_for(new_sos)))
+    ws = wb["Invoices"]
+    col = ws.max_column + 1
+    hdr = ws.cell(row=1, column=col, value="Netsuite SO created")
+    hdr.fill = PatternFill("solid", fgColor="1F3864")
+    hdr.font = Font(bold=True, color="FFFFFF", size=10)
+    hdr.alignment = Alignment(horizontal="center", vertical="center")
+    for r in range(2, ws.max_row + 1):
+        inv = ws.cell(row=r, column=1).value
+        if not inv or inv == "Total":
+            continue
+        created, url = so_map.get(str(inv), ("", ""))
+        cell = ws.cell(row=r, column=col, value=created or "—")
+        if url:
+            cell.hyperlink = url
             cell.style = "Hyperlink"
-    if gaps:
-        ws2 = wb.create_sheet("Issues - no SO")
-        ws2.append(["CRSTL Invoice", "PO", "Province", "Product", "Total (CAD)", "Issue"])
-        for g in gaps:
-            ws2.append([g.get("invoice_number"), g.get("po_number"), g.get("province"),
-                        g.get("product"), g.get("total_amount"), "invoiced in CRSTL, no SO in NetSuite"])
-    buf = BytesIO()
+    ws.column_dimensions[get_column_letter(col)].width = 20
+    m = re.match(r"A1:([A-Z]+)(\d+)", ws.auto_filter.ref or "")
+    if m:  # extend the filter to cover the new column
+        ws.auto_filter.ref = f"A1:{get_column_letter(col)}{m.group(2)}"
+    buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
@@ -613,9 +620,9 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
     body_html = _so_digest_html(data, rows)
 
     attachments = None
-    if rows or data["gaps"]:
+    if data["new_sos"]:
         attachments = [(f"hd_sales_orders_{today}.xlsx",
-                        _so_digest_workbook(rows, data["gaps"]), XLSX_MEDIA_TYPE)]
+                        _so_digest_workbook(data["new_sos"], data["so_map"]), XLSX_MEDIA_TYPE)]
 
     # Send FIRST; only mark reported once the mail is away, so a send failure leaves
     # the SOs to carry into tomorrow's digest rather than being silently dropped.

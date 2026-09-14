@@ -433,34 +433,40 @@ def test_so_digest_lists_pushed_sos_gaps_and_marks_reported(client, monkeypatch)
         result = _send_daily_digest()
     assert result["count"] == 1 and result["gaps"] == 1
     body = mail.call_args.kwargs["body_html"]
-    assert "Province" in body and "Product" in body and "Drape Panel" in body   # summary tables
+    assert "Product" in body and "Drape Panel" in body        # blinds-vs-drapes summary table
+    assert "Province" not in body                             # province table removed per feedback
     assert "INV-SO-2" in body                                  # the gap called out in issues
-    assert "INV-SO-1" not in body                              # per-SO detail lives in the Excel, not the email
+    assert "INV-SO-1" not in body                              # created-SO detail lives in the Excel, not the email
     # reported SO is marked so it won't repeat in the next digest
     assert tracking.get_latest_events(["so-1"])["so-1"]["so_digest_at"] is not None
     # the gap is NOT marked (still needs an SO)
     assert tracking.get_latest_events(["so-2"])["so-2"]["so_digest_at"] is None
 
 
-def test_so_digest_attaches_workbook_with_so_link(client, monkeypatch):
-    """The digest's Excel carries the per-SO detail with a clickable NetSuite link."""
-    from app.main import _cache, _send_daily_digest
-    from app import tracking
-    tracking.init_db()
-    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
-    monkeypatch.setenv("NETSUITE_ACCOUNT_ID", "734463")
-    tracking.record_events(["so-1"], "netsuite")
-    tracking.record_netsuite_push("CRSTL-sd1", "12345", "T1")
-    with patch.dict(_cache, {"invoices": _so_ready_invoices()}), \
-         patch("app.main.send_mail") as mail:
-        _send_daily_digest()
-    name, content, mime = mail.call_args.kwargs["attachments"][0]
-    assert name.endswith(".xlsx") and mime == XLSX_MEDIA_TYPE
-    ws = load_workbook(io.BytesIO(content))["Sales Orders"]
-    vals = [c.value for row in ws.iter_rows() for c in row]
-    assert "INV-SO-1" in vals                                   # SO detail is in the Excel
-    links = [c.hyperlink.target for row in ws.iter_rows() for c in row if c.hyperlink]
-    assert any("id=12345" in (l or "") for l in links)          # direct link to the SO
+def test_so_digest_workbook_adds_linked_so_column(monkeypatch):
+    """The digest Excel is the export workbook (Invoices sheet) plus a
+    'Netsuite SO created' column whose cell links straight to the SO."""
+    from app.main import _so_digest_workbook
+    from openpyxl import Workbook
+    # stand-in export workbook: one invoice row + a Total row, matching the real shape
+    wb = Workbook(); ws = wb.active; ws.title = "Invoices"
+    ws.append(["Invoice", "Type", "Total"])
+    ws.append(["INV-SO-1", "Dropship", 100.0])
+    ws.append(["Total", "", 100.0])
+    ws.auto_filter.ref = "A1:C2"
+    buf = io.BytesIO(); wb.save(buf); wb_bytes = buf.getvalue()
+    monkeypatch.setattr("app.main._workbook_for", lambda invs: wb_bytes)
+
+    url = "https://734463.app.netsuite.com/app/accounting/transactions/salesord.nl?id=999"
+    out = _so_digest_workbook([{"invoice_number": "INV-SO-1"}],
+                              {"INV-SO-1": ("2026-09-14", url)})
+    ws2 = load_workbook(io.BytesIO(out))["Invoices"]
+    headers = [c.value for c in ws2[1]]
+    assert "Netsuite SO created" in headers                     # new column added
+    col = headers.index("Netsuite SO created") + 1
+    cell = ws2.cell(row=2, column=col)
+    assert cell.value == "2026-09-14"
+    assert cell.hyperlink and "id=999" in cell.hyperlink.target  # links straight to the SO
 
 
 def test_sync_survives_finale_being_down(monkeypatch, client):
