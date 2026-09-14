@@ -513,59 +513,53 @@ def _so_digest_rows(data: dict) -> list[dict]:
 
 
 def _so_digest_html(data: dict, rows: list[dict]) -> str:
-    """The accounting email: summary (total / provinces / product) + the SO list
-    with direct links + an issues callout (invoiced-but-no-SO, SOs off the 810)."""
+    """The accounting email: a SUMMARY (by province, by product) as styled tables --
+    the per-SO detail lives in the attached Excel, not here -- plus an issues section
+    ONLY when there is something to flag (invoiced-but-no-SO, or SOs off the 810)."""
     total = sum((r["total"] or 0) for r in rows)
-    by_prov: dict[str, int] = {}
-    by_prod: dict[str, int] = {}
+    prov: dict[str, list] = {}
+    prod: dict[str, list] = {}
     for r in rows:
-        by_prov[r["province"] or "—"] = by_prov.get(r["province"] or "—", 0) + 1
-        by_prod[r["product"] or "—"] = by_prod.get(r["product"] or "—", 0) + 1
-    prov_str = ", ".join(f"{html.escape(p)} {c}" for p, c in sorted(by_prov.items())) or "—"
-    prod_str = ", ".join(f"{html.escape(p)} {c}" for p, c in sorted(by_prod.items())) or "—"
-    h = (f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite since the last "
-         f"digest, ready for invoice generation.</p>"
-         f"<p><strong>Total value:</strong> ${total:,.2f} CAD<br>"
-         f"<strong>By province:</strong> {prov_str}<br>"
-         f"<strong>By product:</strong> {prod_str}</p>")
-    if rows:
-        trs = ""
-        for r in rows:
-            link = (f'<a href="{html.escape(r["so_link"])}">Open SO</a>'
-                    if r["so_link"] else "search by Lead #")
-            trs += (f"<tr><td>{html.escape(str(r['invoice_number'] or ''))}</td>"
-                    f"<td>{html.escape(str(r['po_number'] or ''))}</td>"
-                    f"<td>{html.escape(str(r['customer'] or ''))}</td>"
-                    f"<td>{html.escape(str(r['province'] or ''))}</td>"
-                    f"<td>{html.escape(str(r['product'] or ''))}</td>"
-                    f'<td style="text-align:right">${(r["total"] or 0):,.2f}</td>'
-                    f"<td>{link}</td></tr>")
-        h += ('<table cellpadding="4" cellspacing="0" border="1" style="border-collapse:collapse">'
-              '<tr><th align="left">CRSTL Invoice</th><th align="left">PO</th>'
-              '<th align="left">Customer</th><th align="left">Prov</th>'
-              '<th align="left">Product</th><th align="right">Total</th>'
-              '<th align="left">NetSuite</th></tr>' + trs + "</table>")
+        p = r["province"] or "—"
+        prov.setdefault(p, [0, 0.0]); prov[p][0] += 1; prov[p][1] += (r["total"] or 0)
+        d = r["product"] or "—"
+        prod.setdefault(d, [0, 0.0]); prod[d][0] += 1; prod[d][1] += (r["total"] or 0)
+
+    def summary_table(label: str, mapping: dict) -> str:
+        head = ('<table cellpadding="6" cellspacing="0" border="1" '
+                'style="border-collapse:collapse;font-size:13px;margin:6px 0 14px">'
+                f'<tr style="background:#1f3a5f;color:#ffffff">'
+                f'<th align="left">{html.escape(label)}</th>'
+                '<th align="right">SOs</th><th align="right">Value (CAD)</th></tr>')
+        body = "".join(
+            f'<tr><td>{html.escape(k)}</td><td align="right">{cnt}</td>'
+            f'<td align="right">${val:,.2f}</td></tr>'
+            for k, (cnt, val) in sorted(mapping.items()))
+        foot = (f'<tr style="background:#eef2f7;font-weight:bold"><td>Total</td>'
+                f'<td align="right">{len(rows)}</td><td align="right">${total:,.2f}</td></tr>')
+        return head + body + foot + "</table>"
+
+    h = (f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite, ready for invoice "
+         f"generation. Full list — each row links to its SO — is in the attached Excel.</p>"
+         + summary_table("Province", prov) + summary_table("Product", prod))
+
     gaps = data["gaps"]
     mism = [r for r in rows if r["reconcile_flag"]]
-    issues = ""
-    if gaps:
-        gl = "".join(
-            f"<li>{html.escape(str(g.get('invoice_number') or ''))} — "
-            f"{html.escape(str(g.get('province') or '—'))} — "
-            f"{html.escape(str(g.get('product') or '—'))} — "
-            f"${(g.get('total_amount') or 0):,.2f}</li>" for g in gaps[:50])
-        issues += (f'<p style="color:#b45309"><strong>{len(gaps)} invoiced in CRSTL but NO SO '
-                   f'in NetSuite</strong> (accepted, on/after {html.escape(data["cutoff"])}):</p>'
-                   f"<ul>{gl}</ul>")
-    if mism:
-        ml = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))}: "
-                     f"{html.escape(str(r['reconcile_flag']))}</li>" for r in mism)
-        issues += (f'<p style="color:#b32020"><strong>{len(mism)} SO(s) do not tie to the '
-                   f"810:</strong></p><ul>{ml}</ul>")
-    if not issues:
-        issues = ('<p style="color:#2e7d32">No issues — every accepted invoice on/after the '
-                  "cutoff has a matching SO that ties to its 810.</p>")
-    return h + '<h3 style="margin-top:16px">Issues</h3>' + issues
+    if gaps or mism:
+        h += '<h3 style="color:#b32020;margin-top:16px">Issues</h3>'
+        if gaps:
+            gl = "".join(
+                f"<li>{html.escape(str(g.get('invoice_number') or ''))} — "
+                f"{html.escape(str(g.get('province') or '—'))} — "
+                f"{html.escape(str(g.get('product') or '—'))} — "
+                f"${(g.get('total_amount') or 0):,.2f}</li>" for g in gaps[:100])
+            h += (f"<p><strong>{len(gaps)} invoiced in CRSTL but no SO in NetSuite</strong> "
+                  f"(accepted, on/after {html.escape(data['cutoff'])}):</p><ul>{gl}</ul>")
+        if mism:
+            ml = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))}: "
+                         f"{html.escape(str(r['reconcile_flag']))}</li>" for r in mism)
+            h += f"<p><strong>{len(mism)} SO(s) do not tie to the 810:</strong></p><ul>{ml}</ul>"
+    return h
 
 
 def _so_digest_workbook(rows: list[dict], gaps: list[dict]) -> bytes:

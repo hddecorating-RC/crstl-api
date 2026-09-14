@@ -433,28 +433,34 @@ def test_so_digest_lists_pushed_sos_gaps_and_marks_reported(client, monkeypatch)
         result = _send_daily_digest()
     assert result["count"] == 1 and result["gaps"] == 1
     body = mail.call_args.kwargs["body_html"]
-    assert "INV-SO-1" in body and "22699999" in body          # the SO row + its link
-    assert "INV-SO-2" in body                                  # the gap called out
+    assert "Province" in body and "Product" in body and "Drape Panel" in body   # summary tables
+    assert "INV-SO-2" in body                                  # the gap called out in issues
+    assert "INV-SO-1" not in body                              # per-SO detail lives in the Excel, not the email
     # reported SO is marked so it won't repeat in the next digest
     assert tracking.get_latest_events(["so-1"])["so-1"]["so_digest_at"] is not None
     # the gap is NOT marked (still needs an SO)
     assert tracking.get_latest_events(["so-2"])["so-2"]["so_digest_at"] is None
 
 
-def test_so_digest_attaches_workbook(client, monkeypatch):
-    """The digest attaches an Excel of the SOs (with per-row NetSuite links)."""
+def test_so_digest_attaches_workbook_with_so_link(client, monkeypatch):
+    """The digest's Excel carries the per-SO detail with a clickable NetSuite link."""
     from app.main import _cache, _send_daily_digest
     from app import tracking
     tracking.init_db()
     monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    monkeypatch.setenv("NETSUITE_ACCOUNT_ID", "734463")
     tracking.record_events(["so-1"], "netsuite")
+    tracking.record_netsuite_push("CRSTL-sd1", "12345", "T1")
     with patch.dict(_cache, {"invoices": _so_ready_invoices()}), \
          patch("app.main.send_mail") as mail:
         _send_daily_digest()
-    attachments = mail.call_args.kwargs["attachments"]
-    assert len(attachments) == 1
-    name, content, mime = attachments[0]
+    name, content, mime = mail.call_args.kwargs["attachments"][0]
     assert name.endswith(".xlsx") and mime == XLSX_MEDIA_TYPE
+    ws = load_workbook(io.BytesIO(content))["Sales Orders"]
+    vals = [c.value for row in ws.iter_rows() for c in row]
+    assert "INV-SO-1" in vals                                   # SO detail is in the Excel
+    links = [c.hyperlink.target for row in ws.iter_rows() for c in row if c.hyperlink]
+    assert any("id=12345" in (l or "") for l in links)          # direct link to the SO
 
 
 def test_sync_survives_finale_being_down(monkeypatch, client):
