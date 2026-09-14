@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from app.crstl import CrstlClient
 from app import tracking
 from app.mail import send_mail, MailConfigError
-from app.netsuite import transform_invoice, resolve_customer
+from app.netsuite import transform_invoice, resolve_customer, external_id_for
 from app.netsuite_csv import build_netsuite_csv
 from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation
 from app.netsuite_payload import load_refs
@@ -447,142 +447,191 @@ def _reportable(invoices: list[dict]) -> list[dict]:
     return keep
 
 
-def _netsuite_push_digest_html() -> str:
-    """HTML section for the daily digest summarising the most recent NetSuite
-    push. The auto-push job runs at 5:00, before the 7:15 digest, so this reflects
-    it; a manual push later in the day would show instead."""
-    with _netsuite_push_lock:
-        st = dict(_netsuite_push_state)
-    heading = "<h3 style='margin-top:18px'>Pushed to NetSuite</h3>"
-    if st.get("mode") != "live" or not st.get("last_run"):
-        return heading + "<p>No NetSuite push since the last digest.</p>"
-    results = st.get("results") or []
-    sent = [r for r in results if r.get("status") == "sent"]
-    failed = [r for r in results if r.get("status") == "failed"]
-    skipped_mod = [r for r in results if r.get("status") == "skipped_modified"]
-    skipped_nb = [r for r in results if r.get("status") == "skipped_no_baseline"]
-    flagged_amt = [r for r in sent if r.get("amount_flag")]
-    created = sum(1 for r in sent if r.get("action") == "created")
-    updated = sum(1 for r in sent if r.get("action") == "updated")
-    total = sum((r.get("total") or 0) for r in sent)
-    # Created vs updated is the audit signal: a run that suddenly CREATES many
-    # where it should UPDATE is an early warning (e.g. the keying broke). skipped
-    # (changed on server) means the optimistic lock refused to overwrite an edit.
-    header = (heading + f"<p><strong>{len(sent)} invoice(s) pushed</strong> "
-              f"&middot; {created} created &middot; {updated} updated "
-              f"&middot; total ${total:,.2f} CAD"
-              + (f" &middot; <span style='color:#b32020'>{len(failed)} failed</span>" if failed else "")
-              + (f" &middot; <span style='color:#b45309'>{len(skipped_mod)} skipped (changed on server)</span>" if skipped_mod else "")
-              + (f" &middot; <span style='color:#b32020'>{len(skipped_nb)} skipped (NO BASELINE -- tracking.db lost?)</span>" if skipped_nb else "")
-              + (f" &middot; <span style='color:#b45309'>{len(flagged_amt)} amount-flagged (out of range)</span>" if flagged_amt else "")
-              + "</p>")
-    if st.get("blocked"):
-        header += f"<p style='color:#b45309'><strong>Blocked:</strong> {html.escape(str(st['blocked']))}</p>"
-    if not sent:
-        return header
-    rows = ""
-    for r in sent[:50]:
-        inv = html.escape(str(r.get("invoice_number") or r.get("transaction_id") or ""))
-        ch = html.escape(str(r.get("channel") or ""))
-        rows += (f"<tr><td>{inv}</td><td>{ch}</td>"
-                 f"<td style='text-align:right'>${(r.get('net') or 0):,.2f}</td>"
-                 f"<td style='text-align:right'>${(r.get('tax') or 0):,.2f}</td>"
-                 f"<td style='text-align:right'>${(r.get('total') or 0):,.2f}</td></tr>")
-    table = ("<table cellpadding='4' cellspacing='0' border='1' style='border-collapse:collapse'>"
-             "<tr><th align='left'>Invoice</th><th align='left'>Channel</th>"
-             "<th align='right'>Net</th><th align='right'>Tax</th><th align='right'>Total</th></tr>"
-             + rows + "</table>")
-    more = f"<p><em>&hellip; and {len(sent) - 50} more</em></p>" if len(sent) > 50 else ""
-    return header + table + more
+def _netsuite_base_url() -> str:
+    """Base URL for direct links to NetSuite records, from the account id."""
+    acct = os.environ.get("NETSUITE_ACCOUNT_ID", "").strip()
+    return f"https://{acct}.app.netsuite.com" if acct else ""
+
+
+def _so_link(netsuite_id) -> str:
+    """A direct link to the sales order in NetSuite, or "" if id/account is missing."""
+    base = _netsuite_base_url()
+    return f"{base}/app/accounting/transactions/salesord.nl?id={netsuite_id}" if (base and netsuite_id) else ""
+
+
+def _so_digest_data() -> dict:
+    """Receipt-sourced view for the accounting SO digest -- what actually happened,
+    not in-memory state. Scoped to the go-live cutoff. Returns the day's NEW SOs
+    (pushed to NetSuite, not yet reported) and the GAPS (accepted + eligible but no
+    SO created), plus a dry-run row per new SO for its numbers + reconcile flag."""
+    with _cache_lock:
+        invoices = list(_cache["invoices"])
+    cutoff = str((load_refs().get("automation") or {}).get("go_live_after") or "")
+    scoped = [i for i in eligible_for_push(invoices)
+              if str(i.get("invoice_date") or "")[:10] >= cutoff]
+    events = tracking.get_latest_events([str(i["transaction_id"]) for i in scoped])
+
+    def ev(i, k):
+        return events.get(str(i["transaction_id"]), {}).get(k)
+
+    new_sos = [i for i in scoped if ev(i, "netsuite_at") and not ev(i, "so_digest_at")]
+    gaps = [i for i in scoped if not ev(i, "netsuite_at")]
+    dry = (push_invoices(invoices, live=False,
+                         only=[str(i["transaction_id"]) for i in new_sos])["results"]
+           if new_sos else [])
+    row_by_tx = {str(r["transaction_id"]): r for r in dry}
+    eids = {}
+    for i in new_sos:
+        try:
+            eids[str(i["transaction_id"])] = external_id_for(i)
+        except Exception:
+            pass
+    ns_ids = tracking.get_netsuite_ids(list(eids.values()))
+    return {"cutoff": cutoff, "new_sos": new_sos, "gaps": gaps,
+            "row_by_tx": row_by_tx, "eids": eids, "ns_ids": ns_ids}
+
+
+def _so_digest_rows(data: dict) -> list[dict]:
+    """One display row per new SO: invoice, NetSuite customer + product, total,
+    reconcile flag, and a direct SO link."""
+    rows = []
+    for i in data["new_sos"]:
+        tx = str(i["transaction_id"])
+        r = data["row_by_tx"].get(tx, {})
+        ns_id = data["ns_ids"].get(data["eids"].get(tx))
+        rows.append({
+            "invoice_number": i.get("invoice_number"),
+            "po_number": i.get("po_number"),
+            "customer": r.get("customer_name") or (_netsuite_customer(i) or {}).get("name"),
+            "province": i.get("province") or r.get("where"),
+            "product": i.get("product"),
+            "total": r.get("total"),
+            "reconcile_flag": r.get("reconcile_flag"),
+            "so_link": _so_link(ns_id),
+        })
+    return rows
+
+
+def _so_digest_html(data: dict, rows: list[dict]) -> str:
+    """The accounting email: summary (total / provinces / product) + the SO list
+    with direct links + an issues callout (invoiced-but-no-SO, SOs off the 810)."""
+    total = sum((r["total"] or 0) for r in rows)
+    by_prov: dict[str, int] = {}
+    by_prod: dict[str, int] = {}
+    for r in rows:
+        by_prov[r["province"] or "—"] = by_prov.get(r["province"] or "—", 0) + 1
+        by_prod[r["product"] or "—"] = by_prod.get(r["product"] or "—", 0) + 1
+    prov_str = ", ".join(f"{html.escape(p)} {c}" for p, c in sorted(by_prov.items())) or "—"
+    prod_str = ", ".join(f"{html.escape(p)} {c}" for p, c in sorted(by_prod.items())) or "—"
+    h = (f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite since the last "
+         f"digest, ready for invoice generation.</p>"
+         f"<p><strong>Total value:</strong> ${total:,.2f} CAD<br>"
+         f"<strong>By province:</strong> {prov_str}<br>"
+         f"<strong>By product:</strong> {prod_str}</p>")
+    if rows:
+        trs = ""
+        for r in rows:
+            link = (f'<a href="{html.escape(r["so_link"])}">Open SO</a>'
+                    if r["so_link"] else "search by Lead #")
+            trs += (f"<tr><td>{html.escape(str(r['invoice_number'] or ''))}</td>"
+                    f"<td>{html.escape(str(r['po_number'] or ''))}</td>"
+                    f"<td>{html.escape(str(r['customer'] or ''))}</td>"
+                    f"<td>{html.escape(str(r['province'] or ''))}</td>"
+                    f"<td>{html.escape(str(r['product'] or ''))}</td>"
+                    f'<td style="text-align:right">${(r["total"] or 0):,.2f}</td>'
+                    f"<td>{link}</td></tr>")
+        h += ('<table cellpadding="4" cellspacing="0" border="1" style="border-collapse:collapse">'
+              '<tr><th align="left">CRSTL Invoice</th><th align="left">PO</th>'
+              '<th align="left">Customer</th><th align="left">Prov</th>'
+              '<th align="left">Product</th><th align="right">Total</th>'
+              '<th align="left">NetSuite</th></tr>' + trs + "</table>")
+    gaps = data["gaps"]
+    mism = [r for r in rows if r["reconcile_flag"]]
+    issues = ""
+    if gaps:
+        gl = "".join(
+            f"<li>{html.escape(str(g.get('invoice_number') or ''))} — "
+            f"{html.escape(str(g.get('province') or '—'))} — "
+            f"{html.escape(str(g.get('product') or '—'))} — "
+            f"${(g.get('total_amount') or 0):,.2f}</li>" for g in gaps[:50])
+        issues += (f'<p style="color:#b45309"><strong>{len(gaps)} invoiced in CRSTL but NO SO '
+                   f'in NetSuite</strong> (accepted, on/after {html.escape(data["cutoff"])}):</p>'
+                   f"<ul>{gl}</ul>")
+    if mism:
+        ml = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))}: "
+                     f"{html.escape(str(r['reconcile_flag']))}</li>" for r in mism)
+        issues += (f'<p style="color:#b32020"><strong>{len(mism)} SO(s) do not tie to the '
+                   f"810:</strong></p><ul>{ml}</ul>")
+    if not issues:
+        issues = ('<p style="color:#2e7d32">No issues — every accepted invoice on/after the '
+                  "cutoff has a matching SO that ties to its 810.</p>")
+    return h + '<h3 style="margin-top:16px">Issues</h3>' + issues
+
+
+def _so_digest_workbook(rows: list[dict], gaps: list[dict]) -> bytes:
+    """Excel of the SO list with a clickable NetSuite link per row (so accounting
+    opens each SO without searching), plus an Issues sheet for the gaps."""
+    from io import BytesIO
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sales Orders"
+    ws.append(["CRSTL Invoice", "PO", "Customer", "Province", "Product", "Total (CAD)", "NetSuite SO"])
+    for r in rows:
+        ws.append([r["invoice_number"], r["po_number"], r["customer"], r["province"],
+                   r["product"], r["total"], "Open SO" if r["so_link"] else "search by Lead #"])
+        if r["so_link"]:
+            cell = ws.cell(row=ws.max_row, column=7)
+            cell.hyperlink = r["so_link"]
+            cell.style = "Hyperlink"
+    if gaps:
+        ws2 = wb.create_sheet("Issues - no SO")
+        ws2.append(["CRSTL Invoice", "PO", "Province", "Product", "Total (CAD)", "Issue"])
+        for g in gaps:
+            ws2.append([g.get("invoice_number"), g.get("po_number"), g.get("province"),
+                        g.get("product"), g.get("total_amount"), "invoiced in CRSTL, no SO in NetSuite"])
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
-    """Send an invoice email.
+    """The daily accounting digest: the sales orders created in NetSuite since the
+    last digest (ready for invoice generation), a summary (total / province /
+    product), and an issues callout. Sourced from durable push receipts, not
+    in-memory state. Always sends -- accounting uses receipt as proof of life.
 
-    Two modes:
-    - Digest (selected_ids is None): pull invoices not yet emailed. Always
-      sends, even on zero new invoices — accounting uses receipt as proof
-      the pipeline is alive.
-    - Selection (selected_ids provided): send exactly those invoices,
-      regardless of whether they've been emailed before.
-
-    In both modes, sent invoices are marked with an 'emailed' tracking event
-    so they don't appear in future digests.
-
-    Returns a summary dict. Raises MailConfigError if env vars missing.
+    Reported SOs are marked with a 'so_digest' event so they don't repeat tomorrow.
+    (`selected_ids` is accepted for API compatibility but the digest is receipt-
+    driven, so it is ignored.) Raises MailConfigError if recipients are unset.
     """
-    recipients_raw = os.environ.get("MAIL_RECIPIENTS", "")
-    recipients = [r.strip() for r in recipients_raw.split(",") if r.strip()]
+    recipients = [r.strip() for r in os.environ.get("MAIL_RECIPIENTS", "").split(",") if r.strip()]
     if not recipients:
         raise MailConfigError("MAIL_RECIPIENTS not set (comma-separated addresses)")
 
-    with _cache_lock:
-        invoices = list(_cache["invoices"])
-
-    if selected_ids is not None:
-        selected_set = set(selected_ids)
-        to_send = [inv for inv in invoices if inv["transaction_id"] in selected_set]
-        mode = "selection"
-    else:
-        # Accepted only. Drafts are the warehouse's superseded resubmissions;
-        # emailing them duplicates invoices in accounting's queue.
-        reportable = _reportable(invoices)
-        all_ids = [inv["transaction_id"] for inv in reportable]
-        new_ids = set(tracking.get_unemailed_ids(all_ids))
-        to_send = [inv for inv in reportable if inv["transaction_id"] in new_ids]
-        mode = "digest"
-
+    data = _so_digest_data()
+    rows = _so_digest_rows(data)
     today = date.today().isoformat()
-    if to_send:
-        total = sum(inv.get("total_amount", 0) for inv in to_send)
-        by_province: dict[str, int] = {}
-        for inv in to_send:
-            p = inv.get("province") or "—"
-            by_province[p] = by_province.get(p, 0) + 1
-        # HTML-escape every interpolated value — province today is a 2-letter code from Crstl
-        # so exploitability is nil, but Crstl-controlled strings drifting into email HTML is
-        # the exact class of injection that becomes a real bug the day they add a description field.
-        prov_rows = "".join(
-            f"<tr><td>{html.escape(p)}</td><td style='text-align:right'>{c}</td></tr>"
-            for p, c in sorted(by_province.items())
-        )
+    n = len(rows)
+    subject = f"HD Sales Orders for invoicing — {today} — {n} SO(s)"
+    if data["gaps"]:
+        subject += f" · {len(data['gaps'])} issue(s)"
+    body_html = _so_digest_html(data, rows)
 
-        if mode == "selection":
-            subject = f"HD Invoices — {today} — {len(to_send)} selected"
-            intro = f"<p>{len(to_send)} invoice(s) sent manually from the dashboard.</p>"
-        else:
-            subject = f"HD Invoice Digest — {today} — {len(to_send)} new"
-            intro = f"<p>{len(to_send)} new invoice(s) since the last digest.</p>"
+    attachments = None
+    if rows or data["gaps"]:
+        attachments = [(f"hd_sales_orders_{today}.xlsx",
+                        _so_digest_workbook(rows, data["gaps"]), XLSX_MEDIA_TYPE)]
 
-        body_html = f"""
-            {intro}
-            <p><strong>Total value:</strong> ${total:,.2f} CAD</p>
-            <table cellpadding="4" cellspacing="0" border="1" style="border-collapse:collapse">
-              <tr><th align="left">Province</th><th align="right">Count</th></tr>
-              {prov_rows}
-            </table>
-            <p>Full details attached as an Excel workbook.</p>
-        """
-        # Raises ReportUnavailable if Crstl can't be reached. That aborts the
-        # send, which is deliberate: nothing is marked emailed, so tomorrow's
-        # digest carries these invoices instead of accounting receiving a
-        # workbook that quietly omits them.
-        attachments = [(f"hd_invoices_{today}.xlsx", _workbook_for(to_send), XLSX_MEDIA_TYPE)]
-    else:
-        # Only reachable in digest mode — selection mode with 0 matches is a caller bug
-        subject = f"HD Invoice Digest — {today} — 0 new"
-        body_html = "<p>No new invoices since the last digest. Pipeline is healthy.</p>"
-        attachments = None
-
-    if mode == "digest":
-        body_html += _netsuite_push_digest_html()
-
+    # Send FIRST; only mark reported once the mail is away, so a send failure leaves
+    # the SOs to carry into tomorrow's digest rather than being silently dropped.
     send_mail(subject=subject, body_html=body_html, recipients=recipients, attachments=attachments)
+    reported_ids = [str(i["transaction_id"]) for i in data["new_sos"]]
+    if reported_ids:
+        tracking.record_events(reported_ids, "so_digest")
 
-    if to_send:
-        tracking.record_events([inv["transaction_id"] for inv in to_send], "emailed")
-
-    return {"sent_to": recipients, "count": len(to_send), "subject": subject, "mode": mode}
+    return {"sent_to": recipients, "count": n, "gaps": len(data["gaps"]),
+            "subject": subject, "mode": "so_digest"}
 
 
 AUTO_DIGEST_SETTING = "auto_digest_enabled"
@@ -613,8 +662,9 @@ def _run_daily_digest_job() -> None:
             _digest_state["last_sent"] = datetime.now(timezone.utc).isoformat()
             _digest_state["count"] = result["count"]
             _digest_state["error"] = None
-        print(f"Digest: sent {result['count']} invoices to {result['sent_to']}")
-        tracking.record_job_run("daily_digest", "ok", f"{result['count']} invoice(s) emailed")
+        print(f"Digest: sent {result['count']} SO(s) to {result['sent_to']}")
+        tracking.record_job_run("daily_digest", "ok",
+                                f"{result['count']} SO(s), {result.get('gaps', 0)} issue(s)")
     except Exception as exc:
         with _digest_lock:
             _digest_state["error"] = str(exc)

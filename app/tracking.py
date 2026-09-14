@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 # Event types the app writes. Enforced in application code, not via a DB CHECK
 # constraint — SQLite can't ALTER a CHECK, and letting the schema outlive the
 # app's event vocabulary made adding 'emailed' painful.
-EVENT_TYPES = ("exported", "netsuite", "emailed")
+EVENT_TYPES = ("exported", "netsuite", "emailed", "so_digest")
 
 # Last write failure — surfaced via `write_health()` so the /api/health endpoint
 # can report "digest ran but couldn't record — expect re-sends tomorrow".
@@ -305,3 +305,22 @@ def get_netsuite_last_modified(external_id: str) -> str | None:
     except Exception as exc:
         print(f"WARNING: netsuite_records read failed for {external_id!r}: {exc}")
         return None
+
+
+def get_netsuite_ids(external_ids: list[str]) -> dict[str, str]:
+    """{external_id: netsuite_id} for the given externalIds we have pushed -- used
+    to build direct links to each SO in the accounting digest. Missing/failed reads
+    just omit the id (the digest falls back to a search-by-Lead# note)."""
+    ids = [e for e in external_ids if e]
+    if not ids:
+        return {}
+    try:
+        with contextlib.closing(_connect()) as conn:
+            placeholders = ",".join("?" * len(ids))
+            rows = conn.execute(
+                f"SELECT external_id, netsuite_id FROM netsuite_records WHERE external_id IN ({placeholders})",
+                ids).fetchall()
+        return {r[0]: r[1] for r in rows if r[1]}
+    except Exception as exc:
+        print(f"WARNING: netsuite_records batch read failed: {exc}")
+        return {}

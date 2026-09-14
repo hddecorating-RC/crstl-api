@@ -402,54 +402,59 @@ def test_explicit_id_selection_is_honoured_even_for_a_draft(client):
     assert _invoice_numbers(content) == ["INV-tx-dr1"]
 
 
-def test_draft_is_not_marked_emailed_so_it_can_be_reported_once_accepted(client):
-    """Filtering defers, it must never lose. A Draft withheld today has to
-    still be unemailed tomorrow, so the digest picks it up the moment HD
-    acknowledges it."""
+def _so_ready_invoices():
+    """Two Accepted, on/after-cutoff, mappable dropship invoices for the SO digest."""
+    base = {"status": "Accepted", "due_date": "", "store": None, "province": "ON",
+            "product": "Drape Panel", "invoice_date": "2026-09-12"}
+    return [
+        {**base, "transaction_id": "so-1", "source_document_id": "sd1", "invoice_number": "INV-SO-1",
+         "po_number": "PO1", "subtotal": 100.0, "allowance_amount": 5.19, "discount_amount": 0.0,
+         "total_amount": 107.14},
+        {**base, "transaction_id": "so-2", "source_document_id": "sd2", "invoice_number": "INV-SO-2",
+         "po_number": "PO2", "subtotal": 200.0, "allowance_amount": 10.38, "discount_amount": 0.0,
+         "total_amount": 214.27},
+    ]
+
+
+def test_so_digest_lists_pushed_sos_gaps_and_marks_reported(client, monkeypatch):
+    """The daily digest lists SOs actually pushed to NetSuite (with a direct link),
+    flags invoiced-but-no-SO as an issue, and marks the reported ones so they don't
+    repeat tomorrow -- sourced from durable receipts, not in-memory state."""
     from app.main import _cache, _send_daily_digest
-    from app.tracking import get_unemailed_ids
-    client.post("/api/sync")
-    with patch.dict(_cache, {"invoices": _mixed_status_invoices()}), \
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    monkeypatch.setenv("NETSUITE_ACCOUNT_ID", "734463")
+    # so-1 was pushed (receipt + stored SO internal id); so-2 was not (a gap).
+    tracking.record_events(["so-1"], "netsuite")
+    tracking.record_netsuite_push("CRSTL-sd1", "22699999", "T1")
+    with patch.dict(_cache, {"invoices": _so_ready_invoices()}), \
          patch("app.main.send_mail") as mail:
         result = _send_daily_digest()
-    assert result["count"] == 1, "only the Accepted invoice should be emailed"
-    assert mail.called
-    # the drafts remain unemailed and are therefore still eligible later
-    assert set(get_unemailed_ids(["tx-acc", "tx-dr1", "tx-dr2"])) == {"tx-dr1", "tx-dr2"}
+    assert result["count"] == 1 and result["gaps"] == 1
+    body = mail.call_args.kwargs["body_html"]
+    assert "INV-SO-1" in body and "22699999" in body          # the SO row + its link
+    assert "INV-SO-2" in body                                  # the gap called out
+    # reported SO is marked so it won't repeat in the next digest
+    assert tracking.get_latest_events(["so-1"])["so-1"]["so_digest_at"] is not None
+    # the gap is NOT marked (still needs an SO)
+    assert tracking.get_latest_events(["so-2"])["so-2"]["so_digest_at"] is None
 
 
-def test_digest_attaches_the_workbook(client, monkeypatch):
-    """The digest carries the same workbook the Export button produces. These
-    are the two surfaces accounting actually receives, so they must not drift
-    into different formats — or different figures — from one another."""
-    from app.main import _send_daily_digest
+def test_so_digest_attaches_workbook(client, monkeypatch):
+    """The digest attaches an Excel of the SOs (with per-row NetSuite links)."""
+    from app.main import _cache, _send_daily_digest
+    from app import tracking
+    tracking.init_db()
     monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
-    client.post("/api/sync")
-    with patch("app.main.send_mail") as mail:
-        result = _send_daily_digest()
-    assert result["count"] == 1
+    tracking.record_events(["so-1"], "netsuite")
+    with patch.dict(_cache, {"invoices": _so_ready_invoices()}), \
+         patch("app.main.send_mail") as mail:
+        _send_daily_digest()
     attachments = mail.call_args.kwargs["attachments"]
     assert len(attachments) == 1
     name, content, mime = attachments[0]
-    assert name.endswith(".xlsx")
-    assert mime == XLSX_MEDIA_TYPE
-    assert _invoice_numbers(content) == ["INV-tx-001"]
-
-
-def test_digest_aborts_rather_than_emailing_without_the_workbook(client, monkeypatch):
-    """If Crstl can't be reached the digest must fail, not send. Nothing is
-    marked emailed, so tomorrow's digest still carries these invoices instead
-    of accounting receiving a mail that quietly omits them."""
-    from app.main import _send_daily_digest, ReportUnavailable
-    from app.tracking import get_unemailed_ids
-    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
-    client.post("/api/sync")
-    with patch("app.main.rows_for_transactions", return_value=[]), \
-         patch("app.main.send_mail") as mail:
-        with pytest.raises(ReportUnavailable):
-            _send_daily_digest()
-    assert not mail.called
-    assert get_unemailed_ids(["tx-001"]) == ["tx-001"]
+    assert name.endswith(".xlsx") and mime == XLSX_MEDIA_TYPE
 
 
 def test_sync_survives_finale_being_down(monkeypatch, client):
