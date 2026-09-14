@@ -643,18 +643,14 @@ def _auto_digest_enabled() -> bool:
     return tracking.get_setting(AUTO_DIGEST_SETTING, "true").lower() != "false"
 
 
-def _run_daily_digest_job() -> None:
-    """Scheduler entry point — wraps _send_daily_digest with state tracking.
-    Honors the runtime auto-digest toggle: if disabled, the job logs and
-    exits without sending. Manual /api/email/send-digest is unaffected."""
-    if not _auto_digest_enabled():
-        print("Digest: auto-send disabled via settings, skipping scheduled run")
-        tracking.record_job_run("daily_digest", "skipped", "disabled")
-        return
+def _send_digest_safe(reason: str) -> bool:
+    """Send the accounting digest and update digest state; never raises (best-effort).
+    Returns True if it sent. The _digest_lock guard stops a post-push send and the
+    scheduled run from overlapping. `reason` is logged so the run history shows what
+    triggered each digest (post-push vs scheduled)."""
     with _digest_lock:
         if _digest_state.get("sending"):
-            print("Digest: already running, skipping")
-            return
+            return False
         _digest_state["sending"] = True
     try:
         result = _send_daily_digest()
@@ -662,17 +658,41 @@ def _run_daily_digest_job() -> None:
             _digest_state["last_sent"] = datetime.now(timezone.utc).isoformat()
             _digest_state["count"] = result["count"]
             _digest_state["error"] = None
-        print(f"Digest: sent {result['count']} SO(s) to {result['sent_to']}")
+        print(f"Digest ({reason}): {result['count']} SO(s) to {result['sent_to']}")
         tracking.record_job_run("daily_digest", "ok",
-                                f"{result['count']} SO(s), {result.get('gaps', 0)} issue(s)")
+                                f"{result['count']} SO(s), {result.get('gaps', 0)} issue(s) [{reason}]")
+        return True
     except Exception as exc:
         with _digest_lock:
             _digest_state["error"] = str(exc)
-        print(f"WARNING: digest send failed: {exc}")
-        tracking.record_job_run("daily_digest", "error", str(exc)[:200])
+        print(f"WARNING: digest send failed ({reason}): {exc}")
+        tracking.record_job_run("daily_digest", "error", f"{str(exc)[:180]} [{reason}]")
+        return False
     finally:
         with _digest_lock:
             _digest_state["sending"] = False
+
+
+def _run_daily_digest_job() -> None:
+    """Scheduled SAFETY-NET for the accounting digest. The digest normally fires the
+    moment a push completes (see _run_netsuite_push) -- no waiting for a fixed time.
+    This daily run only sends when something is still unreported: newly-pushed SOs a
+    post-push send missed (e.g. mail was down), or invoiced-but-no-SO gaps. Quiet days
+    send nothing. Honors the auto-digest toggle."""
+    if not _auto_digest_enabled():
+        print("Digest: auto-send disabled via settings, skipping scheduled run")
+        tracking.record_job_run("daily_digest", "skipped", "disabled")
+        return
+    try:
+        data = _so_digest_data()
+    except Exception as exc:
+        print(f"WARNING: digest data build failed: {exc}")
+        tracking.record_job_run("daily_digest", "error", str(exc)[:200])
+        return
+    if not data["new_sos"] and not data["gaps"]:
+        tracking.record_job_run("daily_digest", "ok", "nothing to report")
+        return
+    _send_digest_safe("scheduled")
 
 
 # ---- Automation control: on/off toggles, schedule, and run logs ----------
@@ -955,6 +975,11 @@ def _run_netsuite_push(live: bool, ids: Optional[list[str]], limit: Optional[int
             "blocked": result.get("blocked"),
             "error": None,
         })
+    # Fire the accounting digest the moment SOs actually land in NetSuite -- no
+    # waiting for the scheduled run. Live pushes only; best-effort so a digest
+    # failure never fails the push (the scheduled safety-net will catch it).
+    if live and (result.get("summary") or {}).get("sent", 0) > 0 and _auto_digest_enabled():
+        _send_digest_safe("post-push")
     return result
 
 

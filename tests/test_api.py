@@ -513,3 +513,23 @@ def test_reportable_defers_send_success_without_warning(capsys):
     kept = _reportable(rows)
     assert [r["transaction_id"] for r in kept] == ["t2"]      # Send_Success deferred
     assert "Send_Success" not in capsys.readouterr().out      # known state -> no warning
+
+
+def test_live_push_fires_digest_dry_run_does_not(client, monkeypatch):
+    """The digest fires the moment a live push lands SOs (no waiting for 7:15); a
+    dry run never sends. Guarded by the auto-digest toggle."""
+    from app.main import _run_netsuite_push, _cache
+    monkeypatch.setattr("app.main._auto_digest_enabled", lambda: True)
+    fake = {"mode": "live", "summary": {"sent": 2, "failed": 0}, "unresolved": [],
+            "results": [], "blocked": None}
+    with patch.dict(_cache, {"invoices": []}), \
+         patch("app.main.push_invoices", return_value=fake), \
+         patch("app.main._send_digest_safe") as digest:
+        _run_netsuite_push(live=True, ids=["x"], limit=None)
+    digest.assert_called_once()
+
+    with patch.dict(_cache, {"invoices": []}), \
+         patch("app.main.push_invoices", return_value={**fake, "mode": "dry", "summary": {"sent": 0, "failed": 0}}), \
+         patch("app.main._send_digest_safe") as digest2:
+        _run_netsuite_push(live=False, ids=None, limit=None)
+    digest2.assert_not_called()
