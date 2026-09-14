@@ -238,8 +238,8 @@ def test_build_sales_order_payload_shape():
     assert body["orderStatus"] == {"id": "A"}       # Pending Approval -- approval-queue gate
     assert body["customForm"] == {"id": "231"}      # the SO form, NOT invoice form 101
     assert body["class"] == {"id": "5"}
-    # Invoice-only fields must NOT leak onto an SO.
-    assert "custbodyinvoicepercent" not in body     # invoice deposit field
+    # INVOICE % forced to 100 (form 102 defaults it to 50 -- OMIS's deposit split).
+    assert body["custbodyinvoicepercent"] == 100
     assert "dueDate" not in body                     # SO carries terms, not a due date
 
 
@@ -252,7 +252,7 @@ def test_build_sales_order_payload_omits_blank_custom_form_and_status():
 
 def test_build_payload_dispatches_on_record_type():
     so = build_payload(LINES, SO_REFS)               # record_type from refs
-    assert "orderStatus" in so and "custbodyinvoicepercent" not in so
+    assert "orderStatus" in so and "dueDate" not in so and so["custbodyinvoicepercent"] == 100
     inv = build_payload(LINES, REFS)                 # no record_type -> defaults to invoice
     assert "custbodyinvoicepercent" in inv and "orderStatus" not in inv
     forced = build_payload(LINES, SO_REFS, record_type="invoice")   # explicit wins over refs

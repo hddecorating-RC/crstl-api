@@ -285,7 +285,7 @@ def test_push_builds_sales_order_when_configured():
     p = client.calls[0][1]
     assert p["orderStatus"] == {"id": "A"}          # Pending Approval carried through
     assert p["customForm"] == {"id": "231"}
-    assert "custbodyinvoicepercent" not in p        # invoice-only field never leaks onto the SO
+    assert p["custbodyinvoicepercent"] == 100        # INVOICE % forced to 100 (form default is 50)
 
 
 def test_select_for_automation_applies_cutoff_and_dedup():

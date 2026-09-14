@@ -146,8 +146,10 @@ def build_sales_order_payload(line_records: list[dict], refs: dict | None = None
         routing is enabled; otherwise it silently creates the SO as "B".
       * customForm is the SO's own form (config sales_order.custom_form_id), NOT the
         invoice form 101.
-      * no custbodyinvoicepercent (an invoice deposit field) and no dueDate (an SO
-        carries terms, not a due date).
+      * custbodyinvoicepercent = 100: form 102 (OMIS's form) carries the "INVOICE %"
+        field and DEFAULTS it to 50 (OMIS's 50%-now/50%-later deposit model); HD
+        Canada bills in full, so force 100 -- same as the invoice path.
+      * no dueDate (an SO carries terms, not a due date).
     """
     if not line_records:
         raise ValueError("build_sales_order_payload needs at least one line record")
@@ -161,6 +163,9 @@ def build_sales_order_payload(line_records: list[dict], refs: dict | None = None
         "tranDate": head["tran_date"],
         "memo": head["memo"],
         "otherRefNum": head.get("invoice_number") or head["other_ref_num"],
+        # Form 102 defaults "INVOICE %" to 50 (OMIS's 50/50 deposit split); HD Canada
+        # is billed in full, so force 100 (same as the invoice body).
+        "custbodyinvoicepercent": 100,
         "item": _item_sublist(line_records, refs),
     }
     # Optional fields -- only sent when present, so NetSuite derives/rejects nothing.
