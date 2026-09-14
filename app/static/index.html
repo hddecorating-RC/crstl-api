@@ -375,18 +375,32 @@
                 <dt class="text-xs text-gray-400">Total</dt>
                 <dd class="text-2xl font-bold text-slate-800 mt-0.5" x-text="fmtMoney(activeInvoice.total_amount)"></dd>
               </div>
-              <!-- Discrepancy warning — shows only when the invoice doesn't reconcile
-                   (subtotal − allowances − discounts + freight + fees + tax ≠ total).
-                   Non-zero means HD's SAC data is incomplete or wrong for this invoice. -->
+              <!-- Reconciliation note — shows only when the invoice doesn't reconcile
+                   (subtotal − allowances − discounts + freight + fees + tax_from_SAC ≠ total).
+                   When a tax_suggestion fully covers the residual (HD didn't itemize the
+                   tax as a SAC segment — routine for dropship/DSD), it's a neutral INFO
+                   note, not a problem. Amber ⚠ is reserved for residuals nothing explains:
+                   a positive one with no tax match (missing tax/charge code) or a negative
+                   one (extra deduction / double-counted allowance). -->
               <template x-if="Math.abs(activeInvoice.discrepancy || 0) > 0.01">
-                <div class="col-span-2 bg-amber-50 border border-amber-200 rounded p-3 -mt-2">
-                  <dt class="text-xs font-semibold text-amber-800 uppercase tracking-wide">⚠ Unreconciled</dt>
-                  <dd class="text-sm text-amber-900 mt-1">
+                <div class="col-span-2 border rounded p-3 -mt-2"
+                     :class="activeInvoice.tax_suggestion ? 'bg-sky-50 border-sky-200' : 'bg-amber-50 border-amber-200'">
+                  <dt class="text-xs font-semibold uppercase tracking-wide"
+                      :class="activeInvoice.tax_suggestion ? 'text-sky-800' : 'text-amber-800'"
+                      x-text="activeInvoice.tax_suggestion ? 'Tax not itemized' : '⚠ Unreconciled'"></dt>
+                  <dd class="text-sm mt-1"
+                      :class="activeInvoice.tax_suggestion ? 'text-sky-900' : 'text-amber-900'">
                     <span class="font-mono font-semibold" x-text="(activeInvoice.discrepancy > 0 ? '+' : '') + fmtMoney(activeInvoice.discrepancy)"></span>
-                    unexplained by SAC data.
-                    <span x-show="activeInvoice.discrepancy > 0 && !activeInvoice.tax_suggestion">Likely missing tax or charge code.</span>
-                    <span x-show="activeInvoice.discrepancy < 0">Likely double-counted allowance or extra deduction.</span>
-                    <span x-show="activeInvoice.tax_suggestion">See suggested tax above.</span>
+                    <template x-if="activeInvoice.tax_suggestion">
+                      <span>not itemized in HD's SAC data — see suggested tax above.</span>
+                    </template>
+                    <template x-if="!activeInvoice.tax_suggestion">
+                      <span>
+                        unexplained by SAC data.
+                        <span x-show="activeInvoice.discrepancy > 0">Likely missing tax or charge code.</span>
+                        <span x-show="activeInvoice.discrepancy < 0">Likely double-counted allowance or extra deduction.</span>
+                      </span>
+                    </template>
                   </dd>
                 </div>
               </template>
