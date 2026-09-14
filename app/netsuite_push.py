@@ -183,6 +183,11 @@ def push_invoices(
             **_reconcile(inv, lines),
         }
         row["amount_flag"] = amount_flag(row.get("gross"), row["channel"])
+        # Reconcile guard: our total MUST equal CRSTL's 810 total (hd_total). A
+        # non-zero delta means the record would not match the invoice HD pays --
+        # surface it loudly rather than book a wrong number silently.
+        d = row.get("delta")
+        row["reconcile_flag"] = None if (d is None or d == 0) else f"total off CRSTL 810 by {d:+.2f}"
         for tag in unresolved_ids(lines, refs):
             if tag not in unresolved:
                 unresolved.append(tag)

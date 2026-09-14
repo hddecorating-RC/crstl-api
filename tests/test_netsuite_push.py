@@ -322,3 +322,25 @@ def test_select_for_automation_no_guards_is_passthrough():
     cand = [{"transaction_id": "a", "invoice_date": "2026-01-01"}]
     to_push, blocked = select_for_automation(cand, {"a"})   # no cutoff, no cap
     assert blocked is None and [i["transaction_id"] for i in to_push] == ["a"]
+
+
+def test_reconcile_flag_none_when_total_matches_crstl():
+    """Row ties to CRSTL's 810 total (delta 0) -> no reconcile flag."""
+    inv = {"transaction_id": "T-OK", "source_document_id": "S-OK", "invoice_number": "INVOK",
+           "product": "Drape Panel", "status": "Accepted", "po_number": "POK",
+           "invoice_date": "2026-09-11", "due_date": "", "subtotal": 100.0,
+           "allowance_amount": 6.0, "discount_amount": 0.0, "total_amount": 106.22,
+           "store": "VAUGHAN", "province": "ON"}
+    r = push_invoices([inv], live=False, refs=REFS_FULL)["results"][0]
+    assert r["status"] == "built" and r["total"] == 106.22 and r["reconcile_flag"] is None
+
+
+def test_reconcile_flag_set_when_total_differs_from_crstl():
+    """A total that doesn't match CRSTL's 810 is flagged, not silently booked."""
+    inv = {"transaction_id": "T-BAD", "source_document_id": "S-BAD", "invoice_number": "INVBAD",
+           "product": "Drape Panel", "status": "Accepted", "po_number": "POB",
+           "invoice_date": "2026-09-11", "due_date": "", "subtotal": 100.0,
+           "allowance_amount": 6.0, "discount_amount": 0.0, "total_amount": 200.0,
+           "store": "VAUGHAN", "province": "ON"}
+    r = push_invoices([inv], live=False, refs=REFS_FULL)["results"][0]
+    assert r["reconcile_flag"] and "off CRSTL 810" in r["reconcile_flag"]

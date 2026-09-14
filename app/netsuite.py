@@ -144,10 +144,17 @@ def transform_invoice(invoice: dict, province: str | None, store: str | None) ->
         }
 
         gross = round(invoice["subtotal"], 2)
-        # Discount amount is computed here so the total is deterministic and the
-        # interim CSV path works; `rate` must match the NetSuite Discount item's
-        # stored rate, so NetSuite recomputing it changes nothing.
-        discount_amount = -round(gross * discount["rate"], 2)
+        # Book the ACTUAL vendor reduction CRSTL put on the 810 (allowance + discount),
+        # NOT gross * a flat rate. CRSTL sums its individually-rounded SAC allowances
+        # (Trade/IBx/MET), which lands a few cents off any single rate; accounting
+        # reconciles NetSuite against the invoice HD actually pays, and NetSuite records
+        # the exact amount we send (verified 2026-09-14 on SO491632: pushed -8.28, kept
+        # -8.28, SO total = CRSTL 810 to the penny). Fall back to the flat rate only if
+        # CRSTL reports no reduction (unexpected for an Accepted invoice) -- the reconcile
+        # guard in push_invoices then flags any total that doesn't tie out to the 810.
+        crstl_reduction = round((invoice.get("allowance_amount") or 0)
+                                + (invoice.get("discount_amount") or 0), 2)
+        discount_amount = -crstl_reduction if crstl_reduction > 0 else -round(gross * discount["rate"], 2)
         net = round(gross + discount_amount, 2)
         tax = round(net * route["tax_rate"], 2)
 

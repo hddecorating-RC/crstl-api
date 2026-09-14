@@ -66,6 +66,8 @@ def _print_row(r: dict) -> None:
         line += f"   -> {r.get('location')}"
     if r["status"] == "failed":
         line += f"   FAIL: {r.get('error')}"
+    if r.get("reconcile_flag"):
+        line += f"   ** {r['reconcile_flag']} **"
     print(line)
 
 

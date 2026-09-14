@@ -354,3 +354,26 @@ def test_amount_flag_soft_per_channel_bounds():
     assert amount_flag(100, "dropship", cfg) is None
     assert amount_flag(100, "nochannel", cfg) is None        # no bounds -> no flag
     assert amount_flag(None, "dsd", cfg) is None
+
+
+def test_transform_books_crstl_reported_reduction(mock_config):
+    """When CRSTL reports the actual 810 reduction (allowance + discount), the
+    discount line books THAT exact amount -- not gross * the flat rate -- so the SO
+    ties to the invoice HD pays (verified live on SO491632)."""
+    from app.netsuite import transform_invoice
+    inv = {**SAMPLE_INVOICE, "product": "Blind", "subtotal": 160.30,
+           "allowance_amount": 5.48, "discount_amount": 2.80, "total_amount": 171.78}
+    merch, disc = transform_invoice(inv, province="ON", store=None)      # dropship ON blind
+    assert merch["amount"] == 160.30
+    assert disc["amount"] == -8.28          # CRSTL's 5.48 + 2.80, NOT 160.30 * 5.19% = 8.32
+    assert merch["tax_amount"] == 19.76     # net 152.02 * 13%
+    total = round(sum(l["amount"] for l in (merch, disc)) + merch["tax_amount"], 2)
+    assert total == inv["total_amount"] == 171.78     # ties to the 810 exactly
+
+
+def test_transform_falls_back_to_rate_when_no_crstl_reduction(mock_config):
+    """No CRSTL allowance/discount reported => fall back to gross * the flat rate."""
+    from app.netsuite import transform_invoice
+    inv = {**SAMPLE_INVOICE, "subtotal": 1000.0, "allowance_amount": 0.0}  # no discount_amount
+    _, disc = transform_invoice(inv, province="ON", store="VAUGHAN")
+    assert disc["amount"] == -round(1000.0 * 0.0619, 2)                    # 61.90 rate fallback
