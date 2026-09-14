@@ -72,6 +72,14 @@ class NetSuiteModifiedOnServer(RuntimeError):
     manual review, rather than overwriting whatever changed."""
 
 
+class NetSuiteExternalIdConflict(RuntimeError):
+    """The externalId already belongs to a DIFFERENT transaction type in NetSuite --
+    the eid namespace is shared across transaction types. E.g. an invoice holds
+    CRSTL-<sid> and we're pushing a salesOrder: the SO cannot be created until the
+    conflicting record is removed. Surfaced clearly instead of NetSuite's raw 400
+    ("Transaction type specified is incorrect")."""
+
+
 class NetSuiteNoBaseline(RuntimeError):
     """Raised when a record already EXISTS in NetSuite under our externalId but we
     have NO local baseline (lastModifiedDate) for it -- e.g. tracking.db was lost
@@ -222,12 +230,23 @@ class NetSuiteClient:
 
     def get_by_external_id(self, record_type: str, external_id: str):
         """The record under our externalId as a dict, or None on 404. Read-only --
-        used to decide created-vs-updated and to read lastModifiedDate for the guard."""
+        used to decide created-vs-updated and to read lastModifiedDate for the guard.
+
+        Raises NetSuiteExternalIdConflict when the externalId exists but as a DIFFERENT
+        transaction type (NetSuite answers the typed eid GET with 400 "Transaction type
+        specified is incorrect") -- e.g. an invoice already holds CRSTL-<sid> and we ask
+        for a salesOrder."""
         try:
             return self._request("GET", f"/record/v1/{record_type}/eid:{quote(external_id, safe='')}")
         except NetSuiteUnavailable as exc:
-            if "-> 404" in str(exc):
+            s = str(exc)
+            if "-> 404" in s:
                 return None
+            if "-> 400" in s and "ransaction type" in s:
+                raise NetSuiteExternalIdConflict(
+                    f"externalId {external_id!r} is already held by a different transaction type "
+                    f"in NetSuite (not a {record_type}; most likely an invoice) -- it must be "
+                    f"removed before a {record_type} can use this externalId") from exc
             raise
 
     def get_record(self, record_type: str, record_id: str, expand: bool = True) -> dict:

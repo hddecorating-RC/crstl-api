@@ -477,7 +477,7 @@
     <div x-show="netsuitePush.last_run" class="mt-2 text-xs text-gray-500 flex items-center gap-2 flex-wrap">
       <span x-text="'Last: ' + (netsuitePush.mode || '') + ' · ' + (netsuitePush.last_run ? fmtTime(netsuitePush.last_run) : '')"></span>
       <template x-if="netsuitePush.summary">
-        <span x-text="'built ' + netsuitePush.summary.built + ', sent ' + netsuitePush.summary.sent + ', failed ' + netsuitePush.summary.failed + ', skipped ' + netsuitePush.summary.skipped_no_map"></span>
+        <span x-text="'built ' + netsuitePush.summary.built + ', sent ' + netsuitePush.summary.sent + ', failed ' + netsuitePush.summary.failed + ', skipped ' + netsuitePush.summary.skipped_no_map + (netsuitePush.summary.skipped_exists ? ', exists ' + netsuitePush.summary.skipped_exists : '') + (netsuitePush.summary.skipped_conflict ? ', conflict ' + netsuitePush.summary.skipped_conflict : '')"></span>
       </template>
       <button x-show="netsuitePush.results && netsuitePush.results.length" @click="showPreview = true"
               class="text-blue-600 hover:text-blue-800 hover:underline">View details →</button>
@@ -849,9 +849,9 @@ function dashboard() {
     // sends live (refused by the server while any id is unresolved -> data.blocked).
     // ids: a list of transaction_ids to scope the push (one invoice, or the
     // current selection). Null/empty => all cached invoices (the dry-run preview).
-    async pushNetsuite(dryRun, ids = null) {
+    async pushNetsuite(dryRun, ids = null, confirmExisting = false) {
       ids = ids && ids.length ? ids : null;
-      if (!dryRun) {
+      if (!dryRun && !confirmExisting) {
         const scope = ids ? (ids.length === 1 ? `invoice ${ids[0]}` : `${ids.length} invoices`) : 'ALL invoices';
         if (!confirm(`Push ${scope} LIVE to NetSuite now? This writes to production NetSuite.`)) return;
       }
@@ -860,7 +860,7 @@ function dashboard() {
         const res = await fetch('/api/netsuite', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ dry_run: dryRun, ids }),
+          body: JSON.stringify({ dry_run: dryRun, ids, confirm_existing: confirmExisting }),
         });
         const data = await res.json();
         if (res.status === 409) { this.showToast(data.message || 'A push is already running'); return; }
@@ -875,6 +875,17 @@ function dashboard() {
           await this.loadInvoices();   // refresh netsuite_at markers
           if (this.activeInvoice) {    // keep the open flyout in sync
             this.activeInvoice = this.invoices.find(i => i.transaction_id === this.activeInvoice.transaction_id) || this.activeInvoice;
+          }
+          // Cross-type collision: an invoice already holds the externalId — can't be an SO.
+          const conflict = data.summary.skipped_conflict || 0;
+          if (conflict) this.showToast(conflict + ' blocked — externalId already held by an existing invoice (delete it first)');
+          // Explicit confirm before overwriting anything already in NetSuite.
+          const exists = data.summary.skipped_exists || 0;
+          if (exists && !confirmExisting) {
+            const existIds = (data.results || []).filter(r => r.status === 'skipped_exists').map(r => r.transaction_id);
+            if (confirm(exists + ' of these already exist in NetSuite. UPDATE (overwrite) them now?')) {
+              await this.pushNetsuite(false, existIds, true);   // re-push just those, confirmed
+            }
           }
         }
       } catch {

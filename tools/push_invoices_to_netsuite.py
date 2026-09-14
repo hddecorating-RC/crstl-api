@@ -78,6 +78,9 @@ def main() -> None:
     parser.add_argument("--only", metavar="TXN_ID", help="push just this transaction_id")
     parser.add_argument("--limit", type=int, help="cap the number processed")
     parser.add_argument("--json", action="store_true", help="dump the full result dict")
+    parser.add_argument("--confirm-existing", action="store_true",
+                        help="allow UPDATING records that already exist in NetSuite "
+                             "(default: they are skipped, never overwritten)")
     args = parser.parse_args()
 
     load_env()
@@ -94,6 +97,7 @@ def main() -> None:
         live=args.live,
         only=[args.only] if args.only else None,
         limit=args.limit,
+        confirm_existing=args.confirm_existing,
     )
 
     if args.only and not result["results"]:
@@ -117,7 +121,10 @@ def main() -> None:
     s = result["summary"]
     mode = "LIVE" if args.live else "DRY RUN"
     print(f"\n{mode}: {s['built']} built, {s['sent']} sent, {s['failed']} failed, "
-          f"{s['skipped_no_map']} skipped (no mapping).")
+          f"{s['skipped_no_map']} no-map, {s.get('skipped_exists', 0)} already-exist, "
+          f"{s.get('skipped_conflict', 0)} eid-conflict.")
+    if s.get("skipped_exists"):
+        print("  (already in NetSuite — re-run with --confirm-existing to UPDATE them.)")
     if not args.live:
         print("Re-run with --live to send (no sandbox -- use --only/--limit for one controlled record).")
 

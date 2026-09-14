@@ -125,6 +125,7 @@ def push_invoices(
     limit: int | None = None,
     refs: dict | None = None,
     client=None,
+    confirm_existing: bool = False,
 ) -> dict:
     """Build (and, when live, send) NetSuite invoices for these Crstl invoices.
 
@@ -152,6 +153,8 @@ def push_invoices(
     skipped_no_map = 0
     skipped_invalid = 0
     skipped_no_baseline = 0
+    skipped_exists = 0        # already in NetSuite; needs explicit confirm to update
+    skipped_conflict = 0      # externalId held by a different transaction type (invoice)
 
     for inv in invoices:
         tid = str(inv.get("transaction_id", "?"))
@@ -203,9 +206,11 @@ def push_invoices(
             return {"mode": mode, "unresolved": unresolved, "results": results,
                     "summary": {"built": len(prepared), "sent": 0, "failed": 0,
                                 "skipped_no_map": skipped_no_map, "skipped_modified": 0,
-                                "skipped_invalid": skipped_invalid, "skipped_no_baseline": skipped_no_baseline},
+                                "skipped_invalid": skipped_invalid, "skipped_no_baseline": skipped_no_baseline,
+                                "skipped_exists": 0, "skipped_conflict": 0},
                     "blocked": "unresolved ids"}
-        from app.netsuite_client import NetSuiteClient, NetSuiteUnavailable, NetSuiteModifiedOnServer, NetSuiteNoBaseline
+        from app.netsuite_client import (NetSuiteClient, NetSuiteUnavailable, NetSuiteModifiedOnServer,
+                                          NetSuiteNoBaseline, NetSuiteExternalIdConflict)
         from app import tracking
         if client is None:
             if not NetSuiteClient.configured():
@@ -216,30 +221,48 @@ def push_invoices(
         pushed_ids: list[str] = []
         for row, payload in prepared:
             eid = payload.get("externalId")
+            # VALIDATION: never overwrite a record already booked in NetSuite without
+            # an explicit confirm. Read-only existence check first; a cross-type eid
+            # collision (an invoice already holds our eid) is surfaced clearly.
             try:
-                # Optimistic lock: pass the lastModifiedDate we recorded when we
-                # last wrote this record; the client aborts if NetSuite's copy has
-                # changed since (someone edited our record) rather than overwrite.
-                guard = tracking.get_netsuite_last_modified(eid) if eid else None
+                existing = client.get_by_external_id(record_type, eid) if eid else None
+            except NetSuiteExternalIdConflict as exc:
+                row["status"] = "skipped_conflict"; row["error"] = str(exc)
+                skipped_conflict += 1
+                continue
+            except Exception as exc:
+                row["status"] = "failed"; row["error"] = str(exc)
+                failed += 1
+                continue
+            if existing is not None and not confirm_existing:
+                # Already in NetSuite. Refuse to touch it unless the caller confirms --
+                # a booked record was put there deliberately (by us, or accounting).
+                row["status"] = "skipped_exists"
+                row["action"] = "exists"
+                row["error"] = (f"already in NetSuite as {record_type} "
+                                f"{existing.get('tranId') or existing.get('id')} — confirm to update")
+                skipped_exists += 1
+                continue
+            try:
+                # New -> create. Existing + confirmed -> update, guarding against a
+                # concurrent edit between our read and the write (fresh lastModified).
+                guard = existing.get("lastModifiedDate") if existing is not None else None
                 result = client.upsert(payload, record_type, guard_last_modified=guard)
                 row["status"] = "sent"
                 row["location"] = result.get("location") or result
-                # "created" vs "updated" -- proves a re-push UPDATED our own record
-                # and never created a duplicate or touched another source.
+                # "created" vs "updated" -- proves a confirmed re-push UPDATED our own
+                # record and never created a duplicate or touched another source.
                 row["action"] = result.get("action") if isinstance(result, dict) else None
                 if isinstance(result, dict) and eid:
-                    # Store the new lastModifiedDate as the next push's guard.
                     tracking.record_netsuite_push(eid, result.get("netsuite_id"), result.get("last_modified"))
                 sent += 1
                 pushed_ids.append(row["transaction_id"])
             except NetSuiteNoBaseline as exc:
-                # Record exists but we have no baseline (tracking.db lost). Do NOT
-                # overwrite -- flag for a deliberate reseed. (M2)
                 row["status"] = "skipped_no_baseline"
                 row["error"] = str(exc)
                 skipped_no_baseline += 1
             except NetSuiteModifiedOnServer as exc:
-                # OMIS's "Record modified on server!" -- do NOT overwrite; flag it.
+                # Changed in NetSuite between our read and the write -- do NOT overwrite.
                 row["status"] = "skipped_modified"
                 row["error"] = str(exc)
                 skipped_modified += 1
@@ -261,5 +284,6 @@ def push_invoices(
         "results": results,
         "summary": {"built": len(prepared), "sent": sent, "failed": failed,
                     "skipped_no_map": skipped_no_map, "skipped_modified": skipped_modified,
-                    "skipped_invalid": skipped_invalid, "skipped_no_baseline": skipped_no_baseline},
+                    "skipped_invalid": skipped_invalid, "skipped_no_baseline": skipped_no_baseline,
+                    "skipped_exists": skipped_exists, "skipped_conflict": skipped_conflict},
     }

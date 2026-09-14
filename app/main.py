@@ -860,6 +860,9 @@ class NetsuitePushRequest(BaseModel):
     dry_run: bool = True
     ids: Optional[list[str]] = None
     limit: Optional[int] = Field(default=None, ge=1)
+    # Off by default: a record already in NetSuite is skipped, never overwritten.
+    # Set true to explicitly UPDATE existing records (the "confirm to update" flow).
+    confirm_existing: bool = False
 
 
 def _sanitize_push_result(result: dict) -> dict:
@@ -874,15 +877,19 @@ def _sanitize_push_result(result: dict) -> dict:
     return result
 
 
-def _run_netsuite_push(live: bool, ids: Optional[list[str]], limit: Optional[int]) -> dict:
+def _run_netsuite_push(live: bool, ids: Optional[list[str]], limit: Optional[int],
+                       confirm_existing: bool = False) -> dict:
     """Push the cached invoices via the shared engine and record the run. Runs in
-    a worker thread (the upsert loop is blocking network I/O)."""
+    a worker thread (the upsert loop is blocking network I/O). confirm_existing=False
+    (default, incl. the scheduled job) skips records already in NetSuite; True updates
+    them (the dashboard's explicit 'confirm to update')."""
     with _cache_lock:
         invoices = list(_cache["invoices"])
     # Eligibility (Accepted + latest-per-invoice + non-zero) is enforced INSIDE
     # push_invoices, so the manual button, dry-run, scheduled job and CLI all get
     # the same filter -- no caller can bypass it.
-    result = _sanitize_push_result(push_invoices(invoices, live=live, only=ids, limit=limit))
+    result = _sanitize_push_result(push_invoices(invoices, live=live, only=ids, limit=limit,
+                                                 confirm_existing=confirm_existing))
     with _netsuite_push_lock:
         _netsuite_push_state.update({
             "last_run": datetime.now(timezone.utc).isoformat(),
@@ -915,7 +922,8 @@ async def netsuite_push(body: NetsuitePushRequest = NetsuitePushRequest()) -> JS
             return JSONResponse(status_code=409, content={"message": "A NetSuite push is already in progress"})
         _netsuite_push_state["running"] = True
     try:
-        result = await asyncio.to_thread(_run_netsuite_push, not body.dry_run, body.ids, body.limit)
+        result = await asyncio.to_thread(_run_netsuite_push, not body.dry_run, body.ids, body.limit,
+                                         body.confirm_existing)
     except Exception as exc:
         print(f"NetSuite push failed: {exc}")   # detail to journald, not to the caller
         with _netsuite_push_lock:

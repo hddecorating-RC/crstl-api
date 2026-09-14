@@ -49,6 +49,8 @@ class FakeClient:
     def __init__(self, fail_on=None):
         self.calls = []
         self.fail_on = fail_on or set()
+    def get_by_external_id(self, record_type, external_id):
+        return None
     def upsert(self, payload, record_type="invoice", guard_last_modified=None):
         self.calls.append(payload)
         if payload["externalId"] in self.fail_on:
@@ -66,7 +68,7 @@ def test_dry_run_builds_and_reconciles_without_sending():
     with patch("app.tracking.record_events") as rec:
         out = push_invoices(INVOICES, live=False, refs=REFS_PARTIAL)
     assert out["mode"] == "dry"
-    assert out["summary"] == {"built": 2, "sent": 0, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0, "skipped_no_baseline": 0}
+    assert out["summary"] == {"built": 2, "sent": 0, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0, "skipped_no_baseline": 0, "skipped_exists": 0, "skipped_conflict": 0}
     dsd = next(r for r in out["results"] if r["transaction_id"] == "T-DSD")
     assert dsd["channel"] == "dsd" and dsd["status"] == "built"
     assert dsd["gross"] == 100.0 and dsd["discount"] == -6.19 and dsd["net"] == 93.81
@@ -96,7 +98,7 @@ def test_live_sends_and_records_tracking():
          patch("app.tracking.record_netsuite_push"):
         out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
     assert out["mode"] == "live"
-    assert out["summary"] == {"built": 2, "sent": 2, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0, "skipped_no_baseline": 0}
+    assert out["summary"] == {"built": 2, "sent": 2, "failed": 0, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0, "skipped_no_baseline": 0, "skipped_exists": 0, "skipped_conflict": 0}
     assert len(client.calls) == 2
     sent = [r for r in out["results"] if r["status"] == "sent"]
     assert {r["transaction_id"] for r in sent} == {"T-DSD", "T-DROP"}
@@ -110,7 +112,7 @@ def test_live_one_failure_does_not_stop_the_batch():
          patch("app.tracking.get_netsuite_last_modified", return_value=None), \
          patch("app.tracking.record_netsuite_push"):
         out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
-    assert out["summary"] == {"built": 2, "sent": 1, "failed": 1, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0, "skipped_no_baseline": 0}
+    assert out["summary"] == {"built": 2, "sent": 1, "failed": 1, "skipped_no_map": 1, "skipped_modified": 0, "skipped_invalid": 0, "skipped_no_baseline": 0, "skipped_exists": 0, "skipped_conflict": 0}
     failed = next(r for r in out["results"] if r["status"] == "failed")
     assert failed["transaction_id"] == "T-DROP" and "boom" in failed["error"]
     # only the successful one is logged
@@ -154,6 +156,8 @@ def test_modified_on_server_is_skipped_not_overwritten():
     class GuardClient:
         def __init__(self):
             self.calls = []
+        def get_by_external_id(self, record_type, external_id):
+            return None
         def upsert(self, payload, record_type="invoice", guard_last_modified=None):
             self.calls.append(payload["externalId"])
             if payload["externalId"] == "CRSTL-S-DROP":
@@ -232,6 +236,8 @@ def test_push_invoices_skips_no_baseline_never_overwrites():
     class NoBaseClient:
         def __init__(self):
             self.calls = []
+        def get_by_external_id(self, record_type, external_id):
+            return None
         def upsert(self, payload, record_type="invoice", guard_last_modified=None):
             self.calls.append(payload["externalId"])
             if payload["externalId"] == "CRSTL-S-DROP":
@@ -271,6 +277,8 @@ def test_push_builds_sales_order_when_configured():
     class RecordingClient:
         def __init__(self):
             self.calls = []
+        def get_by_external_id(self, record_type, external_id):
+            return None
         def upsert(self, payload, record_type="invoice", guard_last_modified=None):
             self.calls.append((record_type, payload))
             return {"location": "/x", "action": "created", "netsuite_id": "1", "last_modified": "T"}
@@ -344,3 +352,55 @@ def test_reconcile_flag_set_when_total_differs_from_crstl():
            "store": "VAUGHAN", "province": "ON"}
     r = push_invoices([inv], live=False, refs=REFS_FULL)["results"][0]
     assert r["reconcile_flag"] and "off CRSTL 810" in r["reconcile_flag"]
+
+
+def test_skips_existing_record_without_confirm():
+    """A record already in NetSuite is SKIPPED (never overwritten) unless confirmed."""
+    class ExistsClient:
+        def __init__(self): self.upserts = []
+        def get_by_external_id(self, record_type, external_id):
+            return {"id": "999", "tranId": "SO999", "lastModifiedDate": "T1"}
+        def upsert(self, payload, record_type="invoice", guard_last_modified=None):
+            self.upserts.append(payload)
+            return {"location": "/x", "action": "updated", "netsuite_id": "999", "last_modified": "T2"}
+    client = ExistsClient()
+    with patch("app.tracking.record_events"), patch("app.tracking.record_netsuite_push"):
+        out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)   # confirm_existing default False
+    assert client.upserts == []                                    # nothing written
+    statuses = {r["status"] for r in out["results"] if r["status"] != "skipped_no_map"}
+    assert statuses == {"skipped_exists"}
+    assert out["summary"]["skipped_exists"] == 2 and out["summary"]["sent"] == 0
+
+
+def test_confirm_existing_updates_the_record():
+    """With confirm_existing=True the existing record is UPDATED, guarded by its
+    fresh lastModifiedDate."""
+    class ExistsClient:
+        def __init__(self): self.guards = []
+        def get_by_external_id(self, record_type, external_id):
+            return {"id": "999", "tranId": "SO999", "lastModifiedDate": "T1"}
+        def upsert(self, payload, record_type="invoice", guard_last_modified=None):
+            self.guards.append(guard_last_modified)
+            return {"location": "/x", "action": "updated", "netsuite_id": "999", "last_modified": "T2"}
+    client = ExistsClient()
+    with patch("app.tracking.record_events"), patch("app.tracking.record_netsuite_push"):
+        out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client, confirm_existing=True)
+    assert out["summary"]["sent"] == 2 and out["summary"]["skipped_exists"] == 0
+    assert all(g == "T1" for g in client.guards)                   # fresh lastModified used as guard
+
+
+def test_skips_on_external_id_type_conflict():
+    """An externalId held by a DIFFERENT transaction type (an invoice) -> skipped_conflict,
+    never a create attempt."""
+    from app.netsuite_client import NetSuiteExternalIdConflict
+    class ConflictClient:
+        def __init__(self): self.upserts = []
+        def get_by_external_id(self, record_type, external_id):
+            raise NetSuiteExternalIdConflict("held by an invoice")
+        def upsert(self, payload, record_type="invoice", guard_last_modified=None):
+            self.upserts.append(payload); return {}
+    client = ConflictClient()
+    with patch("app.tracking.record_events"), patch("app.tracking.record_netsuite_push"):
+        out = push_invoices(INVOICES, live=True, refs=REFS_FULL, client=client)
+    assert client.upserts == []
+    assert out["summary"]["skipped_conflict"] == 2 and out["summary"]["sent"] == 0
