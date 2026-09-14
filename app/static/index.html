@@ -39,11 +39,11 @@
         <div class="text-xs text-gray-400 mt-1">Not yet sent</div>
       </div>
       <div class="bg-white rounded-lg border border-gray-200 p-4 cursor-pointer hover:border-green-400 transition"
-           :class="activeFilter === 'Sent' ? 'ring-2 ring-green-400' : ''"
-           @click="activeFilter = activeFilter === 'Sent' ? 'All' : 'Sent'; currentPage = 1">
-        <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Sent</div>
-        <div class="text-3xl font-bold text-green-500" x-text="counts.Sent"></div>
-        <div class="text-xs text-gray-400 mt-1">Transmitted to HD</div>
+           :class="activeFilter === 'Accepted' ? 'ring-2 ring-green-400' : ''"
+           @click="activeFilter = activeFilter === 'Accepted' ? 'All' : 'Accepted'; currentPage = 1">
+        <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Accepted</div>
+        <div class="text-3xl font-bold text-green-500" x-text="counts.Accepted"></div>
+        <div class="text-xs text-gray-400 mt-1">Received &amp; accepted by HD</div>
       </div>
       <div class="bg-white rounded-lg border border-gray-200 p-4">
         <div class="text-xs uppercase tracking-wide text-gray-400 mb-1">Total Value</div>
@@ -104,7 +104,7 @@
       <div class="flex items-center gap-2">
         <template x-if="selected.size === 0">
           <div class="flex items-center gap-2">
-            <template x-for="f in ['All','Draft','Sent']" :key="f">
+            <template x-for="f in ['All','Draft','Sent','Accepted']" :key="f">
               <button @click="activeFilter = f; currentPage = 1"
                       :class="activeFilter === f ? 'bg-blue-600 text-white' : 'bg-white text-gray-500 border border-gray-200 hover:border-blue-400'"
                       class="px-4 py-2 rounded-full text-xs font-medium transition" x-text="f"></button>
@@ -614,7 +614,7 @@ function dashboard() {
     invoices: [],
     activeInvoice: null,
     selected: new Set(),
-    activeFilter: 'Sent',   // default view = Sent; a saved choice overrides in init()
+    activeFilter: 'Accepted',   // default view = Accepted (push-eligible); a saved choice overrides in init()
     // Export-state dimension, independent of status filter above.
     // 'Any' | 'Pushed' | 'NotPushed' | 'Emailed' | 'NotEmailed' | 'Exported' | 'NotExported'
     exportStateFilter: 'Any',
@@ -671,7 +671,7 @@ function dashboard() {
       // storage disabled), so guard every access and fall back to the default.
       try {
         const saved = localStorage.getItem('crstl.activeFilter');
-        if (['All', 'Draft', 'Sent'].includes(saved)) this.activeFilter = saved;
+        if (['All', 'Draft', 'Sent', 'Accepted'].includes(saved)) this.activeFilter = saved;
       } catch (e) {}
       this.$watch('activeFilter', v => {
         try { localStorage.setItem('crstl.activeFilter', v); } catch (e) {}
@@ -946,12 +946,13 @@ function dashboard() {
     get filteredInvoices() {
       return this.invoices.filter(inv => {
         const s = (inv.status || '').toLowerCase();
-        // HD Canada sends "Draft" (unsent) and "Accepted" (received & accepted).
-        // Kept "sent"/"completed"/"open" as legacy fallbacks in case another
-        // trading partner uses different vocab later.
+        // Match the REAL CRSTL 810 statuses (verified in live data): Draft (unsent),
+        // Send_Success (sent, awaiting HD ack), Accepted (HD received & accepted).
+        // 'open'/'sent'/'completed' kept as legacy fallbacks for other partners.
         const matchStatus = this.activeFilter === 'All' ||
-          (this.activeFilter === 'Draft' && (s === 'draft' || s === 'open')) ||
-          (this.activeFilter === 'Sent'  && (s === 'sent' || s === 'accepted' || s === 'completed'));
+          (this.activeFilter === 'Draft'    && (s === 'draft' || s === 'open')) ||
+          (this.activeFilter === 'Sent'     && (s === 'send_success' || s === 'sent')) ||
+          (this.activeFilter === 'Accepted' && (s === 'accepted' || s === 'completed'));
         // Export state filter (independent of status). Any = don't filter,
         // Emailed / NotEmailed / Exported / NotExported = filter by presence
         // of the respective timestamp on the invoice.
@@ -1025,11 +1026,12 @@ function dashboard() {
     },
 
     get counts() {
+      const by = pred => this.invoices.filter(i => pred((i.status||'').toLowerCase())).length;
+      // One bucket per REAL status — Sent (Send_Success) and Accepted are distinct.
       return {
-        Draft: this.invoices.filter(i => { const s = (i.status||'').toLowerCase(); return s === 'draft' || s === 'open'; }).length,
-        // Sent count now includes 'accepted' (HD's actual status after they
-        // receive our 810). Without this the top card underreported by ~2/3.
-        Sent:  this.invoices.filter(i => { const s = (i.status||'').toLowerCase(); return s === 'sent' || s === 'accepted' || s === 'completed'; }).length,
+        Draft:    by(s => s === 'draft' || s === 'open'),
+        Sent:     by(s => s === 'send_success' || s === 'sent'),
+        Accepted: by(s => s === 'accepted' || s === 'completed'),
       };
     },
 
@@ -1039,10 +1041,11 @@ function dashboard() {
 
     statusClass(status) {
       const s = (status || '').toLowerCase();
+      // Distinct badge per real status so the row shows what CRSTL actually reports.
       if (s === 'draft' || s === 'open') return 'bg-amber-100 text-amber-800';
-      // Keep this in sync with counts.Sent and the filteredInvoices matcher —
-      // HD's 810 pipeline reports "Accepted" once they receive the invoice.
-      if (s === 'sent' || s === 'accepted' || s === 'completed') return 'bg-green-100 text-green-800';
+      if (s === 'send_success' || s === 'sent') return 'bg-blue-100 text-blue-800';
+      if (s === 'accepted' || s === 'completed') return 'bg-green-100 text-green-800';
+      if (s === 'rejected' || s.includes('fail') || s.includes('error')) return 'bg-red-100 text-red-700';
       return 'bg-gray-100 text-gray-600';
     },
 
