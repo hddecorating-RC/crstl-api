@@ -213,7 +213,7 @@ def push_finale_invoices(
     unresolved: list[str] = []
     counts = {k: 0 for k in ("skipped_no_map", "skipped_no_po", "skipped_no_product",
                              "skipped_invalid", "skipped_exists", "skipped_no_order",
-                             "skipped_not_shipped")}
+                             "skipped_not_shipped", "skipped_completed")}
 
     for inv in invoices:
         tid = str(inv.get("transaction_id", "?"))
@@ -265,6 +265,16 @@ def push_finale_invoices(
             row["status"] = "skipped_no_order"
             row["error"] = f"no Finale order {row['po_number']}"
             counts["skipped_no_order"] += 1
+            return None
+        if order.get("statusId") in ("ORDER_COMPLETED", "ORDER_CANCELLED"):
+            # Finale refuses a new invoice on a completed order (403) -- and a cancelled
+            # one is gone. Say so once instead of failing a create every poll. A
+            # completed order with no shipment/invoice is the ShipStation integration
+            # completing on ship without its shipment step; it must be reopened first.
+            row["status"] = "skipped_completed"
+            row["error"] = (f"Finale order is {order.get('statusId').replace('ORDER_', '').lower()} "
+                            f"(no invoice possible) -- reopen it to invoice")
+            counts["skipped_completed"] += 1
             return None
         live_invoices = [i for i in client.order_invoices(order) if i.get("statusId") != CANCELLED]
         if live_invoices:

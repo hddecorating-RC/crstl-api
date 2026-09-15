@@ -292,3 +292,17 @@ def test_dry_run_without_client_resolves_products_read_only():
     assert out["results"][0]["status"] == "built" and out["results"][0]["missing_products"] == []
     assert out["results"][0]["would"] == "posted"
     inst.create_invoice.assert_not_called(); inst.complete_invoice.assert_not_called()
+
+
+def test_live_completed_order_is_skipped_not_attempted():
+    """Finale 403s an invoice on a completed order; the engine says so up front (once)
+    instead of failing a create on every poll, and writes no receipt so a reopen is
+    picked up next run."""
+    client = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    client._order = {**client._order, "statusId": "ORDER_COMPLETED"}
+    out, rec_inv, rec_ev = _live(client)
+    r = out["results"][0]
+    assert r["status"] == "skipped_completed" and "reopen" in r["error"]
+    assert "create" not in [c[0] for c in client.calls]
+    rec_inv.assert_not_called(); rec_ev.assert_not_called()
+    assert out["summary"]["skipped_completed"] == 1
