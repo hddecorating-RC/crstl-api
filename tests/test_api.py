@@ -696,3 +696,79 @@ def test_refresh_new_accepted_fetches_only_changed_and_merges(monkeypatch):
     assert fake.calls == [("fetch_invoices", ["b", "c"]), ("fetch_po_provinces", ["PO-B", "PO-C"])]
     assert by["b"]["status"] == "Accepted" and "c" in by and by["a"]["status"] == "Accepted"
     assert pos == {"PO-A", "PO-B", "PO-C"} and by["b"]["province"] == "ON"
+
+
+
+def test_finale_poll_job_also_runs_the_nonedi_pass(monkeypatch):
+    from app.main import _run_finale_push_job, _cache
+    from app import tracking
+    tracking.init_db()
+    with patch.dict(_cache, {"invoices": []}), patch("app.main._finale_enabled", return_value=True), \
+         patch("app.main._refresh_new_accepted", return_value=0), \
+         patch("app.main._finale_config", return_value={"enabled": True, "max_per_run": 75}), \
+         patch("app.tracking.get_unfinaled_ids", return_value=[]), \
+         patch("app.main._run_nonedi_push") as nonedi:
+        _run_finale_push_job()
+    nonedi.assert_called_once_with(True, None, None)
+    with patch("app.main._finale_enabled", return_value=False), patch("app.main._run_nonedi_push") as nonedi2:
+        _run_finale_push_job()
+    nonedi2.assert_not_called()
+
+
+def test_nonedi_endpoint_and_runner_classify_by_exclusion(client, monkeypatch):
+    """The runner feeds the engine Finale's sale-order list and the Crstl PO set; the
+    endpoint previews by default and refuses an unscoped live run."""
+    from app.main import _cache, _run_nonedi_push
+    from app import tracking
+    tracking.init_db()
+    r = client.post("/api/finale/nonedi", json={"dry_run": False})
+    assert r.status_code == 400
+    orders = [{"orderId": "538831979", "orderTypeId": "SALES_ORDER", "statusId": "ORDER_LOCKED", "orderDate": "2026-09-16"},   # EDI PO
+              {"orderId": "507872-00", "orderTypeId": "SALES_ORDER", "statusId": "ORDER_LOCKED", "orderDate": "2026-09-16",
+               "orderUrl": "/hddecorating/api/order/507872-00", "orderRoleList": [{"roleTypeId": "CUSTOMER", "partyId": "100022"}],
+               "orderItemList": [{"productUrl": "/p/a", "unitPrice": 10.0, "quantity": 1}]}]
+    class FakeFinale:
+        account_id = "hddecorating"
+        def list_sale_orders(self): return orders
+        def party_province_index(self): return {"100022": "ON"}
+        def get_order(self, oid): return orders[1]
+        def order_invoices(self, o): return []
+        def shipment_qty_for_order(self, o): return {"/p/a": 1.0}
+    with patch("app.main.FinaleClient", create=True), patch("app.finale.FinaleClient") as FC, \
+         patch.dict(_cache, {"invoices": [{"po_number": "538831979"}], "po_provinces": {}}), \
+         patch("app.main._finale_config", return_value={"enabled": True, "nonedi_go_live_after": "2026-09-15", "max_per_run": 75}), \
+         patch("app.tracking.get_finale_invoices", return_value={}), patch("app.tracking.record_job_run"):
+        FC.configured.return_value = True; FC.return_value = FakeFinale()
+        out = _run_nonedi_push(False, None, None)
+    ids = [x["order_id"] for x in out["results"]]
+    assert ids == ["507872-00"]                                       # the EDI PO was excluded
+    assert out["results"][0]["status"] == "built" and out["results"][0]["would"] == "posted"
+    assert out["summary"]["candidates"] == 1
+
+
+def test_digest_lists_stale_pickups_and_nonedi_line(client, monkeypatch):
+    """An Accepted 810 older than stale_pickup_days with no Finale invoice and no
+    shipment in Finale is called out under Issues; recent non-EDI receipts get a line."""
+    from app.main import _cache, _send_daily_digest
+    from app import tracking
+    from datetime import datetime, timezone, timedelta
+    tracking.init_db()
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    monkeypatch.setenv("NETSUITE_ACCOUNT_ID", "734463")
+    invs = _so_ready_invoices()
+    old = (datetime.now(timezone.utc) - timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for i in invs: i["created_at"] = old
+    tracking.record_events([i["transaction_id"] for i in invs], "netsuite")      # SOs exist, no Finale receipts
+    tracking.record_finale_invoice("order:507872-00", "507872-00", "100420", "/i/100420", "507872-00-1", "posted")
+    class FakeFinale:
+        def get_order(self, po): return {"orderId": po, "shipmentUrlList": []}
+        def shipment_qty_for_order(self, o): return None                          # nothing shipped
+    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail, \
+         patch("app.main._finale_enabled", return_value=True), \
+         patch("app.main._finale_config", return_value={"enabled": True, "stale_pickup_days": 4, "max_per_run": 75}), \
+         patch("app.finale.FinaleClient") as FC:
+        FC.configured.return_value = True; FC.return_value = FakeFinale()
+        _send_daily_digest()
+    body = mail.call_args.kwargs["body_html"]
+    assert "not shipped in Finale" in body and "6 days" in body
+    assert "Finale (non-EDI orders)" in body and "1 invoice(s) posted" in body and "507872-00" in body

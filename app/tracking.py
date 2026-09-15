@@ -396,3 +396,19 @@ def get_unfinaled_ids(candidate_ids: list[str]) -> list[str]:
         print(f"WARNING: tracking read failed: {exc}")
         return []
     return [tid for tid in candidate_ids if tid not in done]
+
+
+def recent_finale_invoices(since_iso: str) -> list[dict]:
+    """Finale invoice receipts written since `since_iso` (UTC ISO), newest first.
+    Keys starting "order:" are non-EDI orders (no Crstl transaction); the rest are
+    Crstl transaction ids. Feeds the digest's Finale lines."""
+    try:
+        with contextlib.closing(_connect()) as conn:
+            rows = conn.execute(
+                "SELECT transaction_id, po_number, invoice_id, invoice_url, invoice_id_user, status, updated_at "
+                "FROM finale_invoices WHERE updated_at >= ? ORDER BY updated_at DESC", (since_iso,)).fetchall()
+        return [{"key": r[0], "po_number": r[1], "invoice_id": r[2], "invoice_url": r[3],
+                 "invoice_id_user": r[4], "status": r[5], "updated_at": r[6]} for r in rows]
+    except Exception as exc:
+        print(f"WARNING: finale_invoices recent read failed: {exc}")
+        return []

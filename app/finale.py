@@ -235,3 +235,25 @@ class FinaleClient:
         resp = self.session.post(self.HOST + url, json={}, timeout=self.TIMEOUT)
         resp.raise_for_status()
         return resp.json()
+
+    # ------------------------------------------------------------ non-EDI reads
+    def list_sale_orders(self) -> list[dict]:
+        """Every sale order in one listing (orderId, statusId, saleSourceId, orderDate,
+        invoiceUrlList, shipmentUrlList, orderRoleList...). The non-EDI invoicer
+        classifies from this list and GETs an order individually only to build."""
+        rows = to_rows(self._get(f"{self.base_url}/order", limit=self.PAGE_LIMIT))
+        return [r for r in rows if r.get("orderTypeId") == "SALES_ORDER"]
+
+    def party_province_index(self) -> dict:
+        """{partyId: province} from GET /api/partygroup -- the customer's POSTAL_ADDRESS
+        stateProvinceGeoId (HD Supply Canada 100022 -> "ON"). Customers without a
+        postal address (e.g. the EDI 'Home Depot Canada - Dropship' party) are simply
+        absent, so the caller skips them rather than guessing a tax province."""
+        index: dict = {}
+        for p in to_rows(self._get(f"{self.base_url}/partygroup", limit=self.PAGE_LIMIT)):
+            pid = str(p.get("partyId") or "").strip() or str(p.get("partyUrl") or "").rstrip("/").rsplit("/", 1)[-1]
+            for cm in (p.get("contactMechList") or []):
+                if isinstance(cm, dict) and cm.get("contactMechTypeId") == "POSTAL_ADDRESS" and cm.get("stateProvinceGeoId"):
+                    index[pid] = str(cm["stateProvinceGeoId"]).upper()
+                    break
+        return index

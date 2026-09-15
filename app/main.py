@@ -20,6 +20,7 @@ from app.netsuite import transform_invoice, resolve_customer, external_id_for
 from app.netsuite_csv import build_netsuite_csv
 from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation
 from app.finale_invoice import push_finale_invoices
+from app.finale_nonedi import push_nonedi_invoices
 from app.netsuite_payload import load_refs
 from app.report import (XLSX_MEDIA_TYPE, dates_for, flavor_of, product_for,
                         rows_for_transactions, window_label, workbook_bytes)
@@ -497,9 +498,14 @@ def _so_digest_data() -> dict:
     # Finale invoices created for these SOs (receipts), for the headline line, the
     # Excel column and the issues list. Empty when Finale invoicing is off.
     finale = tracking.get_finale_invoices([str(i["transaction_id"]) for i in new_sos])
+    fin_cfg = _finale_config()
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    nonedi = [r for r in tracking.recent_finale_invoices(since) if str(r.get("key", "")).startswith("order:")]
+    stale = _stale_pickups(scoped, events, fin_cfg.get("stale_pickup_days")) if _finale_enabled() else []
     return {"cutoff": cutoff, "new_sos": new_sos, "gaps": gaps,
             "row_by_tx": row_by_tx, "eids": eids, "ns_ids": ns_ids, "so_map": so_map,
-            "finale": finale, "finale_enabled": _finale_enabled()}
+            "finale": finale, "finale_enabled": _finale_enabled(),
+            "nonedi": nonedi, "stale_pickups": stale}
 
 
 def _so_digest_rows(data: dict) -> list[dict]:
@@ -557,11 +563,20 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
         if f_draft:
             line += f", <strong>{len(f_draft)} held as draft</strong>"
         h += f"<p>{line}.</p>"
+    nonedi = data.get("nonedi") or []
+    n_posted = [r for r in nonedi if r.get("status") == "posted"]
+    n_draft = [r for r in nonedi if r.get("status") == "draft"]
+    if nonedi:
+        line = f"<strong>Finale (non-EDI orders):</strong> {len(n_posted)} invoice(s) posted"
+        if n_draft:
+            line += f", <strong>{len(n_draft)} held as draft</strong>"
+        h += f"<p>{line} — {html.escape(', '.join(str(r.get('po_number') or '') for r in nonedi[:12]))}.</p>"
     h += product_table
 
     gaps = data["gaps"]
     mism = [r for r in rows if r["reconcile_flag"]]
-    if gaps or mism or f_draft or f_missing:
+    stale = data.get("stale_pickups") or []
+    if gaps or mism or f_draft or f_missing or n_draft or stale:
         h += '<h3 style="color:#b32020;margin-top:16px">Issues</h3>'
         if gaps:
             gl = "".join(
@@ -583,6 +598,15 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
         if f_missing:
             ml2 = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))}</li>" for r in f_missing)
             h += f"<p><strong>{len(f_missing)} SO(s) with no Finale invoice</strong> (create failed or skipped):</p><ul>{ml2}</ul>"
+        if n_draft:
+            nl = "".join(f"<li>{html.escape(str(r.get('po_number') or ''))} — Finale {html.escape(str(r.get('invoice_id_user') or ''))}</li>" for r in n_draft)
+            h += f"<p><strong>{len(n_draft)} non-EDI Finale invoice(s) held as draft</strong> (a shipped product the order does not price — review in Finale):</p><ul>{nl}</ul>"
+        if stale:
+            sl = "".join(f"<li>{html.escape(str(s.get('invoice_number') or ''))} — PO {html.escape(str(s.get('po_number') or ''))} — "
+                         f"{html.escape(str(s.get('province') or '—'))} — accepted <strong>{s['days']} days</strong> ago"
+                         f"{' — no Finale order' if s.get('order_missing') else ''}</li>" for s in stale)
+            h += (f"<p><strong>{len(stale)} pickup(s) not shipped in Finale</strong> "
+                  f"(810 accepted over {data.get('stale_days', 4)} days ago, still no shipment):</p><ul>{sl}</ul>")
     return h
 
 
@@ -692,7 +716,8 @@ AUTO_DIGEST_SETTING = "auto_digest_enabled"
 AUTO_FINALE_SETTING = "auto_finale_enabled"
 _finale_push_lock = threading.Lock()
 _finale_push_state: dict = {"last_run": None, "mode": None, "summary": None,
-                            "results": None, "blocked": None, "error": None, "running": False}
+                            "results": None, "blocked": None, "error": None, "running": False,
+                            "nonedi": None}
 
 
 def _finale_config() -> dict:
@@ -779,36 +804,115 @@ def _refresh_new_accepted() -> int:
         return 0
 
 
+def _finale_edi_pass() -> None:
+    """The EDI half of the poll: incremental 810 refresh, then invoice the Accepted
+    810s not yet invoiced, under the automation guards + finale.max_per_run. Early
+    returns here only end THIS pass -- the non-EDI pass still runs after it."""
+    _refresh_new_accepted()
+    auto = load_refs().get("automation") or {}
+    cap = _finale_config().get("max_per_run")
+    with _cache_lock:
+        invoices = list(_cache["invoices"])
+    candidates = eligible_for_push(invoices)
+    todo = tracking.get_unfinaled_ids([str(i["transaction_id"]) for i in candidates])
+    # Finale's OWN floor ("orders moving forward"), falling back to the shared one.
+    floor = str(_finale_config().get("go_live_after") or auto.get("go_live_after") or "") or None
+    to_push, blocked = select_for_automation(candidates, todo,
+                                             created_after=floor,
+                                             created_within_days=auto.get("created_within_days"),
+                                             max_per_run=cap)
+    if blocked:
+        tracking.record_job_run("finale_push", "blocked", f"{blocked} -- refusing; run manually"); return
+    if not to_push:
+        tracking.record_job_run("finale_push", "ok", "nothing new to invoice"); return
+    _run_finale_push(True, [str(i["transaction_id"]) for i in to_push], None)
+
+
 def _run_finale_push_job() -> None:
-    """Every 15 minutes: refresh 810 states incrementally, then invoice in Finale the
-    Accepted 810s not yet invoiced -- under the same automation guards as the NetSuite
-    job (go-live floor, created_at window) plus finale.max_per_run. An order not yet
-    shipped in Finale is skipped by the engine and retried next run. OFF unless both
-    config finale.enabled and the dashboard toggle are on."""
+    """Every 15 minutes, two passes -- BOTH gated by the same two switches (config
+    finale.enabled AND the dashboard toggle): (1) EDI: Accepted 810s not yet invoiced,
+    shipped in Finale; (2) non-EDI: shipped Finale sale orders that are not Crstl POs
+    (HD Supply, Special Orders, future OMIS...). One pass failing never stops the other.
+    An order not yet shipped in Finale is skipped by the engine and retried next run."""
     if not _finale_enabled():
         tracking.record_job_run("finale_push", "skipped", "disabled"); return
     try:
-        _refresh_new_accepted()
-        auto = load_refs().get("automation") or {}
-        cap = _finale_config().get("max_per_run")
-        with _cache_lock:
-            invoices = list(_cache["invoices"])
-        candidates = eligible_for_push(invoices)
-        todo = tracking.get_unfinaled_ids([str(i["transaction_id"]) for i in candidates])
-        # Finale's OWN floor ("orders moving forward"), falling back to the shared one.
-        floor = str(_finale_config().get("go_live_after") or auto.get("go_live_after") or "") or None
-        to_push, blocked = select_for_automation(candidates, todo,
-                                                 created_after=floor,
-                                                 created_within_days=auto.get("created_within_days"),
-                                                 max_per_run=cap)
-        if blocked:
-            tracking.record_job_run("finale_push", "blocked", f"{blocked} -- refusing; run manually"); return
-        if not to_push:
-            tracking.record_job_run("finale_push", "ok", "nothing new to invoice"); return
-        _run_finale_push(True, [str(i["transaction_id"]) for i in to_push], None)
+        _finale_edi_pass()
     except Exception as exc:
         print(f"WARNING: Finale poll failed: {exc}")
         tracking.record_job_run("finale_push", "error", str(exc)[:200])
+    try:
+        _run_nonedi_push(True, None, None)
+    except Exception as exc:
+        print(f"WARNING: non-EDI Finale poll failed: {exc}")
+        tracking.record_job_run("finale_nonedi", "error", str(exc)[:200])
+
+
+def _crstl_po_set() -> set:
+    """Every PO number Crstl knows -- the 810s in the cache and the 850 map. A Finale
+    sale order whose id is NOT in here is non-EDI (classification by exclusion)."""
+    with _cache_lock:
+        pos = {str(i.get("po_number") or "") for i in _cache["invoices"]}
+        pos |= set(_cache["po_provinces"].keys())
+    pos.discard("")
+    return pos
+
+
+def _run_nonedi_push(live: bool, ids: Optional[list[str]], limit: Optional[int]) -> dict:
+    """Invoice (live) or preview (dry) shipped non-EDI sale orders in Finale. Reads the
+    sale-order list + party provinces from Finale; the engine does the rest."""
+    from app.finale import FinaleClient, FinaleUnavailable
+    if not FinaleClient.configured():
+        raise FinaleUnavailable("FINALE_* credentials not set")
+    client = FinaleClient()
+    fin = _finale_config()
+    result = push_nonedi_invoices(client.list_sale_orders(), _crstl_po_set(), live=live, only=ids, limit=limit,
+                                  client=client, floor=str(fin.get("nonedi_go_live_after") or "") or None,
+                                  max_per_run=fin.get("max_per_run"))
+    with _finale_push_lock:
+        _finale_push_state["nonedi"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
+    s = result["summary"]
+    tracking.record_job_run("finale_nonedi", "blocked" if result.get("blocked") else ("ok" if s["failed"] == 0 else "partial"),
+                            f"{s['candidates']} candidates: {s['posted']} posted, {s['draft']} draft, {s['failed']} failed, "
+                            f"{s['skipped_not_shipped']} not shipped [{'live' if live else 'dry'}]"
+                            + (f" -- {result['blocked']}" if result.get("blocked") else ""))
+    return result
+
+
+def _stale_pickups(scoped: list[dict], events: dict, days: int) -> list[dict]:
+    """Accepted 810s with no Finale invoice, accepted more than `days` ago, and STILL
+    not shipped in Finale -- surfaced in the digest (DSD pickups ship within 7 days;
+    over 4 is trouble). Read-only Finale lookups, bounded to the recency window."""
+    from app.finale import FinaleClient
+    if days is None or not FinaleClient.configured():
+        return []
+    now = datetime.now(timezone.utc)
+    old = []
+    for i in scoped:
+        tx = str(i["transaction_id"])
+        if events.get(tx, {}).get("finale_at"):
+            continue
+        try:
+            created = datetime.fromisoformat(str(i.get("created_at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        age = (now - created).days
+        if age >= days:
+            old.append((i, age))
+    if not old:
+        return []
+    client = FinaleClient()
+    out = []
+    for i, age in old[:25]:
+        try:
+            order = client.get_order(str(i.get("po_number")))
+            shipped = client.shipment_qty_for_order(order) if order else None
+        except Exception:  # noqa: BLE001 -- a lookup failure is not a stale pickup
+            continue
+        if shipped is None:
+            out.append({"invoice_number": i.get("invoice_number"), "po_number": i.get("po_number"),
+                        "province": i.get("province"), "days": age, "order_missing": order is None})
+    return out
 
 
 def _auto_digest_enabled() -> bool:
@@ -1245,6 +1349,21 @@ async def finale_push(body: FinalePushRequest = FinalePushRequest()) -> JSONResp
     with _finale_push_lock:
         last_run = _finale_push_state["last_run"]
     return JSONResponse(status_code=400 if result.get("blocked") else 200, content={**result, "last_run": last_run})
+
+
+@app.post("/api/finale/nonedi")
+async def finale_nonedi_push(body: FinalePushRequest = FinalePushRequest()) -> JSONResponse:
+    """Manual non-EDI Finale invoicing (HD Supply, Special Orders, ...). Dry run unless
+    dry_run=false; a live run must name the Finale order ids."""
+    if not body.dry_run and not body.ids:
+        return JSONResponse(status_code=400, content={
+            "message": "A live non-EDI run must name the Finale order ids (ids). Use dry_run for a preview."})
+    try:
+        result = await asyncio.to_thread(_run_nonedi_push, not body.dry_run, body.ids, body.limit)
+    except Exception as exc:
+        print(f"non-EDI Finale push failed: {exc}")
+        return JSONResponse(status_code=500, content={"message": "non-EDI Finale push failed — see server logs"})
+    return JSONResponse(status_code=400 if result.get("blocked") else 200, content=result)
 
 
 @app.get("/api/finale-push/latest")
