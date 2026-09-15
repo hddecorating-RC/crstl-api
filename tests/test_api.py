@@ -583,8 +583,8 @@ def test_finale_push_safe_honors_cap_and_never_raises(monkeypatch):
     monkeypatch.setattr("app.main.load_refs", lambda: {"automation": {"created_within_days": 365}})
     inv = [{"transaction_id": "a", "created_at": "2026-09-16T01:00:00Z"}, {"transaction_id": "b", "created_at": "2026-09-16T01:00:00Z"}]
     with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push") as run:
-        _run_finale_push_safe(["a", "b"])                   # over the cap -> refused, nothing run
-    run.assert_not_called()
+        _run_finale_push_safe(["a", "b"])
+    run.assert_called_once_with(True, ["a", "b"], None, max_per_run=1)  # cap handed to the engine (counts writes)
     with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push", side_effect=RuntimeError("boom")):
         _run_finale_push_safe(["a"])                        # failure is swallowed, never fails the push
 
@@ -603,7 +603,7 @@ def test_finale_push_safe_applies_the_finale_floor_and_window(monkeypatch):
     with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push") as run, \
          patch("app.tracking.record_job_run") as job:
         _run_finale_push_safe(["old", "new", "ghost"])
-    run.assert_called_once_with(True, ["new"], None)
+    run.assert_called_once_with(True, ["new"], None, max_per_run=75)
     assert any("2 sent to NetSuite left alone" in str(c.args) for c in job.call_args_list)
     with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push") as run2:
         _run_finale_push_safe(["old"])
@@ -726,14 +726,14 @@ def test_finale_poll_job_gates_refreshes_and_invoices_only_unfinaled(monkeypatch
          patch("app.main._run_finale_push") as run2:
         _run_finale_push_job()
     refresh.assert_called_once()
-    run2.assert_called_once_with(True, ["b"], None)                    # only the un-invoiced one
+    run2.assert_called_once_with(True, ["b"], None, max_per_run=75)    # only the un-invoiced one; cap to the engine
     with patch.dict(_cache, {"invoices": invs}), patch("app.main._finale_enabled", return_value=True), \
          patch("app.main._refresh_new_accepted", return_value=0), \
          patch("app.main._finale_config", return_value={"enabled": True, "max_per_run": 1}), \
          patch("app.tracking.get_unfinaled_ids", return_value=["a", "b"]), \
          patch("app.main._run_finale_push") as run3:
         _run_finale_push_job()
-    run3.assert_not_called()                                             # over the cap -> refused
+    run3.assert_called_once_with(True, ["a", "b"], None, max_per_run=1)  # the ENGINE caps, on invoices it would create
 
 
 def test_refresh_new_accepted_fetches_only_changed_and_merges(monkeypatch):

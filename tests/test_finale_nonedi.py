@@ -136,12 +136,23 @@ def test_live_skips_not_shipped_no_province_existing_invoice_and_receipt():
     assert out4["results"][0]["status"] == "skipped_exists" and c4.calls == []
 
 
-def test_cap_refuses_whole_run_and_missing_order_is_skipped():
+def test_cap_counts_invoices_about_to_be_created_and_missing_order_is_skipped():
+    """Two shipped orders over a cap of 1: refused, nothing written, preview kept.
+    One shipped + one waiting: the waiting one does not count, the shipped one posts."""
     two = [ORDER, {**ORDER, "orderId": "507873-00"}]
-    out, _, _ = _run(FakeFinale(shipped={P_A: 1.0}), live=True, orders=two, max_per_run=1)
-    assert out.get("blocked") and out["results"] == []
-    out2, _, _ = _run(FakeFinale(order=None), live=True)
-    assert out2["results"][0]["status"] == "skipped_no_order"
+    c = FakeFinale(shipped={P_A: 1.0})
+    out, rec, _ = _run(c, live=True, orders=two, max_per_run=1)
+    assert out["blocked"].startswith("2 invoices to create exceeds max_per_run 1")
+    assert "create" not in [x[0] for x in c.calls] and rec.assert_not_called() is None
+    assert [r["would"] for r in out["results"]] == ["posted", "posted"]
+    class ByOrder(FakeFinale):
+        def get_order(self, oid):
+            self._shipped = {P_A: 1.0} if oid == "507872-00" else None
+            return {**self._order, "orderId": oid}
+    out2, _, _ = _run(ByOrder(), live=True, orders=two, max_per_run=1)
+    assert "blocked" not in out2 and [r["status"] for r in out2["results"]] == ["posted", "skipped_not_shipped"]
+    out3, _, _ = _run(FakeFinale(order=None), live=True)
+    assert out3["results"][0]["status"] == "skipped_no_order"
 
 
 def test_hollow_completed_nonedi_order_is_a_candidate_and_reopens_when_gate_on():
@@ -153,6 +164,8 @@ def test_hollow_completed_nonedi_order_is_a_candidate_and_reopens_when_gate_on()
     c = FakeFinale(order=hollow, shipped={P_A: 24.0, P_B: 2.0})
     out, _, _ = _run(c, live=True, orders=[hollow])
     assert out["results"][0]["status"] == "skipped_completed" and out["results"][0]["would_reopen"] is True   # gate off by default
+    dry, _, _ = _run(FakeFinale(order=hollow, shipped={P_A: 24.0, P_B: 2.0}), live=False, orders=[hollow], auto_reopen=True)
+    assert dry["results"][0]["would"] == "posted" and dry["results"][0]["would_reopen"] is True              # gate on: preview, no reopen
     c2 = FakeFinale(order=hollow, shipped={P_A: 24.0, P_B: 2.0})
     out2, _, _ = _run(c2, live=True, orders=[hollow], auto_reopen=True)
     assert out2["results"][0]["status"] == "posted" and out2["results"][0]["reopened"] is True

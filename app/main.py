@@ -765,15 +765,18 @@ def _finale_enabled() -> bool:
     return bool(_finale_config().get("enabled")) and _job_enabled(AUTO_FINALE_SETTING, default="false")
 
 
-def _run_finale_push(live: bool, ids: Optional[list[str]], limit: Optional[int]) -> dict:
+def _run_finale_push(live: bool, ids: Optional[list[str]], limit: Optional[int],
+                     max_per_run: Optional[int] = None) -> dict:
     """Create (live) or preview (dry) Finale invoices for cached invoices via the
     shared engine, and record the run. The engine enforces eligibility, the exact-
-    cents build, the reconcile + qty gates (posted vs draft) and idempotency."""
+    cents build, the reconcile + qty gates (posted vs draft), idempotency and, for
+    the automated callers that pass it, the blast cap on invoices about to be
+    created. Manual runs (the endpoint) are uncapped, like manual NetSuite pushes."""
     with _cache_lock:
         invoices = list(_cache["invoices"])
         po_map = dict(_cache["po_provinces"])
     with _finale_run("edi"):
-        result = push_finale_invoices(invoices, po_map, live=live, only=ids, limit=limit)
+        result = push_finale_invoices(invoices, po_map, live=live, only=ids, limit=limit, max_per_run=max_per_run)
     with _finale_push_lock:
         _finale_push_state.update({
             "last_run": datetime.now(timezone.utc).isoformat(), "mode": result["mode"],
@@ -795,19 +798,19 @@ def _finale_floor() -> Optional[str]:
     return str(_finale_config().get("go_live_after") or auto.get("go_live_after") or "") or None
 
 
-def _finale_scope(ids: list[str]) -> tuple[list[str], list[str], Optional[str]]:
-    """Apply the automation guards to these transaction ids: (in_scope, out_of_scope,
-    blocked_reason). Same floor / rolling window / cap as the 15-min poll, keyed on
-    the cached invoice's created_at -- an id the cache does not know is out of scope."""
+def _finale_scope(ids: list[str]) -> tuple[list[str], list[str]]:
+    """Apply the automation date guards to these transaction ids: (in_scope,
+    out_of_scope). Same floor / rolling window as the 15-min poll, keyed on the
+    cached invoice's created_at -- an id the cache does not know is out of scope.
+    The blast cap is the engine's (on invoices about to be created)."""
     auto = load_refs().get("automation") or {}
     wanted = {str(i) for i in ids}
     with _cache_lock:
         cands = [i for i in _cache["invoices"] if str(i.get("transaction_id")) in wanted]
-    chosen, blocked = select_for_automation(cands, wanted, created_after=_finale_floor(),
-                                            created_within_days=auto.get("created_within_days"),
-                                            max_per_run=_finale_config().get("max_per_run"))
+    chosen, _ = select_for_automation(cands, wanted, created_after=_finale_floor(),
+                                      created_within_days=auto.get("created_within_days"), max_per_run=None)
     kept = [str(i["transaction_id"]) for i in chosen]
-    return kept, [i for i in ids if str(i) not in set(kept)], blocked
+    return kept, [i for i in ids if str(i) not in set(kept)]
 
 
 def _run_finale_push_safe(sent_ids: list[str]) -> None:
@@ -815,10 +818,7 @@ def _run_finale_push_safe(sent_ids: list[str]) -> None:
     never fails the NetSuite push. Scoped exactly like the poll -- the Finale floor,
     the rolling window and max_per_run -- so a manual (unlimited) NetSuite push of an
     old invoice never reaches into orders the warehouse invoiced by hand."""
-    ids, dropped, blocked = _finale_scope(sent_ids)
-    if blocked:
-        tracking.record_job_run("finale_push", "blocked", f"{blocked} -- run manually")
-        return
+    ids, dropped = _finale_scope(sent_ids)
     if not ids:
         tracking.record_job_run("finale_push", "skipped",
                                 f"{len(dropped)} sent to NetSuite, none inside the Finale floor/window")
@@ -827,7 +827,7 @@ def _run_finale_push_safe(sent_ids: list[str]) -> None:
         tracking.record_job_run("finale_push", "skipped",
                                 f"{len(dropped)} sent to NetSuite left alone (before the Finale floor/window)")
     try:
-        _run_finale_push(True, ids, None)
+        _run_finale_push(True, ids, None, max_per_run=_finale_config().get("max_per_run"))
     except FinaleBusy as exc:
         tracking.record_job_run("finale_push", "skipped", f"{exc} -- the 15-min poll will invoice them")
     except Exception as exc:
@@ -876,24 +876,24 @@ def _refresh_new_accepted() -> int:
 
 def _finale_edi_pass() -> None:
     """The EDI half of the poll: incremental 810 refresh, then invoice the Accepted
-    810s not yet invoiced, under the automation guards + finale.max_per_run. Early
-    returns here only end THIS pass -- the non-EDI pass still runs after it."""
+    810s not yet invoiced, under the automation date guards; the engine applies
+    finale.max_per_run to the invoices it is about to create (a pending, unshipped
+    810 is waiting, not writing). Early returns here only end THIS pass -- the
+    non-EDI pass still runs after it."""
     _refresh_new_accepted()
     auto = load_refs().get("automation") or {}
-    cap = _finale_config().get("max_per_run")
     with _cache_lock:
         invoices = list(_cache["invoices"])
     candidates = eligible_for_push(invoices)
     todo = tracking.get_unfinaled_ids([str(i["transaction_id"]) for i in candidates])
-    to_push, blocked = select_for_automation(candidates, todo,
-                                             created_after=_finale_floor(),
-                                             created_within_days=auto.get("created_within_days"),
-                                             max_per_run=cap)
-    if blocked:
-        tracking.record_job_run("finale_push", "blocked", f"{blocked} -- refusing; run manually"); return
+    to_push, _ = select_for_automation(candidates, todo,
+                                       created_after=_finale_floor(),
+                                       created_within_days=auto.get("created_within_days"),
+                                       max_per_run=None)
     if not to_push:
         tracking.record_job_run("finale_push", "ok", "nothing new to invoice"); return
-    _run_finale_push(True, [str(i["transaction_id"]) for i in to_push], None)
+    _run_finale_push(True, [str(i["transaction_id"]) for i in to_push], None,
+                     max_per_run=_finale_config().get("max_per_run"))
 
 
 def _run_finale_push_job() -> None:
@@ -946,21 +946,18 @@ def _run_dsd_prefill(live: bool, ids: Optional[list[str]], limit: Optional[int])
         raise FinaleUnavailable("FINALE_* credentials not set")
     crstl = _get_client()
     fin, auto = _finale_config(), (load_refs().get("automation") or {})
-    blocked = None
-    if ids is None:
+    automated = ids is None
+    if automated:
         states = crstl.list_transaction_states(transaction_type="856")
         todo = tracking.get_unprefilled_asn_ids(list(states))
-        ids, blocked = select_dsd_asns(states, set(states) - set(todo),
-                                       created_after=_finale_floor(),
-                                       created_within_days=auto.get("created_within_days"),
-                                       max_per_run=fin.get("max_per_run"))
-    if blocked:
-        result = {"mode": "live" if live else "dry", "results": [], "blocked": blocked,
-                  "summary": {"candidates": 0}}
-    else:
-        asns = crstl.fetch_asn_refs(ids) if ids else []
-        with _finale_run("dsd"):
-            result = push_dsd_prefill(asns, live=live, only=None, limit=limit, client=FinaleClient())
+        ids = select_dsd_asns(states, set(states) - set(todo),
+                              created_after=_finale_floor(),
+                              created_within_days=auto.get("created_within_days"))
+    asns = crstl.fetch_asn_refs(ids) if ids else []
+    with _finale_run("dsd"):
+        result = push_dsd_prefill(asns, live=live, only=None, limit=limit, client=FinaleClient(),
+                                  max_per_run=fin.get("max_per_run") if automated else None)
+    blocked = result.get("blocked")
     with _finale_push_lock:
         _finale_push_state["dsd"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
     s = result["summary"]
@@ -994,7 +991,8 @@ def _run_nonedi_push(live: bool, ids: Optional[list[str]], limit: Optional[int])
     with _finale_run("nonedi"):
         result = push_nonedi_invoices(client.list_sale_orders(), _crstl_po_set(), live=live, only=ids, limit=limit,
                                       client=client, floor=str(fin.get("nonedi_go_live_after") or "") or None,
-                                      max_per_run=fin.get("max_per_run"), auto_reopen=bool(fin.get("auto_reopen")))
+                                      max_per_run=fin.get("max_per_run") if ids is None else None,   # automation only
+                                      auto_reopen=bool(fin.get("auto_reopen")))
     with _finale_push_lock:
         _finale_push_state["nonedi"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
     s = result["summary"]

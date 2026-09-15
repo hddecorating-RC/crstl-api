@@ -342,5 +342,34 @@ def test_hollow_completed_order_is_reopened_and_invoiced_when_gate_on():
     dry._order = {**dry._order, "statusId": "ORDER_COMPLETED"}
     with patch("app.tracking.get_finale_invoices", return_value={}):
         out3 = push_finale_invoices([INV], PO_MAP, live=False, refs={"finale": {**REFS["finale"], "auto_reopen": True}}, client=dry)
-    assert out3["results"][0]["status"] == "skipped_completed" and out3["results"][0]["would_reopen"] is True
+    r3 = out3["results"][0]
+    assert r3["status"] == "built" and r3["would"] == "posted" and r3["would_reopen"] is True   # previews the live outcome
     assert "reopen" not in [c[0] for c in dry.calls]
+
+
+def test_cap_counts_invoices_about_to_be_created_not_the_pending_set():
+    """max_per_run refuses a run (nothing written) only when the rows that SURVIVE
+    preflight exceed it; an Accepted 810 whose order has not shipped is waiting, not
+    writing, and never pushes the poll into refusing."""
+    inv2 = {**INV, "transaction_id": "T2", "source_document_id": "S2", "invoice_number": "INV2", "po_number": "PO2"}
+    po_map = {**PO_MAP, "PO2": PO_MAP["PO1"]}
+    class TwoOrders(FakeFinale):
+        def __init__(self, shipped_by_po):
+            super().__init__(shipped={}); self._by_po = shipped_by_po
+        def get_order(self, oid):
+            self.calls.append(("get_order", oid)); self._shipped = self._by_po[oid]
+            return {"orderId": oid, "invoiceUrlList": [], "shipmentUrlList": []}
+    both = TwoOrders({"PO1": {"/hddecorating/api/product/138VB5236WHTC": 1.0}, "PO2": {"/hddecorating/api/product/138VB5236WHTC": 1.0}})
+    with patch("app.tracking.get_finale_invoices", return_value={}), patch("app.tracking.record_finale_invoice") as rec:
+        out = push_finale_invoices([INV, inv2], po_map, live=True, refs=REFS, client=both, max_per_run=1)
+    assert out["blocked"].startswith("2 invoices to create exceeds max_per_run 1")
+    assert "create" not in [c[0] for c in both.calls] and rec.assert_not_called() is None
+    assert [r["would"] for r in out["results"]] == ["posted", "posted"]           # the preview survives the refusal
+    one = TwoOrders({"PO1": {"/hddecorating/api/product/138VB5236WHTC": 1.0}, "PO2": None})   # PO2 not shipped yet
+    with patch("app.tracking.get_finale_invoices", return_value={}), patch("app.tracking.record_finale_invoice"), \
+         patch("app.tracking.record_events"):
+        out2 = push_finale_invoices([INV, inv2], po_map, live=True, refs=REFS, client=one, max_per_run=1)
+    assert "blocked" not in out2 and [r["status"] for r in out2["results"]] == ["posted", "skipped_not_shipped"]
+    with patch("app.tracking.get_finale_invoices", return_value={}):
+        dry = push_finale_invoices([INV, inv2], po_map, live=False, refs=REFS, client=TwoOrders(both._by_po), max_per_run=1)
+    assert dry["blocked"] and dry["mode"] == "dry"                                  # a dry run shows the refusal too

@@ -66,22 +66,23 @@ def plan_shipment(asn: dict, shipment: dict) -> dict:
 
 
 def select_dsd_asns(states: dict[str, dict], done_ids, *, created_after: str | None,
-                    created_within_days: int | None, max_per_run: int | None) -> tuple[list[str], str | None]:
+                    created_within_days: int | None) -> list[str]:
     """The ASN ids the automated pass should look at: Accepted, DSD by Crstl's own
     flavor label (so Dropship/Wholesale 856s cost no detail fetch), created on/after
-    the floor and inside the rolling window, no receipt yet, under the cap (the shared
-    automation guards -- see select_for_automation). Returns (ids, blocked_reason)."""
+    the floor and inside the rolling window, no receipt yet (the shared automation
+    guards -- see select_for_automation). The blast cap is applied by push_dsd_prefill
+    to the shipments it is about to write, not to this pending set."""
     candidates = [{"transaction_id": aid, "created_at": s.get("created_at"), "po_number": s.get("po_number")}
                   for aid, s in states.items()
                   if s.get("state") == "Accepted" and s.get("flavor", DSD_FLAVOR) == DSD_FLAVOR]
     todo = [c["transaction_id"] for c in candidates if c["transaction_id"] not in set(done_ids or [])]
-    chosen, blocked = select_for_automation(candidates, todo, created_after=created_after,
-                                            created_within_days=created_within_days, max_per_run=max_per_run)
-    return [c["transaction_id"] for c in chosen], blocked
+    chosen, _ = select_for_automation(candidates, todo, created_after=created_after,
+                                      created_within_days=created_within_days, max_per_run=None)
+    return [c["transaction_id"] for c in chosen]
 
 
 def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | None = None,
-                     limit: int | None = None, client=None) -> dict:
+                     limit: int | None = None, client=None, max_per_run: int | None = None) -> dict:
     """Write PRO/RTS onto the open Finale shipments of these Accepted DSD ASNs (live)
     or report what would be written (dry). One row per ASN:
       status: prefilled | would_prefill | skipped_equal | skipped_shipped |
@@ -89,7 +90,8 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
               skipped_not_accepted | skipped_done | failed
     Receipts (app.tracking.finale_shipments) are written for the terminal outcomes
     only -- prefilled / equal / shipped -- so an ASN whose order or shipment has not
-    reached Finale yet is retried next pass.
+    reached Finale yet is retried next pass. `max_per_run` counts the ASNs about to
+    be written (would_prefill); over it the run is refused before the first write.
     """
     if limit is not None and limit < 1:
         raise ValueError("limit must be >= 1")
@@ -108,6 +110,7 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
 
     existing = tracking.get_finale_shipments([str(a.get("asn_id")) for a in asns])
     results: list[dict] = []
+    writers: list[tuple] = []          # (row, [(shipment, plan)], shipment id) -- the set the cap counts
     counts = {k: 0 for k in ("prefilled", "would_prefill", "skipped_equal", "skipped_shipped", "skipped_no_order",
                              "skipped_no_shipment", "skipped_not_dsd", "skipped_not_accepted", "skipped_done", "failed")}
 
@@ -157,14 +160,27 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
                 if live:
                     tracking.record_finale_shipment(aid, row["po_number"], sid, row["pro"], row["rts"], status)
                 finish(row, status, error=why); continue
-            if not live:
-                finish(row, "would_prefill"); continue
-            for s, p in writes:
-                client.update_shipment(str(s.get("shipmentUrl")), p["fields"])
-            tracking.record_finale_shipment(aid, row["po_number"], sid, row["pro"], row["rts"], "prefilled")
-            finish(row, "prefilled", shipment_id_user=sid)
+            row["shipment_id_user"] = sid
+            finish(row, "would_prefill")
+            writers.append((row, writes, sid))
         except Exception as exc:   # one bad ASN must not stop the batch
             finish(row, "failed", error=str(exc))
 
-    return {"mode": "live" if live else "dry", "results": results,
-            "summary": {"candidates": len(asns), **counts}}
+    blocked = None
+    if max_per_run is not None and len(writers) > max_per_run:
+        blocked = f"{len(writers)} shipments to write exceeds max_per_run {max_per_run} -- nothing written"
+    for row, writes, sid in (writers if (live and not blocked) else []):
+        counts["would_prefill"] -= 1
+        try:
+            for s, p in writes:
+                client.update_shipment(str(s.get("shipmentUrl")), p["fields"])
+            tracking.record_finale_shipment(row["asn_id"], row["po_number"], sid, row["pro"], row["rts"], "prefilled")
+            row["status"] = "prefilled"; counts["prefilled"] += 1
+        except Exception as exc:   # one bad ASN must not stop the batch
+            row.update(status="failed", error=str(exc)); counts["failed"] += 1
+
+    out = {"mode": "live" if live else "dry", "results": results,
+           "summary": {"candidates": len(asns), **counts}}
+    if blocked:
+        out["blocked"] = blocked
+    return out

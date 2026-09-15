@@ -92,10 +92,23 @@ def test_select_applies_accepted_floor_receipts_and_cap():
               "c": {"state": "Accepted", "created_at": "2026-09-10T01:00:00Z"},   # before the floor
               "d": {"state": "Accepted", "created_at": "2026-09-16T02:00:00Z"},
               "e": {"state": "Accepted", "created_at": "2026-09-16T03:00:00Z", "flavor": "Dropship"}}
-    ids, blocked = select_dsd_asns(states, {"d"}, created_after="2026-09-15", created_within_days=None, max_per_run=10)
-    assert ids == ["a"] and blocked is None                      # e: Dropship by flavor, never fetched
-    ids, blocked = select_dsd_asns(states, set(), created_after="2026-09-15", created_within_days=None, max_per_run=1)
-    assert ids == [] and blocked
+    ids = select_dsd_asns(states, {"d"}, created_after="2026-09-15", created_within_days=None)
+    assert ids == ["a"]                                          # e: Dropship by flavor, never fetched
+
+
+def test_cap_counts_shipments_about_to_be_written_not_pending_asns():
+    a2 = {**ASN, "asn_id": "a2"}
+    f = FakeFinale(shipments=[ship()])
+    out, rec = _run(f, live=True, asns=[ASN, a2], max_per_run=1)
+    assert out["blocked"].startswith("2 shipments to write exceeds max_per_run 1")
+    assert not [c for c in f.calls if c[0] == "update"] and rec.assert_not_called() is None
+    assert [r["status"] for r in out["results"]] == ["would_prefill", "would_prefill"]
+    # a pending ASN (no shipment in Finale yet) does not count
+    class Mixed(FakeFinale):
+        def order_shipments(self, order): return self._ships if self.calls[-1][1] == "40864264" else []
+    m = Mixed(shipments=[ship()])
+    out2, _ = _run(m, live=True, asns=[ASN, {**a2, "po_number": "40864999"}], max_per_run=1)
+    assert "blocked" not in out2 and [r["status"] for r in out2["results"]] == ["prefilled", "skipped_no_shipment"]
 
 
 # ---------------------------------------------------------------- push

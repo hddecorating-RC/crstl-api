@@ -189,12 +189,19 @@ def push_finale_invoices(
     product_index: dict | None = None,
     account: str | None = None,
     auto_reopen: bool | None = None,
+    max_per_run: int | None = None,
 ) -> dict:
     """Build (and, when live, create + post) Finale invoices for these Crstl invoices.
 
     Returns {mode, unresolved, results, summary, blocked?}. results: one row per
     invoice -- status built | posted | draft | failed | skipped_*, the money view,
     reconcile_flag, qty_flag, missing_products, and the Finale invoice id/url.
+
+    `max_per_run` is the automation blast cap and counts INVOICES ABOUT TO BE
+    CREATED -- the rows that survive preflight -- not the pending set: an Accepted
+    810 whose order has not shipped yet is waiting, not writing, and must never
+    push the poll into refusing. Over the cap the whole run is refused (nothing
+    written, `blocked` set); it is never truncated. Manual runs pass None.
     """
     if limit is not None and limit < 1:
         raise ValueError("limit must be >= 1")
@@ -283,16 +290,19 @@ def push_finale_invoices(
             # ship event without its shipment step. Finale would 403 an invoice, so by
             # Ritchie's rule it is NOT complete -- reopen it (edit -> lock) and carry on:
             # shipped -> invoice + re-complete; unshipped -> stays open for the warehouse.
-            if live and auto_reopen:
+            if not auto_reopen:
+                row["status"] = "skipped_completed"
+                row["would_reopen"] = True
+                row["error"] = "completed with no shipment/invoice -- reopen it to invoice (auto_reopen off)"
+                counts["skipped_completed"] += 1
+                return None
+            if live:
                 order = client.reopen_order(order)
                 row["reopened"] = True
             else:
-                row["status"] = "skipped_completed"
+                # Dry: the shipped-qty check below is read-only, so the preview can
+                # still say posted/draft; it just notes the reopen the live run does.
                 row["would_reopen"] = True
-                row["error"] = ("completed with no shipment/invoice -- would reopen"
-                                if not live else "completed with no shipment/invoice -- reopen it to invoice (auto_reopen off)")
-                counts["skipped_completed"] += 1
-                return None
         if live_invoices:
             row["status"] = "skipped_exists"
             row["error"] = ("order already carries invoice "
@@ -324,12 +334,14 @@ def push_finale_invoices(
         return {"mode": mode, "unresolved": unresolved, "results": results, "blocked": "unresolved ids",
                 "summary": {"built": len(prepared), "posted": 0, "draft": 0, "failed": 0, **counts}}
 
+    blocked = None
     if client is not None:
         # Read-only preflight for BOTH modes, so a dry run reports exactly what a
         # live run would do (skip / retry / would-post / would-draft) -- the
         # "prove the first run" preview must not overstate.
         existing = tracking.get_finale_invoices([r["transaction_id"] for r, _ in prepared])
         created_ids: list[str] = []
+        writers: list[tuple[dict, dict, dict, bool]] = []
         for row, body in prepared:
             tid = row["transaction_id"]
             try:
@@ -340,9 +352,15 @@ def push_finale_invoices(
             if order is None:
                 continue
             clean = row["reconcile_flag"] is None and row["qty_flag"] is None
-            if not live:
-                row["would"] = "posted" if clean else "draft"
-                continue
+            row["would"] = "posted" if clean else "draft"
+            writers.append((row, body, order, clean))
+        # The cap counts what is about to be WRITTEN. Checked before the first
+        # create so a refusal leaves Finale exactly as it was.
+        if max_per_run is not None and len(writers) > max_per_run:
+            blocked = f"{len(writers)} invoices to create exceeds max_per_run {max_per_run} -- nothing written"
+        for row, body, order, clean in (writers if (live and not blocked) else []):
+            tid = row["transaction_id"]
+            row.pop("would", None)
             try:
                 created = client.create_invoice(body)
                 row["invoice_id"] = created.get("invoiceId")
@@ -375,5 +393,8 @@ def push_finale_invoices(
                 print(f"WARNING: finale invoices created but tracking failed: {exc}")
 
     built = sum(1 for r in results if r.get("status") == "built")
-    return {"mode": mode, "unresolved": unresolved, "results": results,
-            "summary": {"built": built, "posted": posted, "draft": draft, "failed": failed, **counts}}
+    out = {"mode": mode, "unresolved": unresolved, "results": results,
+           "summary": {"built": built, "posted": posted, "draft": draft, "failed": failed, **counts}}
+    if blocked:
+        out["blocked"] = blocked
+    return out

@@ -157,12 +157,12 @@ def push_nonedi_invoices(orders: list[dict], crstl_pos, *, live: bool = False, o
     cands = select_candidates(orders, crstl_pos, floor=floor, only=only, limit=limit, include_hollow_completed=True)
     mode = "live" if live else "dry"
     counts = {k: 0 for k in SKIPS}
-    if max_per_run is not None and len(cands) > max_per_run:
-        return {"mode": mode, "results": [], "blocked": f"{len(cands)} to invoice exceeds max_per_run {max_per_run}",
-                "summary": {"candidates": len(cands), "built": 0, "posted": 0, "draft": 0, "failed": 0, **counts}}
     results: list[dict] = []
     posted = draft = failed = 0
     created: list[str] = []
+    # (row, body, order, clean, receipt key, order id) for every candidate that
+    # survives the read-only checks -- the set the cap counts and the live run writes.
+    writers: list[tuple] = []
     existing = tracking.get_finale_invoices([receipt_key(o.get("orderId")) for o in cands])
     for o in cands:
         oid = str(o.get("orderId")); key = receipt_key(oid)
@@ -190,13 +190,15 @@ def push_nonedi_invoices(orders: list[dict], crstl_pos, *, live: bool = False, o
                 continue
             if order.get("statusId") == "ORDER_COMPLETED":
                 # hollow completion (no invoice): reopen by Ritchie's rule, or report it
-                if live and auto_reopen:
-                    order = client.reopen_order(order); row["reopened"] = True
-                else:
+                if not auto_reopen:
                     row.update(status="skipped_completed", would_reopen=True,
-                               error="completed with no shipment/invoice -- " + ("would reopen" if not live else "reopen it to invoice (auto_reopen off)"))
+                               error="completed with no shipment/invoice -- reopen it to invoice (auto_reopen off)")
                     counts["skipped_completed"] += 1
                     continue
+                if live:
+                    order = client.reopen_order(order); row["reopened"] = True
+                else:
+                    row["would_reopen"] = True      # the checks below are read-only
             elif order.get("statusId") not in OPEN_STATUSES:
                 row.update(status="skipped_completed", error=f"Finale order is {order.get('statusId')}"); counts["skipped_completed"] += 1
                 continue
@@ -212,10 +214,19 @@ def push_nonedi_invoices(orders: list[dict], crstl_pos, *, live: bool = False, o
                 continue
             row.update({k: v for k, v in b.items() if k not in ("body", "flag")}); row["qty_flag"] = b["flag"]
             clean = row["qty_flag"] is None
-            if not live:
-                row["status"] = "built"; row["would"] = "posted" if clean else "draft"
-                continue
-            made = client.create_invoice(b["body"])
+            row["status"] = "built"; row["would"] = "posted" if clean else "draft"
+            writers.append((row, b["body"], order, clean, key, oid))
+        except Exception as exc:   # one bad order must not stop the batch
+            row.update(status="failed", error=str(exc)); failed += 1
+    # The cap counts invoices about to be created, never the pending set (unshipped
+    # orders, drafts awaiting review). Checked before the first write.
+    blocked = None
+    if max_per_run is not None and len(writers) > max_per_run:
+        blocked = f"{len(writers)} invoices to create exceeds max_per_run {max_per_run} -- nothing written"
+    for row, body, order, clean, key, oid in (writers if (live and not blocked) else []):
+        row.pop("would", None)
+        try:
+            made = client.create_invoice(body)
             row["invoice_id"], row["invoice_url"], row["invoice_id_user"] = made.get("invoiceId"), made.get("invoiceUrl"), made.get("invoiceIdUser")
             if clean:
                 client.complete_invoice(row["invoice_url"]); row["status"] = "posted"; posted += 1
@@ -234,6 +245,9 @@ def push_nonedi_invoices(orders: list[dict], crstl_pos, *, live: bool = False, o
             tracking.record_events(created, "finale")
         except Exception as exc:  # noqa: BLE001
             print(f"WARNING: non-EDI Finale invoices created but tracking failed: {exc}")
-    return {"mode": mode, "results": results,
-            "summary": {"candidates": len(cands), "built": sum(1 for r in results if r["status"] == "built"),
-                        "posted": posted, "draft": draft, "failed": failed, **counts}}
+    out = {"mode": mode, "results": results,
+           "summary": {"candidates": len(cands), "built": sum(1 for r in results if r["status"] == "built"),
+                       "posted": posted, "draft": draft, "failed": failed, **counts}}
+    if blocked:
+        out["blocked"] = blocked
+    return out
