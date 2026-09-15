@@ -105,7 +105,7 @@
 
   "_comment_finale": "Finale invoice creation (app.finale_invoice) -- ONE tool invoices BOTH DSD and Dropship, EDI-driven (850 product/810 qty+price), exact CRSTL discount + our tax, auto-POSTED when it ties to the 810 to the cent, left as a DRAFT + flagged otherwise. Finale invoices go nowhere downstream (internal record for teams without NetSuite). Ids read from the Finale catalogue 2026-09-15 (GET /api/productpromo, /api/taxauthorityrateproduct): promo presets DSD 100037 'DSD - 6.18875%', Dropship 100038 'Dropship - 5.18875%'; tax-rate products GST 5%=100000 (AB/BC/MB: we bill GST-only, no PST), HST 15%=100001 (NB/NL/PE), HST 13%=100002 (ON), GST+QST=100003 (QC), HST 14%=100004 (NS), GST+Sask PST=100005 (SK). enabled=false ships it OFF; the scheduled path is also capped by max_per_run and only ever invoices what the NetSuite push just sent.",
   "finale": {
-    "enabled": false,
+    "enabled": true,
     "go_live_after": "2026-09-15",
     "_comment_go_live_after": "Finale's OWN positive floor (created_at, per the shared automation guard): the poll never considers an 810 created before this date, so enabling Finale invoicing only ever touches orders from this date forward -- history the warehouse invoiced by hand is out of scope by construction, not just by the existing-invoice skip.",
     "max_per_run": 75,
