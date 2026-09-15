@@ -185,6 +185,7 @@ def push_finale_invoices(
     client=None,
     product_index: dict | None = None,
     account: str | None = None,
+    auto_reopen: bool | None = None,
 ) -> dict:
     """Build (and, when live, create + post) Finale invoices for these Crstl invoices.
 
@@ -196,6 +197,8 @@ def push_finale_invoices(
         raise ValueError("limit must be >= 1")
     refs = refs or load_refs()
     config = _load_config()
+    if auto_reopen is None:
+        auto_reopen = bool((refs.get("finale") or {}).get("auto_reopen"))
     if account is None:
         account = getattr(client, "account_id", None) or __import__("os").environ.get("FINALE_ACCOUNT_ID", "")
     if product_index is None:
@@ -266,17 +269,27 @@ def push_finale_invoices(
             row["error"] = f"no Finale order {row['po_number']}"
             counts["skipped_no_order"] += 1
             return None
-        if order.get("statusId") in ("ORDER_COMPLETED", "ORDER_CANCELLED"):
-            # Finale refuses a new invoice on a completed order (403) -- and a cancelled
-            # one is gone. Say so once instead of failing a create every poll. A
-            # completed order with no shipment/invoice is the ShipStation integration
-            # completing on ship without its shipment step; it must be reopened first.
+        if order.get("statusId") == "ORDER_CANCELLED":
             row["status"] = "skipped_completed"
-            row["error"] = (f"Finale order is {order.get('statusId').replace('ORDER_', '').lower()} "
-                            f"(no invoice possible) -- reopen it to invoice")
+            row["error"] = "Finale order is cancelled"
             counts["skipped_completed"] += 1
             return None
         live_invoices = [i for i in client.order_invoices(order) if i.get("statusId") != CANCELLED]
+        if order.get("statusId") == "ORDER_COMPLETED" and not live_invoices:
+            # Completed with no invoice: the ShipStation connection completed it on the
+            # ship event without its shipment step. Finale would 403 an invoice, so by
+            # Ritchie's rule it is NOT complete -- reopen it (edit -> lock) and carry on:
+            # shipped -> invoice + re-complete; unshipped -> stays open for the warehouse.
+            if live and auto_reopen:
+                order = client.reopen_order(order)
+                row["reopened"] = True
+            else:
+                row["status"] = "skipped_completed"
+                row["would_reopen"] = True
+                row["error"] = ("completed with no shipment/invoice -- would reopen"
+                                if not live else "completed with no shipment/invoice -- reopen it to invoice (auto_reopen off)")
+                counts["skipped_completed"] += 1
+                return None
         if live_invoices:
             row["status"] = "skipped_exists"
             row["error"] = ("order already carries invoice "

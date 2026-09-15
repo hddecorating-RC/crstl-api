@@ -65,6 +65,9 @@ class FakeFinale:
         self.calls.append(("complete_order", order.get("orderId")))
         if getattr(self, "fail_complete_order", False): raise RuntimeError("order boom")
         return {"statusId": "ORDER_COMPLETED"}
+    def reopen_order(self, order):
+        self.calls.append(("reopen", order.get("orderId")))
+        self._order = {**order, "statusId": "ORDER_LOCKED"}; return self._order
 
 
 @pytest.fixture(autouse=True)
@@ -294,15 +297,42 @@ def test_dry_run_without_client_resolves_products_read_only():
     inst.create_invoice.assert_not_called(); inst.complete_invoice.assert_not_called()
 
 
-def test_live_completed_order_is_skipped_not_attempted():
-    """Finale 403s an invoice on a completed order; the engine says so up front (once)
-    instead of failing a create on every poll, and writes no receipt so a reopen is
-    picked up next run."""
+def test_hollow_completed_order_reports_would_reopen_when_gate_off():
+    """Completed + no invoice = not complete (Ritchie's rule). With auto_reopen off the
+    engine says so once (would_reopen) and writes nothing; a completed order that DOES
+    carry an invoice is simply 'exists'."""
     client = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
     client._order = {**client._order, "statusId": "ORDER_COMPLETED"}
     out, rec_inv, rec_ev = _live(client)
     r = out["results"][0]
-    assert r["status"] == "skipped_completed" and "reopen" in r["error"]
-    assert "create" not in [c[0] for c in client.calls]
+    assert r["status"] == "skipped_completed" and r["would_reopen"] is True
+    assert "reopen" not in [c[0] for c in client.calls] and "create" not in [c[0] for c in client.calls]
     rec_inv.assert_not_called(); rec_ev.assert_not_called()
-    assert out["summary"]["skipped_completed"] == 1
+    done = FakeFinale(invoices=[{"invoiceId": "9", "invoiceIdUser": "PO1-1", "statusId": "INVOICE_APPROVED"}], shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    done._order = {**done._order, "statusId": "ORDER_COMPLETED"}
+    out2, _, _ = _live(done)
+    assert out2["results"][0]["status"] == "skipped_exists"
+
+
+def test_hollow_completed_order_is_reopened_and_invoiced_when_gate_on():
+    """auto_reopen on: edit -> lock, then the normal path -- shipped -> invoice posted ->
+    order re-completed; unshipped -> left open for the warehouse and retried."""
+    client = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    client._order = {**client._order, "statusId": "ORDER_COMPLETED"}
+    out, rec_inv, rec_ev = _live(client, refs={"finale": {**REFS["finale"], "auto_reopen": True}})
+    r = out["results"][0]
+    assert r["status"] == "posted" and r["reopened"] is True and r["order_completed"] is True
+    assert [c[0] for c in client.calls] == ["get_order", "reopen", "create", "complete", "complete_order"]
+    unshipped = FakeFinale(shipped=None)
+    unshipped._order = {**unshipped._order, "statusId": "ORDER_COMPLETED"}
+    out2, rec_inv2, _ = _live(unshipped, refs={"finale": {**REFS["finale"], "auto_reopen": True}})
+    assert out2["results"][0]["status"] == "skipped_not_shipped" and out2["results"][0]["reopened"] is True
+    assert [c[0] for c in unshipped.calls] == ["get_order", "reopen"]      # reopened, nothing invoiced
+    rec_inv2.assert_not_called()
+    # a dry run never reopens, it reports
+    dry = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    dry._order = {**dry._order, "statusId": "ORDER_COMPLETED"}
+    with patch("app.tracking.get_finale_invoices", return_value={}):
+        out3 = push_finale_invoices([INV], PO_MAP, live=False, refs={"finale": {**REFS["finale"], "auto_reopen": True}}, client=dry)
+    assert out3["results"][0]["status"] == "skipped_completed" and out3["results"][0]["would_reopen"] is True
+    assert "reopen" not in [c[0] for c in dry.calls]

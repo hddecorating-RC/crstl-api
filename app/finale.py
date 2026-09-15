@@ -257,3 +257,21 @@ class FinaleClient:
                     index[pid] = str(cm["stateProvinceGeoId"]).upper()
                     break
         return index
+
+    def reopen_order(self, order: dict) -> dict:
+        """Reopen a completed order: POST its actionUrlEdit (-> ORDER_CREATED, editable),
+        then actionUrlLock (-> ORDER_LOCKED, committed) so it is back exactly where it
+        was before completion. Proven 2026-09-15 on 538852414. Used for orders the
+        ShipStation connection completed on the ship event with no shipment/invoice --
+        Ritchie's rule: that is not "complete"; it gets re-completed properly."""
+        edit = order.get("actionUrlEdit")
+        if not edit:
+            raise RuntimeError(f"order {order.get('orderId')} exposes no edit action; cannot reopen")
+        resp = self.session.post(self.HOST + edit, json={}, timeout=self.TIMEOUT)
+        resp.raise_for_status()
+        reopened = self.get_order(str(order.get("orderId"))) or {}
+        if reopened.get("statusId") == "ORDER_CREATED" and reopened.get("actionUrlLock"):
+            resp = self.session.post(self.HOST + reopened["actionUrlLock"], json={}, timeout=self.TIMEOUT)
+            resp.raise_for_status()
+            reopened = self.get_order(str(order.get("orderId"))) or reopened
+        return reopened

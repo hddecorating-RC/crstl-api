@@ -868,7 +868,7 @@ def _run_nonedi_push(live: bool, ids: Optional[list[str]], limit: Optional[int])
     fin = _finale_config()
     result = push_nonedi_invoices(client.list_sale_orders(), _crstl_po_set(), live=live, only=ids, limit=limit,
                                   client=client, floor=str(fin.get("nonedi_go_live_after") or "") or None,
-                                  max_per_run=fin.get("max_per_run"))
+                                  max_per_run=fin.get("max_per_run"), auto_reopen=bool(fin.get("auto_reopen")))
     with _finale_push_lock:
         _finale_push_state["nonedi"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
     s = result["summary"]

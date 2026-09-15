@@ -110,6 +110,8 @@
     "nonedi_go_live_after": "2026-09-15",
     "_comment_nonedi": "Non-EDI sale orders (HD Supply, Home Depot Special Orders, Chandos, Cressey, future OMIS commercial...) have no Crstl 850/810; accounting runs elsewhere (OMIS->NetSuite). app.finale_nonedi invoices them in Finale from the ORDER's own lines when SHIPPED in Finale, tax by the customer party's postal-address province, no discount, then completes the order. Classified by EXCLUSION (order id not a Crstl PO and saleSource not an EDI source) -- no customer list to maintain. nonedi_go_live_after is the floor on the Finale order date.",
     "stale_pickup_days": 4,
+    "auto_reopen": false,
+    "_comment_auto_reopen": "Ritchie's rule (2026-09-15): an order marked complete with no shipment or invoice is NOT complete. When true, the engines reopen such an order (edit -> lock, via its own action URLs) before invoicing; if it is still unshipped it stays open for the warehouse and is retried. false = report would_reopen in previews only.",
     "_comment_stale_pickup": "Digest Issues: an Accepted 810 still not shipped in Finale this many days after acceptance (DSD pickups always ship within 7 days; over 4 is trouble).",
     "_comment_go_live_after": "Finale's OWN positive floor (created_at, per the shared automation guard): the poll never considers an 810 created before this date, so enabling Finale invoicing only ever touches orders from this date forward -- history the warehouse invoiced by hand is out of scope by construction, not just by the existing-invoice skip.",
     "max_per_run": 75,

@@ -36,6 +36,8 @@ class FakeFinale:
         self.calls.append(("create", body)); return {"invoiceId": "100420", "invoiceUrl": "/hddecorating/api/invoice/100420", "invoiceIdUser": "507872-00-1"}
     def complete_invoice(self, url): self.calls.append(("complete", url)); return {"statusId": "INVOICE_APPROVED"}
     def complete_order(self, order): self.calls.append(("complete_order", order.get("orderId"))); return {"statusId": "ORDER_COMPLETED"}
+    def reopen_order(self, order):
+        self.calls.append(("reopen", order.get("orderId"))); self._order = {**order, "statusId": "ORDER_LOCKED"}; return self._order
 
 
 @pytest.fixture(autouse=True)
@@ -139,3 +141,18 @@ def test_cap_refuses_whole_run_and_missing_order_is_skipped():
     assert out.get("blocked") and out["results"] == []
     out2, _, _ = _run(FakeFinale(order=None), live=True)
     assert out2["results"][0]["status"] == "skipped_no_order"
+
+
+def test_hollow_completed_nonedi_order_is_a_candidate_and_reopens_when_gate_on():
+    hollow = {**ORDER, "statusId": "ORDER_COMPLETED", "invoiceUrlList": []}
+    assert select_candidates([hollow], CRSTL_POS, floor="2026-09-15") == []
+    assert select_candidates([hollow], CRSTL_POS, floor="2026-09-15", include_hollow_completed=True) == [hollow]
+    invoiced = {**hollow, "invoiceUrlList": ["/i/1"]}
+    assert select_candidates([invoiced], CRSTL_POS, floor="2026-09-15", include_hollow_completed=True) == []
+    c = FakeFinale(order=hollow, shipped={P_A: 24.0, P_B: 2.0})
+    out, _, _ = _run(c, live=True, orders=[hollow])
+    assert out["results"][0]["status"] == "skipped_completed" and out["results"][0]["would_reopen"] is True   # gate off by default
+    c2 = FakeFinale(order=hollow, shipped={P_A: 24.0, P_B: 2.0})
+    out2, _, _ = _run(c2, live=True, orders=[hollow], auto_reopen=True)
+    assert out2["results"][0]["status"] == "posted" and out2["results"][0]["reopened"] is True
+    assert [x[0] for x in c2.calls] == ["get_order", "reopen", "create", "complete", "complete_order"]

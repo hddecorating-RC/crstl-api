@@ -35,7 +35,7 @@ OPEN_STATUSES = {"ORDER_CREATED", "ORDER_LOCKED"}
 INVOICE_TYPE = "SALES_INVOICE"
 CANCELLED = "INVOICE_CANCELLED"
 SKIPS = ("skipped_no_province", "skipped_no_map", "skipped_not_shipped", "skipped_exists",
-         "skipped_no_order", "skipped_invalid")
+         "skipped_no_order", "skipped_invalid", "skipped_completed")
 
 
 def receipt_key(order_id) -> str:
@@ -48,16 +48,18 @@ def is_non_edi(order: dict, crstl_pos) -> bool:
 
 
 def select_candidates(orders: list[dict], crstl_pos, *, floor: str | None = None,
-                      only=None, limit: int | None = None) -> list[dict]:
+                      only=None, limit: int | None = None, include_hollow_completed: bool = False) -> list[dict]:
     """Open, non-EDI sale orders on/after the floor (Finale orderDate). Completed orders
-    are excluded up front: Finale refuses a new invoice on them (403), and cancelled
-    ones are gone."""
+    are excluded (Finale refuses a new invoice on them, 403) -- except, when asked, a
+    completed order with NO invoice at all (a hollow completion), which the engine may
+    reopen. Cancelled ones are gone."""
     wanted = {str(x) for x in only} if only is not None else None
     out = []
     for o in orders:
         if o.get("orderTypeId") not in (None, "SALES_ORDER"):
             continue
-        if o.get("statusId") not in OPEN_STATUSES:
+        hollow = (o.get("statusId") == "ORDER_COMPLETED" and not (o.get("invoiceUrlList") or []))
+        if o.get("statusId") not in OPEN_STATUSES and not (include_hollow_completed and hollow):
             continue
         if not is_non_edi(o, crstl_pos):
             continue
@@ -131,9 +133,11 @@ def push_nonedi_invoices(orders: list[dict], crstl_pos, *, live: bool = False, o
                          limit: int | None = None, refs: dict | None = None, client=None,
                          province_index: dict | None = None, account: str | None = None,
                          floor: str | None = None, max_per_run: int | None = None,
-                         today: str | None = None) -> dict:
+                         today: str | None = None, auto_reopen: bool | None = None) -> dict:
     refs = refs or load_refs()
     config = _load_config()
+    if auto_reopen is None:
+        auto_reopen = bool((refs.get("finale") or {}).get("auto_reopen"))
     from app import tracking
     if client is None:
         from app.finale import FinaleClient, FinaleUnavailable
@@ -145,7 +149,7 @@ def push_nonedi_invoices(orders: list[dict], crstl_pos, *, live: bool = False, o
         account = getattr(client, "account_id", None) or os.environ.get("FINALE_ACCOUNT_ID", "")
     if province_index is None:
         province_index = client.party_province_index() if client is not None else {}
-    cands = select_candidates(orders, crstl_pos, floor=floor, only=only, limit=limit)
+    cands = select_candidates(orders, crstl_pos, floor=floor, only=only, limit=limit, include_hollow_completed=True)
     mode = "live" if live else "dry"
     counts = {k: 0 for k in SKIPS}
     if max_per_run is not None and len(cands) > max_per_run:
@@ -178,6 +182,18 @@ def push_nonedi_invoices(orders: list[dict], crstl_pos, *, live: bool = False, o
                 row.update(status="skipped_exists", error="order already carries invoice "
                            + ", ".join(str(i.get("invoiceIdUser") or i.get("invoiceId")) for i in live_inv))
                 counts["skipped_exists"] += 1
+                continue
+            if order.get("statusId") == "ORDER_COMPLETED":
+                # hollow completion (no invoice): reopen by Ritchie's rule, or report it
+                if live and auto_reopen:
+                    order = client.reopen_order(order); row["reopened"] = True
+                else:
+                    row.update(status="skipped_completed", would_reopen=True,
+                               error="completed with no shipment/invoice -- " + ("would reopen" if not live else "reopen it to invoice (auto_reopen off)"))
+                    counts["skipped_completed"] += 1
+                    continue
+            elif order.get("statusId") not in OPEN_STATUSES:
+                row.update(status="skipped_completed", error=f"Finale order is {order.get('statusId')}"); counts["skipped_completed"] += 1
                 continue
             pid = customer_party_id(order); row["customer"] = pid
             b = build_nonedi_invoice(order, client.shipment_qty_for_order(order), province_index.get(pid),
