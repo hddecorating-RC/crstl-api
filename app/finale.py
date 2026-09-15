@@ -86,6 +86,11 @@ class FinaleClient:
 
     TIMEOUT = 90
     PAGE_LIMIT = 10000
+    # API-returned URLs are host-relative paths ("/{account}/api/order/123");
+    # prefix this to follow them. Never construct a product URL by hand -- resolve
+    # through the catalogue (product_index): productId != productUrl slug on a
+    # third of the catalogue.
+    HOST = "https://app.finaleinventory.com"
 
     def __init__(self, account_id=None, api_key=None, api_secret=None):
         account_id = account_id if account_id is not None else os.environ.get("FINALE_ACCOUNT_ID", "")
@@ -95,7 +100,8 @@ class FinaleClient:
             raise FinaleUnavailable(
                 "Finale needs FINALE_ACCOUNT_ID, FINALE_API_KEY and FINALE_API_SECRET"
             )
-        self.base_url = f"https://app.finaleinventory.com/{account_id}/api"
+        self.account_id = account_id
+        self.base_url = f"{self.HOST}/{account_id}/api"
         self.session = requests.Session()
         self.session.auth = (api_key, api_secret)
 
@@ -124,3 +130,108 @@ class FinaleClient:
             print(f"WARNING: Finale returned {len(rows)} shipments, the maximum asked "
                   f"for — some ship dates may be missing. Raise FinaleClient.PAGE_LIMIT.")
         return ship_date_index(rows)
+
+    # ------------------------------------------------------------------ writes
+    # Finale invoicing (app.finale_invoice). The legacy /api supports these as
+    # undocumented POSTs -- proven 2026-09-15 by DevTools capture + an API-key
+    # write test on TEST_0005: POST /api/invoice/ creates (always creates, even
+    # with invoiceUrl set), the server stores invoiceItemList exactly as sent,
+    # and POST {invoiceUrl}/complete posts it. Every write rewrites Finale's
+    # audit stamp to the API login; only call these from the guarded push path.
+
+    def _get(self, path_or_url: str, **params) -> dict:
+        url = path_or_url if path_or_url.startswith("http") else self.HOST + path_or_url
+        resp = self.session.get(url, params=params or None, timeout=self.TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+
+    def product_index(self) -> dict:
+        """{productId or UPC: productUrl} over the whole catalogue, in one listing.
+
+        productId is HD's item number (the 850's stock_keeping_unit); the UPC is
+        the fallback key. The value is the productUrl path exactly as the API
+        returned it, so an invoice line references the product the way Finale
+        addresses it. First occurrence wins on a duplicate key.
+        """
+        rows = to_rows(self._get(f"{self.base_url}/product", limit=self.PAGE_LIMIT))
+        if len(rows) >= self.PAGE_LIMIT:
+            print(f"WARNING: Finale returned {len(rows)} products, the maximum asked for "
+                  f"-- the product index may be incomplete. Raise FinaleClient.PAGE_LIMIT.")
+        index: dict = {}
+        for p in rows:
+            url = str(p.get("productUrl") or "")
+            if not url:
+                continue
+            for key in (str(p.get("productId") or "").strip(),
+                        str(p.get("universalProductCode") or "").strip()):
+                if key:
+                    index.setdefault(key, url)
+        return index
+
+    def get_order(self, order_id: str) -> dict | None:
+        """The Finale sale order whose id is this HD PO number, or None if there is
+        no such order (404). Read before creating an invoice so a missing order is a
+        clean skip rather than an invoice pointing at nothing."""
+        resp = self.session.get(f"{self.base_url}/order/{order_id}", timeout=self.TIMEOUT)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    def order_invoices(self, order: dict) -> list[dict]:
+        """Every invoice already on this order (followed via invoiceUrlList)."""
+        return [self._get(u) for u in (order.get("invoiceUrlList") or [])]
+
+    def shipment_qty_for_order(self, order: dict) -> dict | None:
+        """{productUrl: quantity} actually SHIPPED on this order (moved shipments
+        only), for the qty cross-check against the 810. None when the order has no
+        moved shipment yet -- 'unverified', not 'mismatch'. Item rows are read
+        defensively (productUrl, else productId; quantity else 0) so an unexpected
+        shape degrades to unverified rather than a false mismatch."""
+        seen = False
+        qty: dict = {}
+        for u in (order.get("shipmentUrlList") or []):
+            sh = self._get(u)
+            if sh.get("statusId") not in MOVED:
+                continue
+            seen = True
+            for it in (sh.get("shipmentItemList") or []):
+                if not isinstance(it, dict):
+                    continue
+                key = str(it.get("productUrl") or it.get("productId") or "")
+                if not key:
+                    continue
+                try:
+                    qty[key] = qty.get(key, 0.0) + float(it.get("quantity") or 0)
+                except (TypeError, ValueError):
+                    pass
+        return qty if seen else None
+
+    def create_invoice(self, body: dict) -> dict:
+        """POST /api/invoice/ -- creates a DRAFT (INVOICE_IN_PROCESS) from exactly the
+        invoiceItemList given. Returns the created invoice (invoiceId, invoiceUrl,
+        invoiceIdUser, actionUrlComplete...)."""
+        resp = self.session.post(f"{self.base_url}/invoice/", json=body, timeout=self.TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+
+    def complete_invoice(self, invoice_url: str) -> dict:
+        """POST {invoiceUrl}/complete -- posts the draft (INVOICE_APPROVED). Locked
+        after this; only call once the invoice reconciles."""
+        resp = self.session.post(self.HOST + invoice_url.rstrip("/") + "/complete", json={},
+                                 timeout=self.TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+
+    def complete_order(self, order: dict) -> dict | None:
+        """POST the order's own actionUrlComplete (as the API returned it) -- moves it
+        to ORDER_COMPLETED so it leaves the actionable sales-order list. None when the
+        order exposes no complete action (already completed/cancelled). Only called
+        after its invoice is POSTED: completion locks the order against new invoices
+        and edits (proven 2026-09-15)."""
+        url = order.get("actionUrlComplete")
+        if not url:
+            return None
+        resp = self.session.post(self.HOST + url, json={}, timeout=self.TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()

@@ -24,8 +24,8 @@ def db_path(tmp_path, monkeypatch):
 def test_get_latest_events_empty(db_path):
     result = get_latest_events(["tx-001", "tx-002"])
     assert result == {
-        "tx-001": {"exported_at": None, "netsuite_at": None, "emailed_at": None, "so_digest_at": None},
-        "tx-002": {"exported_at": None, "netsuite_at": None, "emailed_at": None, "so_digest_at": None},
+        "tx-001": {"exported_at": None, "netsuite_at": None, "emailed_at": None, "so_digest_at": None, "finale_at": None},
+        "tx-002": {"exported_at": None, "netsuite_at": None, "emailed_at": None, "so_digest_at": None, "finale_at": None},
     }
 
 

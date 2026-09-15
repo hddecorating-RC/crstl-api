@@ -67,3 +67,36 @@ def label_for(vendor_items) -> str:
     if not kinds:
         return ""
     return kinds.pop() if len(kinds) == 1 else MIXED
+
+
+def _num(val) -> float:
+    try:
+        return float(str(val).replace(",", ""))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def po_lines_in(detail: dict) -> list[dict]:
+    """Every 850 line with the identifiers the Finale invoice needs, in line order.
+
+    The 810 carries no product identity on Dropship lines (and only a UPC on DSD),
+    so the Finale invoice's product comes from the 850 and is joined back to the
+    810 on line_item_number. `sku` is HD's stock_keeping_unit = the HD item number,
+    which is Finale's productId (5/5 live samples resolved, both channels);
+    `upc` is the fallback key; `vendor_item` is the SKU-shaped vendors_item_number
+    that product_of() classifies (Dropship only). Never construct a Finale
+    productUrl from any of these -- resolve through the catalogue listing.
+    """
+    lines = (((detail.get("file") or {}).get("generic_json_edi") or {})
+             .get("detail") or {}).get("baseline_item_data_loop") or []
+    out = []
+    for line in lines:
+        b = line.get("baseline_item_data") or {}
+        out.append({
+            "line_item_number": str(b.get("line_item_number") or "").strip(),
+            "sku": str(b.get("stock_keeping_unit") or "").strip(),
+            "upc": str(b.get("upc_default") or "").strip(),
+            "vendor_item": str(b.get("vendors_item_number") or "").strip(),
+            "quantity": _num(b.get("quantity")),
+        })
+    return out

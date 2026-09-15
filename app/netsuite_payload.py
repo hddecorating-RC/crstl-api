@@ -45,6 +45,10 @@ def load_refs() -> dict:
         # Scheduled-job-only guards (go-live cutoff + per-run cap). Read by the
         # push job; the shared push path ignores it so manual pushes are unlimited.
         "automation": cfg.get("automation", {}),
+        # Finale invoicing (app.finale_invoice): promo-preset + tax-rate ids per
+        # channel/province, its own enabled flag and per-run cap. Default {} so a
+        # config without the block leaves Finale invoicing off and unresolved.
+        "finale": cfg.get("finale", {}),
     }
 
 

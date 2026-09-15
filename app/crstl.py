@@ -49,10 +49,31 @@ class CrstlClient:
         resp.raise_for_status()
         return resp.json()
 
-    def fetch_invoices(self) -> list[dict]:
-        transactions = self._fetch_all_transactions()
-        tx_ids = [tx.get("id") or tx.get("transaction_id") for tx in transactions]
-        tx_ids = [tid for tid in tx_ids if tid]
+    def list_transaction_states(self) -> dict[str, dict]:
+        """{transaction_id: {"state": "Accepted"|..., "updated_at": ..., "po_number": ...}} for
+        every 810, from the LIST call alone (paginated, no per-transaction detail).
+        The cheap poll the 15-minute Finale job uses to spot new acceptances."""
+        out = {}
+        for tx in self._fetch_all_transactions():
+            m = tx.get("metadata") or tx
+            tid = tx.get("id") or m.get("id") or tx.get("transaction_id")
+            if not tid:
+                continue
+            st = m.get("state") or {}
+            out[str(tid)] = {"state": str(st.get("value") if isinstance(st, dict) else st or ""),
+                             "updated_at": str((st.get("updated_at") if isinstance(st, dict) else "") or ""),
+                             "po_number": str(m.get("source_document_reference_id") or "")}
+        return out
+
+    def fetch_invoices(self, only_ids=None) -> list[dict]:
+        """All 810s with detail -- or, with `only_ids`, just those transactions (the
+        incremental path: no list call, details for a handful of ids)."""
+        if only_ids is not None:
+            tx_ids = [str(t) for t in only_ids if t]
+        else:
+            transactions = self._fetch_all_transactions()
+            tx_ids = [tx.get("id") or tx.get("transaction_id") for tx in transactions]
+            tx_ids = [tid for tid in tx_ids if tid]
         invoices = []
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as pool:
             futures = {pool.submit(self._fetch_transaction_detail, tid): tid for tid in tx_ids}
@@ -64,7 +85,7 @@ class CrstlClient:
                     print(f"  WARNING: failed to fetch detail for {tid}: {exc}")
         return invoices
 
-    def fetch_po_provinces(self) -> dict[str, dict]:
+    def fetch_po_provinces(self, only_pos=None) -> dict[str, dict]:
         """
         Fetch all 850 POs and return
         {po_number: {"province": "ON", "store": "VAUGHAN"|None, "vendor_items": [...]}}.
@@ -75,6 +96,7 @@ class CrstlClient:
         the workbook's Product column depends on this map the same way its
         Province column does.
         """
+        from app.products import po_lines_in
         pos = self._fetch_all_transactions(transaction_type="850")
         # (po_id, po_number) pairs — skip anything missing either
         to_fetch = [
@@ -83,6 +105,9 @@ class CrstlClient:
             for po in pos
         ]
         to_fetch = [(pid, pnum) for pid, pnum in to_fetch if pid and pnum]
+        if only_pos is not None:   # incremental: only the POs the caller is missing
+            wanted = {str(p) for p in only_pos}
+            to_fetch = [(pid, pnum) for pid, pnum in to_fetch if pnum in wanted]
 
         result = {}
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as pool:
@@ -114,7 +139,11 @@ class CrstlClient:
                         store = "CALGARY"
 
                     result[pnum] = {"province": province or None, "store": store,
-                                    "vendor_items": vendor_items}
+                                    "vendor_items": vendor_items,
+                                    # Per-line sku/upc/qty for the Finale invoice:
+                                    # product = stock_keeping_unit -> Finale productId,
+                                    # joined to the 810 on line_item_number.
+                                    "lines": po_lines_in(detail)}
                 except Exception as exc:
                     # Broad catch intentional: detail fetches can fail for structural reasons
                     # (malformed JSON, unexpected schema) beyond HTTP errors. Best-effort bulk fetch
@@ -211,6 +240,10 @@ class CrstlClient:
                 "unit_price": unit_price,
                 "line_amount": amount,
                 "uom": item.get("quantity_unit_code") or "EA",
+                # Join key back to the 850 line (the 810 carries no product identity
+                # on Dropship lines); DSD 810s send the UPC in vendors_part_number.
+                "line_item_number": str(item.get("line_item_number") or "").strip(),
+                "upc": str(item.get("vendors_part_number") or "").strip(),
             })
 
         # metadata.value is Crstl's canonical total; fall back to summary if absent

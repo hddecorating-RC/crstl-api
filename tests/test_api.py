@@ -1,6 +1,8 @@
 import io
+from openpyxl.utils import get_column_letter
 
 import pytest
+from openpyxl.utils import get_column_letter
 from openpyxl import load_workbook
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
@@ -485,7 +487,7 @@ def test_automation_status_and_toggle(client):
     resp = client.get("/api/automation")
     assert resp.status_code == 200
     jobs = {j["id"]: j for j in resp.json()["jobs"]}
-    assert set(jobs) == {"daily_refresh", "netsuite_push", "daily_digest"}
+    assert set(jobs) == {"daily_refresh", "netsuite_push", "daily_digest", "finale_push"}
     assert jobs["netsuite_push"]["enabled"] is False   # off by default
     assert jobs["daily_digest"]["enabled"] is True
     # toggle push on, verify persisted
@@ -545,3 +547,152 @@ def test_live_push_fires_digest_dry_run_does_not(client, monkeypatch):
          patch("app.main._send_digest_safe") as digest2:
         _run_netsuite_push(live=False, ids=None, limit=None)
     digest2.assert_not_called()
+
+
+def test_live_push_invoices_in_finale_only_when_enabled(monkeypatch):
+    """Finale invoicing rides the NetSuite push: the ids that actually SENT get a
+    Finale invoice in the same run -- only when the toggle is on, never on a dry run."""
+    from app.main import _run_netsuite_push, _cache
+    monkeypatch.setattr("app.main._auto_digest_enabled", lambda: False)
+    fake = {"mode": "live", "summary": {"sent": 2, "failed": 0}, "unresolved": [], "blocked": None,
+            "results": [{"transaction_id": "x", "status": "sent"}, {"transaction_id": "y", "status": "sent"},
+                        {"transaction_id": "z", "status": "skipped_exists"}]}
+    with patch.dict(_cache, {"invoices": []}), patch("app.main.push_invoices", return_value=fake), \
+         patch("app.main._finale_enabled", return_value=True), \
+         patch("app.main._run_finale_push_safe") as fin:
+        _run_netsuite_push(live=True, ids=["x", "y", "z"], limit=None)
+    fin.assert_called_once_with(["x", "y"])                 # only what SENT, not the skipped one
+    with patch.dict(_cache, {"invoices": []}), patch("app.main.push_invoices", return_value=fake), \
+         patch("app.main._finale_enabled", return_value=False), \
+         patch("app.main._run_finale_push_safe") as fin2:
+        _run_netsuite_push(live=True, ids=["x"], limit=None)
+    fin2.assert_not_called()
+    with patch.dict(_cache, {"invoices": []}), \
+         patch("app.main.push_invoices", return_value={**fake, "mode": "dry", "summary": {"sent": 0, "failed": 0}}), \
+         patch("app.main._finale_enabled", return_value=True), \
+         patch("app.main._run_finale_push_safe") as fin3:
+        _run_netsuite_push(live=False, ids=None, limit=None)
+    fin3.assert_not_called()
+
+
+def test_finale_push_safe_honors_cap_and_never_raises(monkeypatch):
+    from app.main import _run_finale_push_safe
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setattr("app.main._finale_config", lambda: {"enabled": True, "max_per_run": 1})
+    with patch("app.main._run_finale_push") as run:
+        _run_finale_push_safe(["a", "b"])                   # over the cap -> refused, nothing run
+    run.assert_not_called()
+    with patch("app.main._run_finale_push", side_effect=RuntimeError("boom")):
+        _run_finale_push_safe(["a"])                        # failure is swallowed, never fails the push
+
+
+def test_finale_endpoint_live_requires_ids_and_dry_run_previews(client):
+    r = client.post("/api/finale", json={"dry_run": False})
+    assert r.status_code == 400 and "ids" in r.json()["message"]
+    fake = {"mode": "dry", "unresolved": [], "results": [{"transaction_id": "t", "status": "built"}],
+            "summary": {"built": 1, "posted": 0, "draft": 0, "failed": 0}}
+    with patch("app.main.push_finale_invoices", return_value=fake), \
+         patch("app.tracking.record_job_run"):
+        r2 = client.post("/api/finale", json={"dry_run": True})
+    assert r2.status_code == 200 and r2.json()["summary"]["built"] == 1
+    assert client.get("/api/finale-push/latest").json()["mode"] == "dry"
+
+
+def test_so_digest_reports_finale_line_and_holds(client, monkeypatch):
+    """One headline line for Finale, and drafts called out under Issues; nothing
+    Finale-related when the feature is off and nothing was invoiced."""
+    from app.main import _cache, _send_daily_digest
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    monkeypatch.setenv("NETSUITE_ACCOUNT_ID", "734463")
+    tracking.record_events(["so-1"], "netsuite")
+    tracking.record_netsuite_push("CRSTL-sd1", "22699999", "T1")
+    tracking.record_finale_invoice("so-1", "PO-1", "100407", "/i/100407", "PO-1-1", "draft")
+    with patch.dict(_cache, {"invoices": _so_ready_invoices()}), patch("app.main.send_mail") as mail, \
+         patch("app.main._finale_enabled", return_value=True):
+        _send_daily_digest()
+    body = mail.call_args.kwargs["body_html"]
+    assert "Finale:" in body and "0 invoice(s) posted" in body and "1 held as draft" in body
+    assert "PO-1-1" in body                                   # the draft is named under Issues
+
+
+def test_so_digest_workbook_adds_finale_column(monkeypatch):
+    from app.main import _so_digest_workbook
+    from openpyxl import Workbook
+    wb = Workbook(); ws = wb.active; ws.title = "Invoices"
+    ws.append(["Invoice", "Type", "Total"]); ws.append(["INV-SO-1", "Dropship", 100.0]); ws.append(["Total", "", 100.0])
+    ws.auto_filter.ref = "A1:C2"
+    buf = io.BytesIO(); wb.save(buf)
+    monkeypatch.setattr("app.main._workbook_for", lambda invs: buf.getvalue())
+    out = _so_digest_workbook([{"invoice_number": "INV-SO-1"}], {"INV-SO-1": ("2026-09-15", "")},
+                              {"INV-SO-1": ("PO-1-1", "posted")})
+    ws2 = load_workbook(io.BytesIO(out))["Invoices"]
+    headers = [c.value for c in ws2[1]]
+    assert headers[-2:] == ["Netsuite SO created", "Finale invoice"]
+    assert ws2.cell(row=2, column=len(headers)).value == "PO-1-1 (posted)"
+    assert ws2.auto_filter.ref.endswith(f"{get_column_letter(len(headers))}2")
+
+
+
+def test_finale_poll_job_gates_refreshes_and_invoices_only_unfinaled(monkeypatch):
+    """The 15-min poll: no-op when off; when on it refreshes incrementally, then invoices
+    the Accepted-not-yet-invoiced set under the automation guards + the finale cap."""
+    from app.main import _run_finale_push_job, _cache
+    from app import tracking
+    tracking.init_db()
+    invs = [{"transaction_id": "a", "source_document_id": "sa", "status": "Accepted", "subtotal": 10,
+             "created_at": "2026-09-15T10:00:00Z", "invoice_date": "2026-09-15"},
+            {"transaction_id": "b", "source_document_id": "sb", "status": "Accepted", "subtotal": 10,
+             "created_at": "2026-09-15T10:00:00Z", "invoice_date": "2026-09-15"}]
+    with patch("app.main._finale_enabled", return_value=False), patch("app.main._run_finale_push") as run:
+        _run_finale_push_job()
+    run.assert_not_called()
+    with patch.dict(_cache, {"invoices": invs}), patch("app.main._finale_enabled", return_value=True), \
+         patch("app.main._refresh_new_accepted", return_value=0) as refresh, \
+         patch("app.main._finale_config", return_value={"enabled": True, "max_per_run": 75}), \
+         patch("app.tracking.get_unfinaled_ids", return_value=["b"]), \
+         patch("app.main._run_finale_push") as run2:
+        _run_finale_push_job()
+    refresh.assert_called_once()
+    run2.assert_called_once_with(True, ["b"], None)                    # only the un-invoiced one
+    with patch.dict(_cache, {"invoices": invs}), patch("app.main._finale_enabled", return_value=True), \
+         patch("app.main._refresh_new_accepted", return_value=0), \
+         patch("app.main._finale_config", return_value={"enabled": True, "max_per_run": 1}), \
+         patch("app.tracking.get_unfinaled_ids", return_value=["a", "b"]), \
+         patch("app.main._run_finale_push") as run3:
+        _run_finale_push_job()
+    run3.assert_not_called()                                             # over the cap -> refused
+
+
+def test_refresh_new_accepted_fetches_only_changed_and_merges(monkeypatch):
+    """One list call; details only for new/changed transactions; missing 850s fetched
+    for just those POs; cache entries replaced in place, new ones appended."""
+    from app.main import _refresh_new_accepted, _cache
+    class FakeCrstl:
+        def __init__(self): self.calls = []
+        def list_transaction_states(self):
+            return {"a": {"state": "Accepted", "updated_at": "", "po_number": "PO-A"},   # unchanged
+                    "b": {"state": "Accepted", "updated_at": "", "po_number": "PO-B"},   # Draft -> Accepted
+                    "c": {"state": "Draft",    "updated_at": "", "po_number": "PO-C"}}   # new
+        def fetch_invoices(self, only_ids=None):
+            self.calls.append(("fetch_invoices", sorted(only_ids)))
+            return [{"transaction_id": t, "po_number": f"PO-{t.upper()}", "status": "Accepted" if t == "b" else "Draft",
+                     "subtotal": 1, "discrepancy": 0} for t in only_ids]
+        def fetch_po_provinces(self, only_pos=None):
+            self.calls.append(("fetch_po_provinces", sorted(only_pos)))
+            return {p: {"province": "ON", "store": None, "vendor_items": [], "lines": []} for p in only_pos}
+    fake = FakeCrstl()
+    monkeypatch.setattr("app.main._mock_mode", lambda: False)
+    monkeypatch.setattr("app.main._get_client", lambda: fake)
+    start = [{"transaction_id": "a", "po_number": "PO-A", "status": "Accepted"},
+             {"transaction_id": "b", "po_number": "PO-B", "status": "Draft"}]
+    with patch.dict(_cache, {"invoices": start, "po_provinces": {"PO-A": {"province": "ON", "store": None, "vendor_items": []}}}):
+        n = _refresh_new_accepted()
+        by = {i["transaction_id"]: i for i in _cache["invoices"]}
+        pos = set(_cache["po_provinces"])
+    assert n == 2
+    assert fake.calls == [("fetch_invoices", ["b", "c"]), ("fetch_po_provinces", ["PO-B", "PO-C"])]
+    assert by["b"]["status"] == "Accepted" and "c" in by and by["a"]["status"] == "Accepted"
+    assert pos == {"PO-A", "PO-B", "PO-C"} and by["b"]["province"] == "ON"

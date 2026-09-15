@@ -1,0 +1,322 @@
+"""
+Finale invoice creation from the CRSTL EDI -- one engine for dry run + live, mirroring
+app.netsuite_push. ONE tool invoices BOTH channels (DSD + Dropship); Finale invoices
+are internal records for teams without NetSuite access and go nowhere downstream.
+
+EDI-driven, single source of truth (the same 810 that feeds HD and the NetSuite SO):
+    product     850 line `stock_keeping_unit` (HD item #) -> Finale productId -> productUrl,
+                UPC as the fallback key; joined to the 810 on line_item_number
+    qty / price 810 line quantity_invoiced / unit_price (the 810 is raised after
+                shipping, so quantity_invoiced IS the shipped qty)
+    discount    -(allowance_amount + discount_amount): CRSTL's exact reduction, as one
+                INV_PROMOTION_ADJ on the channel preset (DSD 100037 / Dropship 100038)
+    tax         net x province rate (compound provinces round each component), as one
+                INV_SALES_TAX on the province's tax-rate product
+
+Gate: the invoice is POSTED (/complete) only when it ties to the CRSTL 810 total to
+the cent AND Finale's shipped qty matches the 810; a mismatch is created as a DRAFT
+and flagged for a human (surfaced, never silently invoiced). An order NOT YET SHIPPED
+in Finale is skipped -- no invoice, no receipt -- so the next poll retries it once the
+shipment exists (manual or integration). A posted invoice then COMPLETES the order,
+which is what takes it off the actionable sales-order list.
+
+Safety (see app.netsuite_push for the pattern):
+  * dry run builds and reconciles but writes nothing;
+  * a live run is REFUSED while any promo/tax-rate id is unresolved in config;
+  * idempotent: a transaction with a Finale receipt, or an order that already
+    carries a non-cancelled invoice, is skipped -- Finale's collection POST always
+    creates, so the guard has to live here;
+  * every created invoice (draft or posted) records a 'finale' event + its id.
+"""
+from __future__ import annotations
+
+from app.netsuite import _load_config, resolve_customer
+from app.netsuite_payload import load_refs
+from app.netsuite_push import _select, eligible_for_push
+
+INVOICE_TYPE = "SALES_INVOICE"
+CANCELLED = "INVOICE_CANCELLED"
+
+
+def resolve_finale_refs(invoice: dict, refs: dict, config: dict | None = None) -> dict | None:
+    """Channel, province, tax rate/components, and the Finale preset + tax-rate ids
+    this invoice books to -- or None if it can't be routed (same routing as NetSuite:
+    resolve_customer). Missing ids come back blank and are reported as unresolved."""
+    config = config or _load_config()
+    store, province = invoice.get("store"), invoice.get("province")
+    route = resolve_customer(invoice, province, store, config)
+    if route is None:
+        return None
+    fin = refs.get("finale") or {}
+    channel = route["channel"]
+    if channel == "dsd":
+        tax_prov = (config.get("dsd_stores", {}).get(str(store).upper()) or {}).get("province") or ""
+    else:
+        tax_prov = province or ""
+    tax_prov = str(tax_prov).upper()
+    promo_id = str((fin.get("promo_ids") or {}).get(channel) or "")
+    tax_id = str((fin.get("tax_rate_ids") or {}).get(tax_prov) or "")
+    return {
+        "channel": channel,
+        "province": tax_prov,
+        "tax_rate": route.get("tax_rate", 0),
+        "tax_components": route.get("tax_components"),
+        "promo_id": promo_id,
+        "promo_desc": (fin.get("promo_desc") or {}).get(channel) or f"{channel} discount",
+        "tax_id": tax_id,
+        "tax_desc": (fin.get("tax_desc") or {}).get(tax_id) or f"Tax {tax_prov or '?'}",
+    }
+
+
+def unresolved_finale_ids(r: dict) -> list[str]:
+    tags = []
+    if not r.get("promo_id"):
+        tags.append(f"promo:{r.get('channel')}")
+    if not r.get("tax_id"):
+        tags.append(f"taxrate:{r.get('province') or '?'}")
+    return tags
+
+
+def money(invoice: dict, r: dict, config: dict) -> dict:
+    """gross -> exact CRSTL reduction -> net -> tax -> total, and the delta vs the
+    810 total. Same numbers the NetSuite SO books (app.netsuite.transform_invoice)."""
+    gross = round(float(invoice["subtotal"]), 2)
+    reduction = round((invoice.get("allowance_amount") or 0) + (invoice.get("discount_amount") or 0), 2)
+    if reduction <= 0:   # CRSTL reported none (unexpected for Accepted): flat channel rate
+        reduction = round(gross * config["channel_discounts"][r["channel"]]["rate"], 2)
+    net = round(gross - reduction, 2)
+    comps = r.get("tax_components")
+    tax = round(sum(round(net * c, 2) for c in comps), 2) if comps else round(net * (r.get("tax_rate") or 0), 2)
+    total = round(net + tax, 2)
+    hd_total = invoice.get("total_amount")
+    delta = None if hd_total is None else round(total - float(hd_total), 2)
+    return {"gross": gross, "discount": -reduction, "net": net, "tax": tax, "total": total,
+            "hd_total": hd_total, "delta": delta}
+
+
+def build_product_lines(invoice: dict, po_lines: list[dict] | None, product_index: dict) -> tuple[list[dict], list[str]]:
+    """(INV_PROD_ITEM lines, 810 line numbers whose product could not be resolved).
+    Product identity comes from the 850 line with the same line_item_number; qty and
+    unit price from the 810 line. A line whose product isn't in the catalogue is
+    reported, never guessed."""
+    by_num = {str(l.get("line_item_number") or ""): l for l in (po_lines or [])}
+    lines, missing = [], []
+    for l in invoice.get("invoice_lines") or []:
+        num = str(l.get("line_item_number") or "")
+        po = by_num.get(num) or {}
+        url = (product_index.get(po.get("sku") or "") or product_index.get(po.get("upc") or "")
+               or product_index.get(str(l.get("upc") or "")))
+        if not url:
+            missing.append(num or "?")
+            continue
+        lines.append({
+            "invoiceItemTypeId": "INV_PROD_ITEM",
+            "productUrl": url,
+            "quantity": l.get("quantity"),
+            "unitPrice": l.get("unit_price"),
+            "itemDescription": po.get("vendor_item") or po.get("sku") or str(l.get("description") or ""),
+        })
+    return lines, missing
+
+
+def build_finale_invoice(invoice: dict, po_entry: dict | None, product_index: dict,
+                         refs: dict, account: str, config: dict | None = None) -> dict:
+    """The POST /api/invoice/ body for one Crstl invoice plus its reconciliation.
+    status: built | skipped_no_map | skipped_no_po."""
+    config = config or _load_config()
+    r = resolve_finale_refs(invoice, refs, config)
+    if r is None:
+        return {"status": "skipped_no_map"}
+    if not (po_entry or {}).get("lines"):
+        return {"status": "skipped_no_po", "channel": r["channel"]}
+    m = money(invoice, r, config)
+    prod_lines, missing = build_product_lines(invoice, po_entry["lines"], product_index)
+    items = list(prod_lines)
+    if m["discount"]:
+        items.append({"invoiceItemTypeId": "INV_PROMOTION_ADJ", "itemDescription": r["promo_desc"],
+                      "amount": m["discount"],
+                      "productPromoUrl": f"/{account}/api/productpromo/{r['promo_id']}"})
+    if m["tax"]:
+        items.append({"invoiceItemTypeId": "INV_SALES_TAX", "itemDescription": r["tax_desc"],
+                      "amount": m["tax"],
+                      "taxAuthorityRateProductUrl": f"/{account}/api/taxauthorityrateproduct/{r['tax_id']}"})
+    body = {
+        "invoiceUrl": None,
+        "invoiceTypeId": INVOICE_TYPE,
+        "primaryOrderUrl": f"/{account}/api/order/{invoice.get('po_number')}",
+        "invoiceDate": f"{str(invoice.get('invoice_date') or '')[:10]}T16:00:00.000Z",
+        "invoiceItemList": items,
+    }
+    d = m["delta"]
+    return {
+        "status": "built", "body": body, "channel": r["channel"],
+        "where": invoice.get("store") or r["province"], **m,
+        "reconcile_flag": None if (d is None or abs(d) <= 0.01) else f"total off CRSTL 810 by {d:+.2f}",
+        "missing_products": missing,
+        "unresolved": unresolved_finale_ids(r),
+    }
+
+
+def qty_check(prod_lines: list[dict], shipped: dict | None) -> tuple[list[str], bool]:
+    """(mismatch messages, verified). Unverified (no moved shipment) is reported
+    separately from a mismatch so the caller can hold the invoice without calling
+    a not-yet-shipped order a discrepancy."""
+    if shipped is None:
+        return [], False
+    invoiced: dict = {}
+    for l in prod_lines:
+        invoiced[l["productUrl"]] = invoiced.get(l["productUrl"], 0.0) + float(l.get("quantity") or 0)
+    out = []
+    for url, q in invoiced.items():
+        s = shipped.get(url, 0.0)
+        if abs(q - s) > 1e-6:
+            out.append(f"{url.rsplit('/', 1)[-1]}: invoiced {q:g} vs shipped {s:g}")
+    return out, True
+
+
+def push_finale_invoices(
+    invoices: list[dict],
+    po_map: dict[str, dict],
+    *,
+    live: bool = False,
+    only: list[str] | None = None,
+    limit: int | None = None,
+    refs: dict | None = None,
+    client=None,
+    product_index: dict | None = None,
+    account: str | None = None,
+) -> dict:
+    """Build (and, when live, create + post) Finale invoices for these Crstl invoices.
+
+    Returns {mode, unresolved, results, summary, blocked?}. results: one row per
+    invoice -- status built | posted | draft | failed | skipped_*, the money view,
+    reconcile_flag, qty_flag, missing_products, and the Finale invoice id/url.
+    """
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be >= 1")
+    refs = refs or load_refs()
+    config = _load_config()
+    if account is None:
+        account = getattr(client, "account_id", None) or __import__("os").environ.get("FINALE_ACCOUNT_ID", "")
+    if product_index is None:
+        product_index = client.product_index() if client is not None else {}
+    invoices = _select(eligible_for_push(invoices), only, limit)
+
+    results: list[dict] = []
+    prepared: list[tuple[dict, dict]] = []
+    unresolved: list[str] = []
+    counts = {k: 0 for k in ("skipped_no_map", "skipped_no_po", "skipped_no_product",
+                             "skipped_invalid", "skipped_exists", "skipped_no_order",
+                             "skipped_not_shipped")}
+
+    for inv in invoices:
+        tid = str(inv.get("transaction_id", "?"))
+        base = {"transaction_id": tid, "invoice_number": inv.get("invoice_number"),
+                "po_number": inv.get("po_number")}
+        try:
+            b = build_finale_invoice(inv, po_map.get(str(inv.get("po_number") or "")), product_index,
+                                     refs, account, config)
+        except (KeyError, TypeError, ValueError) as exc:
+            counts["skipped_invalid"] += 1
+            results.append({**base, "channel": None, "where": None, "status": "skipped_invalid", "error": str(exc)})
+            continue
+        if b["status"] != "built":
+            counts[b["status"]] += 1
+            results.append({**base, "channel": b.get("channel"), "where": None, "status": b["status"]})
+            continue
+        row = {**base, **{k: v for k, v in b.items() if k != "body"}}
+        row["qty_flag"] = None
+        if b["missing_products"]:
+            row["status"] = "skipped_no_product"
+            row["error"] = "no Finale product for 810 line(s) " + ", ".join(b["missing_products"])
+            counts["skipped_no_product"] += 1
+            results.append(row)
+            continue
+        for tag in b["unresolved"]:
+            if tag not in unresolved:
+                unresolved.append(tag)
+        results.append(row)
+        prepared.append((row, b["body"]))
+
+    mode = "live" if live else "dry"
+    posted = draft = failed = 0
+
+    if live:
+        if unresolved:
+            return {"mode": mode, "unresolved": unresolved, "results": results, "blocked": "unresolved ids",
+                    "summary": {"built": len(prepared), "posted": 0, "draft": 0, "failed": 0, **counts}}
+        from app import tracking
+        if client is None:
+            from app.finale import FinaleClient, FinaleUnavailable
+            if not FinaleClient.configured():
+                raise FinaleUnavailable("FINALE_* credentials not set")
+            client = FinaleClient()
+        existing = tracking.get_finale_invoices([r["transaction_id"] for r, _ in prepared])
+        created_ids: list[str] = []
+        for row, body in prepared:
+            tid = row["transaction_id"]
+            prior = existing.get(tid)
+            if prior and prior.get("status") in ("draft", "posted"):
+                row["status"] = "skipped_exists"
+                row["invoice_id"], row["invoice_url"], row["invoice_id_user"] = prior.get("invoice_id"), prior.get("invoice_url"), prior.get("invoice_id_user")
+                row["error"] = f"already invoiced in Finale ({prior.get('invoice_id_user') or prior.get('invoice_id')}, {prior.get('status')})"
+                counts["skipped_exists"] += 1
+                continue
+            try:
+                order = client.get_order(str(row["po_number"]))
+                if order is None:
+                    row["status"] = "skipped_no_order"
+                    row["error"] = f"no Finale order {row['po_number']}"
+                    counts["skipped_no_order"] += 1
+                    continue
+                live_invoices = [i for i in client.order_invoices(order) if i.get("statusId") != CANCELLED]
+                if live_invoices:
+                    row["status"] = "skipped_exists"
+                    row["error"] = ("order already carries invoice "
+                                    + ", ".join(str(i.get("invoiceIdUser") or i.get("invoiceId")) for i in live_invoices))
+                    counts["skipped_exists"] += 1
+                    continue
+                mism, verified = qty_check([l for l in body["invoiceItemList"] if l["invoiceItemTypeId"] == "INV_PROD_ITEM"],
+                                           client.shipment_qty_for_order(order))
+                if not verified:
+                    # Not shipped in Finale yet: leave it alone (no invoice, no receipt)
+                    # so the next poll picks it up once the shipment exists.
+                    row["status"] = "skipped_not_shipped"
+                    row["error"] = "not shipped in Finale yet -- will retry"
+                    counts["skipped_not_shipped"] += 1
+                    continue
+                if mism:
+                    row["qty_flag"] = "shipped qty != 810: " + "; ".join(mism)
+                created = client.create_invoice(body)
+                row["invoice_id"] = created.get("invoiceId")
+                row["invoice_url"] = created.get("invoiceUrl")
+                row["invoice_id_user"] = created.get("invoiceIdUser")
+                clean = row["reconcile_flag"] is None and row["qty_flag"] is None
+                if clean:
+                    client.complete_invoice(row["invoice_url"])
+                    row["status"] = "posted"; posted += 1
+                    # Declutter: a posted invoice completes its order. Best-effort --
+                    # the invoice is already posted, so a failure here is reported,
+                    # never turned into a failed invoice.
+                    try:
+                        row["order_completed"] = client.complete_order(order) is not None
+                    except Exception as exc:  # noqa: BLE001
+                        row["order_completed"] = False
+                        row["order_complete_error"] = str(exc)
+                else:
+                    row["status"] = "draft"; draft += 1
+                tracking.record_finale_invoice(tid, str(row["po_number"]), row["invoice_id"], row["invoice_url"],
+                                               row["invoice_id_user"], row["status"])
+                created_ids.append(tid)
+            except Exception as exc:   # one bad invoice must not stop the batch
+                row["status"] = "failed"
+                row["error"] = str(exc)
+                failed += 1
+        if created_ids:
+            try:
+                tracking.record_events(created_ids, "finale")
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARNING: finale invoices created but tracking failed: {exc}")
+
+    return {"mode": mode, "unresolved": unresolved, "results": results,
+            "summary": {"built": len(prepared), "posted": posted, "draft": draft, "failed": failed, **counts}}

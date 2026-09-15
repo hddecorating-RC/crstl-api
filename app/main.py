@@ -19,6 +19,7 @@ from app.mail import send_mail, MailConfigError
 from app.netsuite import transform_invoice, resolve_customer, external_id_for
 from app.netsuite_csv import build_netsuite_csv
 from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation
+from app.finale_invoice import push_finale_invoices
 from app.netsuite_payload import load_refs
 from app.report import (XLSX_MEDIA_TYPE, dates_for, flavor_of, product_for,
                         rows_for_transactions, window_label, workbook_bytes)
@@ -493,8 +494,12 @@ def _so_digest_data() -> dict:
         tx = str(i["transaction_id"])
         created = (events.get(tx, {}).get("netsuite_at") or "")[:10]
         so_map[str(i.get("invoice_number"))] = (created, _so_link(ns_ids.get(eids.get(tx))))
+    # Finale invoices created for these SOs (receipts), for the headline line, the
+    # Excel column and the issues list. Empty when Finale invoicing is off.
+    finale = tracking.get_finale_invoices([str(i["transaction_id"]) for i in new_sos])
     return {"cutoff": cutoff, "new_sos": new_sos, "gaps": gaps,
-            "row_by_tx": row_by_tx, "eids": eids, "ns_ids": ns_ids, "so_map": so_map}
+            "row_by_tx": row_by_tx, "eids": eids, "ns_ids": ns_ids, "so_map": so_map,
+            "finale": finale, "finale_enabled": _finale_enabled()}
 
 
 def _so_digest_rows(data: dict) -> list[dict]:
@@ -514,6 +519,8 @@ def _so_digest_rows(data: dict) -> list[dict]:
             "total": r.get("total"),
             "reconcile_flag": r.get("reconcile_flag"),
             "so_link": _so_link(ns_id),
+            "finale_status": (data.get("finale") or {}).get(tx, {}).get("status"),
+            "finale_id": (data.get("finale") or {}).get(tx, {}).get("invoice_id_user"),
         })
     return rows
 
@@ -540,11 +547,21 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
         + f'<tr style="background:#eef2f7;font-weight:bold"><td>Total</td>'
           f'<td align="right">{len(rows)}</td><td align="right">${total:,.2f}</td></tr></table>')
 
-    h = f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite.</p>" + product_table
+    h = f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite.</p>"
+    # Finale: ONE line, only when the feature is on or something was invoiced.
+    f_posted = [r for r in rows if r.get("finale_status") == "posted"]
+    f_draft = [r for r in rows if r.get("finale_status") == "draft"]
+    f_missing = [r for r in rows if not r.get("finale_status")] if data.get("finale_enabled") else []
+    if data.get("finale_enabled") or f_posted or f_draft:
+        line = f"<strong>Finale:</strong> {len(f_posted)} invoice(s) posted"
+        if f_draft:
+            line += f", <strong>{len(f_draft)} held as draft</strong>"
+        h += f"<p>{line}.</p>"
+    h += product_table
 
     gaps = data["gaps"]
     mism = [r for r in rows if r["reconcile_flag"]]
-    if gaps or mism:
+    if gaps or mism or f_draft or f_missing:
         h += '<h3 style="color:#b32020;margin-top:16px">Issues</h3>'
         if gaps:
             gl = "".join(
@@ -558,10 +575,18 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
             ml = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))}: "
                          f"{html.escape(str(r['reconcile_flag']))}</li>" for r in mism)
             h += f"<p><strong>{len(mism)} SO(s) do not tie to the 810:</strong></p><ul>{ml}</ul>"
+        if f_draft:
+            dl = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))} — Finale {html.escape(str(r['finale_id'] or ''))}</li>"
+                         for r in f_draft)
+            h += (f"<p><strong>{len(f_draft)} Finale invoice(s) held as draft</strong> "
+                  f"(did not tie to the 810 or shipped qty differs — review in Finale):</p><ul>{dl}</ul>")
+        if f_missing:
+            ml2 = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))}</li>" for r in f_missing)
+            h += f"<p><strong>{len(f_missing)} SO(s) with no Finale invoice</strong> (create failed or skipped):</p><ul>{ml2}</ul>"
     return h
 
 
-def _so_digest_workbook(new_sos: list[dict], so_map: dict) -> bytes:
+def _so_digest_workbook(new_sos: list[dict], so_map: dict, finale_map: dict | None = None) -> bytes:
     """The accounting Excel: the SAME export workbook (built from the 810s, so the
     figures match the Export button exactly) PLUS a 'Netsuite SO created' column whose
     cell links straight to each SO. so_map is {invoice_number: (created_date, so_url)}."""
@@ -588,8 +613,24 @@ def _so_digest_workbook(new_sos: list[dict], so_map: dict) -> bytes:
             cell.hyperlink = url
             cell.style = "Hyperlink"
     ws.column_dimensions[get_column_letter(col)].width = 20
+    if finale_map is not None:
+        # 'Finale invoice': the invoice id + posted/draft. No deep link -- Finale's
+        # UI addresses invoices by an opaque token, not the id, so a built URL would
+        # be a guess. by_inv is {invoice_number: (invoice_id_user, status)}.
+        col += 1
+        hdr = ws.cell(row=1, column=col, value="Finale invoice")
+        hdr.fill = PatternFill("solid", fgColor="1F3864")
+        hdr.font = Font(bold=True, color="FFFFFF", size=10)
+        hdr.alignment = Alignment(horizontal="center", vertical="center")
+        for r in range(2, ws.max_row + 1):
+            inv = ws.cell(row=r, column=1).value
+            if not inv or inv == "Total":
+                continue
+            fid, fstatus = finale_map.get(str(inv), ("", ""))
+            ws.cell(row=r, column=col, value=(f"{fid} ({fstatus})" if fid else "—"))
+        ws.column_dimensions[get_column_letter(col)].width = 22
     m = re.match(r"A1:([A-Z]+)(\d+)", ws.auto_filter.ref or "")
-    if m:  # extend the filter to cover the new column
+    if m:  # extend the filter to cover the new column(s)
         ws.auto_filter.ref = f"A1:{get_column_letter(col)}{m.group(2)}"
     buf = io.BytesIO()
     wb.save(buf)
@@ -621,8 +662,13 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
 
     attachments = None
     if data["new_sos"]:
+        finale_by_inv = {str(i.get("invoice_number")): (f.get("invoice_id_user") or f.get("invoice_id") or "", f.get("status") or "")
+                         for i in data["new_sos"]
+                         for f in [data["finale"].get(str(i["transaction_id"]))] if f}
         attachments = [(f"hd_sales_orders_{today}.xlsx",
-                        _so_digest_workbook(data["new_sos"], data["so_map"]), XLSX_MEDIA_TYPE)]
+                        _so_digest_workbook(data["new_sos"], data["so_map"],
+                                            finale_by_inv if (data.get("finale_enabled") or finale_by_inv) else None),
+                        XLSX_MEDIA_TYPE)]
 
     # Send FIRST; only mark reported once the mail is away, so a send failure leaves
     # the SOs to carry into tomorrow's digest rather than being silently dropped.
@@ -636,6 +682,131 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
 
 
 AUTO_DIGEST_SETTING = "auto_digest_enabled"
+
+# ---------------------------------------------------------------- Finale invoicing
+# ONE tool invoices BOTH channels in Finale (internal record; goes nowhere
+# downstream). It rides the NetSuite push event: the invoices that just landed as
+# SOs get their Finale invoice in the same run, so both systems are created from
+# one 810-Accepted moment. Two gates, BOTH must be on: config finale.enabled (ships
+# OFF) and this runtime toggle (dashboard; default OFF). Manual: POST /api/finale.
+AUTO_FINALE_SETTING = "auto_finale_enabled"
+_finale_push_lock = threading.Lock()
+_finale_push_state: dict = {"last_run": None, "mode": None, "summary": None,
+                            "results": None, "blocked": None, "error": None, "running": False}
+
+
+def _finale_config() -> dict:
+    return load_refs().get("finale") or {}
+
+
+def _finale_enabled() -> bool:
+    return bool(_finale_config().get("enabled")) and _job_enabled(AUTO_FINALE_SETTING, default="false")
+
+
+def _run_finale_push(live: bool, ids: Optional[list[str]], limit: Optional[int]) -> dict:
+    """Create (live) or preview (dry) Finale invoices for cached invoices via the
+    shared engine, and record the run. The engine enforces eligibility, the exact-
+    cents build, the reconcile + qty gates (posted vs draft) and idempotency."""
+    with _cache_lock:
+        invoices = list(_cache["invoices"])
+        po_map = dict(_cache["po_provinces"])
+    result = push_finale_invoices(invoices, po_map, live=live, only=ids, limit=limit)
+    with _finale_push_lock:
+        _finale_push_state.update({
+            "last_run": datetime.now(timezone.utc).isoformat(), "mode": result["mode"],
+            "summary": result["summary"], "results": result["results"],
+            "blocked": result.get("blocked"), "error": None,
+        })
+    s = result["summary"]
+    tracking.record_job_run("finale_push", "blocked" if result.get("blocked") else
+                            ("ok" if s["failed"] == 0 else "partial"),
+                            f"{s['posted']} posted, {s['draft']} draft, {s['failed']} failed "
+                            f"[{'live' if live else 'dry'}]" + (f" -- {result['blocked']}" if result.get("blocked") else ""))
+    return result
+
+
+def _run_finale_push_safe(sent_ids: list[str]) -> None:
+    """Invoice in Finale the invoices a live NetSuite push just sent. Best-effort:
+    never fails the NetSuite push. Honors finale.max_per_run as a blast guard."""
+    cap = _finale_config().get("max_per_run")
+    if cap is not None and len(sent_ids) > cap:
+        tracking.record_job_run("finale_push", "blocked",
+                                f"{len(sent_ids)} to invoice exceeds max_per_run {cap} -- run manually")
+        return
+    try:
+        _run_finale_push(True, sent_ids, None)
+    except Exception as exc:
+        with _finale_push_lock:
+            _finale_push_state["error"] = str(exc)
+        print(f"WARNING: Finale invoicing failed after NetSuite push: {exc}")
+        tracking.record_job_run("finale_push", "error", str(exc)[:200])
+
+
+def _refresh_new_accepted() -> int:
+    """Incremental 810 refresh for the 15-minute Finale poll: ONE list call to read
+    every transaction's state, detail fetches only for transactions that are new or
+    whose state changed since the cache (e.g. Draft -> Accepted), plus the 850s of any
+    PO the cache doesn't know. Merges into the cache; never raises. Returns how many
+    invoices were refreshed. The 4:45 full refresh still owns ASN/Finale ship dates."""
+    if _mock_mode():
+        return 0
+    try:
+        client = _get_client()
+        states = client.list_transaction_states()
+        with _cache_lock:
+            cached = {str(i.get("transaction_id")): str(i.get("status") or "") for i in _cache["invoices"]}
+            po_map = dict(_cache["po_provinces"])
+        changed = [tid for tid, st in states.items() if cached.get(tid) != st["state"]]
+        if not changed:
+            return 0
+        fresh = client.fetch_invoices(only_ids=changed)
+        missing_pos = sorted({str(i.get("po_number") or "") for i in fresh} - set(po_map) - {""})
+        if missing_pos:
+            po_map.update(client.fetch_po_provinces(only_pos=missing_pos))
+        _attach_provinces(fresh, po_map)
+        _annotate_tax_suggestion(fresh)
+        by_id = {str(i.get("transaction_id")): i for i in fresh}
+        with _cache_lock:
+            merged = [by_id.pop(str(i.get("transaction_id")), i) for i in _cache["invoices"]]
+            merged.extend(by_id.values())
+            _cache["invoices"] = merged
+            _cache["po_provinces"] = po_map
+            _cache["last_incremental"] = datetime.now(timezone.utc).isoformat()
+        return len(fresh)
+    except Exception as exc:
+        print(f"WARNING: incremental 810 refresh failed: {exc}")
+        tracking.record_job_run("finale_push", "error", f"refresh: {str(exc)[:160]}")
+        return 0
+
+
+def _run_finale_push_job() -> None:
+    """Every 15 minutes: refresh 810 states incrementally, then invoice in Finale the
+    Accepted 810s not yet invoiced -- under the same automation guards as the NetSuite
+    job (go-live floor, created_at window) plus finale.max_per_run. An order not yet
+    shipped in Finale is skipped by the engine and retried next run. OFF unless both
+    config finale.enabled and the dashboard toggle are on."""
+    if not _finale_enabled():
+        tracking.record_job_run("finale_push", "skipped", "disabled"); return
+    try:
+        _refresh_new_accepted()
+        auto = load_refs().get("automation") or {}
+        cap = _finale_config().get("max_per_run")
+        with _cache_lock:
+            invoices = list(_cache["invoices"])
+        candidates = eligible_for_push(invoices)
+        todo = tracking.get_unfinaled_ids([str(i["transaction_id"]) for i in candidates])
+        to_push, blocked = select_for_automation(candidates, todo,
+                                                 created_after=str(auto.get("go_live_after") or "") or None,
+                                                 created_within_days=auto.get("created_within_days"),
+                                                 max_per_run=cap)
+        if blocked:
+            tracking.record_job_run("finale_push", "blocked", f"{blocked} -- refusing; run manually"); return
+        if not to_push:
+            tracking.record_job_run("finale_push", "ok", "nothing new to invoice"); return
+        _run_finale_push(True, [str(i["transaction_id"]) for i in to_push], None)
+    except Exception as exc:
+        print(f"WARNING: Finale poll failed: {exc}")
+        tracking.record_job_run("finale_push", "error", str(exc)[:200])
 
 
 def _auto_digest_enabled() -> bool:
@@ -710,6 +881,7 @@ AUTOMATION_JOBS = [
     {"id": "daily_refresh", "label": "Invoice sync (Crstl)", "schedule": "Daily · 4:45 AM ET",   "setting": AUTO_SYNC_SETTING,    "default": "true"},
     {"id": "netsuite_push", "label": "NetSuite auto-push",   "schedule": "Mon–Fri · 5:00 AM ET", "setting": AUTO_NS_PUSH_SETTING, "default": "false"},
     {"id": "daily_digest",  "label": "Daily digest email",   "schedule": "Mon–Fri · 7:15 AM ET", "setting": AUTO_DIGEST_SETTING,  "default": "true"},
+    {"id": "finale_push",   "label": "Finale invoicing",     "schedule": "Every 15 min",         "setting": AUTO_FINALE_SETTING,  "default": "false"},
 ]
 _JOB_BY_ID = {j["id"]: j for j in AUTOMATION_JOBS}
 
@@ -837,6 +1009,12 @@ async def lifespan(app: FastAPI):
                        day_of_week="mon-fri", hour=7, minute=15,
                        timezone="America/Toronto",
                        misfire_grace_time=3600, coalesce=True)
+    # Finale invoicing poll -- every 15 minutes. HD accepts the 810 a median 6 min after
+    # the ship, so this lands the Finale invoice + order completion ~15-20 min after
+    # shipping with exact 810 cents. Cheap when idle (one CRSTL list call). OFF unless
+    # config finale.enabled AND the dashboard toggle are both on.
+    _scheduler.add_job(_run_finale_push_job, "interval", id="finale_push", minutes=15,
+                       misfire_grace_time=600, coalesce=True)
     _scheduler.start()
     yield
     _scheduler.shutdown()
@@ -984,6 +1162,12 @@ def _run_netsuite_push(live: bool, ids: Optional[list[str]], limit: Optional[int
             "blocked": result.get("blocked"),
             "error": None,
         })
+    # Finale invoicing rides the same event: the invoices that just landed as SOs.
+    if live and _finale_enabled():
+        sent_ids = [str(r.get("transaction_id")) for r in (result.get("results") or [])
+                    if r.get("status") == "sent"]
+        if sent_ids:
+            _run_finale_push_safe(sent_ids)
     # Fire the accounting digest the moment SOs actually land in NetSuite -- no
     # waiting for the scheduled run. Live pushes only; best-effort so a digest
     # failure never fails the push (the scheduled safety-net will catch it).
@@ -1026,6 +1210,45 @@ async def netsuite_push(body: NetsuitePushRequest = NetsuitePushRequest()) -> JS
     # A live send blocked on unresolved ids wrote nothing -> surface as 400.
     status_code = 400 if result.get("blocked") else 200
     return JSONResponse(status_code=status_code, content={**result, "last_run": last_run})
+
+
+class FinalePushRequest(BaseModel):
+    dry_run: bool = True
+    ids: Optional[list[str]] = None
+    limit: Optional[int] = Field(default=None, ge=1)
+
+
+@app.post("/api/finale")
+async def finale_push(body: FinalePushRequest = FinalePushRequest()) -> JSONResponse:
+    """Manual Finale invoicing. Dry run unless dry_run=false; a live run must name
+    the invoices (ids) -- same guard as /api/netsuite -- and is refused while any
+    promo/tax-rate id is unresolved in config."""
+    if not body.dry_run and not body.ids:
+        return JSONResponse(status_code=400, content={
+            "message": "A live Finale run must name the invoices to create (ids). Use dry_run for a preview."})
+    with _finale_push_lock:
+        if _finale_push_state.get("running"):
+            return JSONResponse(status_code=409, content={"message": "A Finale run is already in progress"})
+        _finale_push_state["running"] = True
+    try:
+        result = await asyncio.to_thread(_run_finale_push, not body.dry_run, body.ids, body.limit)
+    except Exception as exc:
+        print(f"Finale push failed: {exc}")
+        with _finale_push_lock:
+            _finale_push_state["error"] = "push failed — see server logs"
+        return JSONResponse(status_code=500, content={"message": "Finale push failed — see server logs"})
+    finally:
+        with _finale_push_lock:
+            _finale_push_state["running"] = False
+    with _finale_push_lock:
+        last_run = _finale_push_state["last_run"]
+    return JSONResponse(status_code=400 if result.get("blocked") else 200, content={**result, "last_run": last_run})
+
+
+@app.get("/api/finale-push/latest")
+async def finale_push_latest() -> JSONResponse:
+    with _finale_push_lock:
+        return JSONResponse(content=dict(_finale_push_state))
 
 
 @app.get("/api/netsuite-push/latest")

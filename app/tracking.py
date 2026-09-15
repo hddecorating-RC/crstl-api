@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 # Event types the app writes. Enforced in application code, not via a DB CHECK
 # constraint — SQLite can't ALTER a CHECK, and letting the schema outlive the
 # app's event vocabulary made adding 'emailed' painful.
-EVENT_TYPES = ("exported", "netsuite", "emailed", "so_digest")
+EVENT_TYPES = ("exported", "netsuite", "emailed", "so_digest", "finale")
 
 # Last write failure — surfaced via `write_health()` so the /api/health endpoint
 # can report "digest ran but couldn't record — expect re-sends tomorrow".
@@ -55,6 +55,15 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
             netsuite_id   TEXT,
             last_modified TEXT,
             updated_at    TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS finale_invoices (
+            transaction_id  TEXT PRIMARY KEY,
+            po_number       TEXT,
+            invoice_id      TEXT,
+            invoice_url     TEXT,
+            invoice_id_user TEXT,
+            status          TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
         );
     """)
 
@@ -324,3 +333,66 @@ def get_netsuite_ids(external_ids: list[str]) -> dict[str, str]:
     except Exception as exc:
         print(f"WARNING: netsuite_records batch read failed: {exc}")
         return {}
+
+
+def record_finale_invoice(transaction_id: str, po_number: str | None, invoice_id: str | None,
+                          invoice_url: str | None, invoice_id_user: str | None, status: str) -> None:
+    """Remember the Finale invoice we created for this Crstl transaction: its id/url
+    and whether it was posted ('posted') or left as a draft for review ('draft').
+    Keyed on transaction_id so a re-run sees it and never creates a second invoice
+    (Finale's collection POST always creates -- proven 2026-09-15). Best-effort."""
+    if not transaction_id:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with contextlib.closing(_connect()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO finale_invoices (transaction_id, po_number, invoice_id, invoice_url, "
+                    "invoice_id_user, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(transaction_id) DO UPDATE SET po_number = excluded.po_number, "
+                    "invoice_id = excluded.invoice_id, invoice_url = excluded.invoice_url, "
+                    "invoice_id_user = excluded.invoice_id_user, status = excluded.status, "
+                    "updated_at = excluded.updated_at",
+                    (transaction_id, po_number, invoice_id, invoice_url, invoice_id_user, status, now))
+    except Exception as exc:
+        print(f"ERROR: finale_invoices write failed for {transaction_id!r}: {exc}")
+
+
+def get_finale_invoices(transaction_ids: list[str]) -> dict[str, dict]:
+    """{transaction_id: {invoice_id, invoice_url, invoice_id_user, status, updated_at}}
+    for the transactions we have created a Finale invoice for. Drives idempotency
+    (skip what already exists) and the digest's 'Finale invoice' column."""
+    ids = [t for t in transaction_ids if t]
+    if not ids:
+        return {}
+    try:
+        with contextlib.closing(_connect()) as conn:
+            placeholders = ",".join("?" * len(ids))
+            rows = conn.execute(
+                f"SELECT transaction_id, po_number, invoice_id, invoice_url, invoice_id_user, status, updated_at "
+                f"FROM finale_invoices WHERE transaction_id IN ({placeholders})", ids).fetchall()
+        return {r[0]: {"po_number": r[1], "invoice_id": r[2], "invoice_url": r[3],
+                       "invoice_id_user": r[4], "status": r[5], "updated_at": r[6]} for r in rows}
+    except Exception as exc:
+        print(f"WARNING: finale_invoices batch read failed: {exc}")
+        return {}
+
+
+def get_unfinaled_ids(candidate_ids: list[str]) -> list[str]:
+    """The subset of `candidate_ids` with no 'finale' event yet -- not yet invoiced
+    in Finale by this tool. Order preserved. Mirrors get_unpushed_ids."""
+    if not candidate_ids:
+        return []
+    placeholders = ",".join("?" * len(candidate_ids))
+    try:
+        with contextlib.closing(_connect()) as conn:
+            rows = conn.execute(
+                f"""SELECT DISTINCT transaction_id FROM invoice_events
+                    WHERE event_type = 'finale' AND transaction_id IN ({placeholders})""",
+                candidate_ids).fetchall()
+        done = {r[0] for r in rows}
+    except Exception as exc:
+        print(f"WARNING: tracking read failed: {exc}")
+        return []
+    return [tid for tid in candidate_ids if tid not in done]

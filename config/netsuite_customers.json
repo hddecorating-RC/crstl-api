@@ -101,5 +101,25 @@
     "go_live_after": "2026-09-11",
     "created_within_days": 7,
     "max_per_run": 75
+  },
+
+  "_comment_finale": "Finale invoice creation (app.finale_invoice) -- ONE tool invoices BOTH DSD and Dropship, EDI-driven (850 product/810 qty+price), exact CRSTL discount + our tax, auto-POSTED when it ties to the 810 to the cent, left as a DRAFT + flagged otherwise. Finale invoices go nowhere downstream (internal record for teams without NetSuite). Ids read from the Finale catalogue 2026-09-15 (GET /api/productpromo, /api/taxauthorityrateproduct): promo presets DSD 100037 'DSD - 6.18875%', Dropship 100038 'Dropship - 5.18875%'; tax-rate products GST 5%=100000 (AB/BC/MB: we bill GST-only, no PST), HST 15%=100001 (NB/NL/PE), HST 13%=100002 (ON), GST+QST=100003 (QC), HST 14%=100004 (NS), GST+Sask PST=100005 (SK). enabled=false ships it OFF; the scheduled path is also capped by max_per_run and only ever invoices what the NetSuite push just sent.",
+  "finale": {
+    "enabled": false,
+    "max_per_run": 75,
+    "promo_ids": {"dsd": "100037", "dropship": "100038"},
+    "promo_desc": {"dsd": "DSD - 6.18875%", "dropship": "Dropship - 5.18875%"},
+    "tax_rate_ids": {
+      "AB": "100000", "BC": "100000", "MB": "100000",
+      "ON": "100002",
+      "NB": "100001", "NL": "100001", "PE": "100001",
+      "NS": "100004",
+      "QC": "100003",
+      "SK": "100005"
+    },
+    "tax_desc": {
+      "100000": "GST 5%", "100001": "HST 15%", "100002": "HST 13%",
+      "100003": "GST + QST", "100004": "HST 14%", "100005": "GST + Sask PST"
+    }
   }
 }
