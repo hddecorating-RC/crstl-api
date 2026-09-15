@@ -199,7 +199,13 @@ def push_finale_invoices(
     if account is None:
         account = getattr(client, "account_id", None) or __import__("os").environ.get("FINALE_ACCOUNT_ID", "")
     if product_index is None:
-        product_index = client.product_index() if client is not None else {}
+        if client is not None:
+            product_index = client.product_index()
+        else:
+            # Dry run with no client still needs the catalogue to resolve products
+            # (read-only GET) -- otherwise the preview reports every line as missing.
+            from app.finale import FinaleClient
+            product_index = FinaleClient().product_index() if FinaleClient.configured() else {}
     invoices = _select(eligible_for_push(invoices), only, limit)
 
     results: list[dict] = []

@@ -259,3 +259,14 @@ def test_tracking_finale_receipts_roundtrip(tmp_path, monkeypatch):
     tracking.record_events(["T1"], "finale")
     assert tracking.get_unfinaled_ids(["T1", "T2"]) == ["T2"]
     assert tracking.get_latest_events(["T1"])["T1"]["finale_at"] is not None
+
+
+def test_dry_run_without_client_resolves_products_read_only():
+    """A dry run with no client fetches the product catalogue (GET only) so the
+    preview shows real product resolution instead of 'missing' everywhere."""
+    with patch("app.finale.FinaleClient") as FC:
+        FC.configured.return_value = True
+        FC.return_value.product_index.return_value = INDEX
+        out = push_finale_invoices([INV], PO_MAP, live=False, refs=REFS)
+    FC.return_value.product_index.assert_called_once()
+    assert out["results"][0]["status"] == "built" and out["results"][0]["missing_products"] == []
