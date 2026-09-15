@@ -143,13 +143,29 @@ def test_qty_check_unverified_vs_mismatch_vs_ok():
     assert ok and mism == ["a: invoiced 2 vs shipped 1"]
 
 
-def test_dry_run_builds_without_touching_finale():
-    client = FakeFinale()
-    with patch("app.tracking.record_events") as rec:
-        out = push_finale_invoices([INV], PO_MAP, live=False, refs=REFS, client=client)
-    assert out["mode"] == "dry" and out["summary"]["built"] == 1 and out["summary"]["posted"] == 0
-    assert out["results"][0]["status"] == "built" and out["results"][0]["total"] == 21.42
-    assert client.calls == [] and rec.assert_not_called() is None
+def test_dry_run_previews_exactly_what_live_would_do_without_writing():
+    """A dry run performs the same READ-ONLY preflight as live -- so it reports
+    skip / retry / would-post / would-draft truthfully -- and never creates,
+    completes, or records anything."""
+    shipped = {"/hddecorating/api/product/138VB5236WHTC": 1.0}
+    with patch("app.tracking.get_finale_invoices", return_value={}), patch("app.tracking.record_events") as rec, \
+         patch("app.tracking.record_finale_invoice") as rec_inv:
+        clean = FakeFinale(shipped=shipped)
+        out = push_finale_invoices([INV], PO_MAP, live=False, refs=REFS, client=clean)
+        assert out["mode"] == "dry" and out["results"][0]["status"] == "built" and out["results"][0]["would"] == "posted"
+        assert out["results"][0]["total"] == 21.42 and out["summary"] == {**out["summary"], "built": 1, "posted": 0}
+        off = FakeFinale(shipped=shipped)
+        out2 = push_finale_invoices([{**INV, "total_amount": 22.00}], PO_MAP, live=False, refs=REFS, client=off)
+        assert out2["results"][0]["would"] == "draft"
+        already = FakeFinale(invoices=[{"invoiceId": "9", "invoiceIdUser": "PO1-1", "statusId": "INVOICE_APPROVED"}], shipped=shipped)
+        out3 = push_finale_invoices([INV], PO_MAP, live=False, refs=REFS, client=already)
+        assert out3["results"][0]["status"] == "skipped_exists" and out3["summary"]["skipped_exists"] == 1
+        unshipped = FakeFinale(shipped=None)
+        out4 = push_finale_invoices([INV], PO_MAP, live=False, refs=REFS, client=unshipped)
+        assert out4["results"][0]["status"] == "skipped_not_shipped"
+    for c in (clean, off, already, unshipped):
+        assert not [x for x in c.calls if x[0] in ("create", "complete", "complete_order")]   # reads only
+    rec.assert_not_called(); rec_inv.assert_not_called()
 
 
 def test_live_clean_invoice_is_created_and_posted_with_receipts():
@@ -264,9 +280,15 @@ def test_tracking_finale_receipts_roundtrip(tmp_path, monkeypatch):
 def test_dry_run_without_client_resolves_products_read_only():
     """A dry run with no client fetches the product catalogue (GET only) so the
     preview shows real product resolution instead of 'missing' everywhere."""
-    with patch("app.finale.FinaleClient") as FC:
+    with patch("app.finale.FinaleClient") as FC, patch("app.tracking.get_finale_invoices", return_value={}):
         FC.configured.return_value = True
-        FC.return_value.product_index.return_value = INDEX
+        inst = FC.return_value
+        inst.product_index.return_value = INDEX
+        inst.get_order.return_value = {"orderId": "PO1", "invoiceUrlList": [], "shipmentUrlList": []}
+        inst.order_invoices.return_value = []
+        inst.shipment_qty_for_order.return_value = {"/hddecorating/api/product/138VB5236WHTC": 1.0}
         out = push_finale_invoices([INV], PO_MAP, live=False, refs=REFS)
-    FC.return_value.product_index.assert_called_once()
+    inst.product_index.assert_called_once()
     assert out["results"][0]["status"] == "built" and out["results"][0]["missing_products"] == []
+    assert out["results"][0]["would"] == "posted"
+    inst.create_invoice.assert_not_called(); inst.complete_invoice.assert_not_called()

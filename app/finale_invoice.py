@@ -247,57 +247,81 @@ def push_finale_invoices(
     mode = "live" if live else "dry"
     posted = draft = failed = 0
 
-    if live:
-        if unresolved:
-            return {"mode": mode, "unresolved": unresolved, "results": results, "blocked": "unresolved ids",
-                    "summary": {"built": len(prepared), "posted": 0, "draft": 0, "failed": 0, **counts}}
-        from app import tracking
-        if client is None:
-            from app.finale import FinaleClient, FinaleUnavailable
-            if not FinaleClient.configured():
-                raise FinaleUnavailable("FINALE_* credentials not set")
+    def preflight(client, row, body, prior):
+        """The read-only checks that decide whether a row may be written, identical
+        for a dry run and a live run: our own receipt, the order's existence, an
+        invoice already on the order, and the shipped-qty gate. Sets a skipped_*
+        status and returns None when the row must not be written; otherwise sets
+        qty_flag and returns the order."""
+        tid = row["transaction_id"]
+        if prior and prior.get("status") in ("draft", "posted"):
+            row["status"] = "skipped_exists"
+            row["invoice_id"], row["invoice_url"], row["invoice_id_user"] = prior.get("invoice_id"), prior.get("invoice_url"), prior.get("invoice_id_user")
+            row["error"] = f"already invoiced in Finale ({prior.get('invoice_id_user') or prior.get('invoice_id')}, {prior.get('status')})"
+            counts["skipped_exists"] += 1
+            return None
+        order = client.get_order(str(row["po_number"]))
+        if order is None:
+            row["status"] = "skipped_no_order"
+            row["error"] = f"no Finale order {row['po_number']}"
+            counts["skipped_no_order"] += 1
+            return None
+        live_invoices = [i for i in client.order_invoices(order) if i.get("statusId") != CANCELLED]
+        if live_invoices:
+            row["status"] = "skipped_exists"
+            row["error"] = ("order already carries invoice "
+                            + ", ".join(str(i.get("invoiceIdUser") or i.get("invoiceId")) for i in live_invoices))
+            counts["skipped_exists"] += 1
+            return None
+        mism, verified = qty_check([l for l in body["invoiceItemList"] if l["invoiceItemTypeId"] == "INV_PROD_ITEM"],
+                                   client.shipment_qty_for_order(order))
+        if not verified:
+            # Not shipped in Finale yet: leave it alone (no invoice, no receipt)
+            # so the next poll picks it up once the shipment exists.
+            row["status"] = "skipped_not_shipped"
+            row["error"] = "not shipped in Finale yet -- will retry"
+            counts["skipped_not_shipped"] += 1
+            return None
+        if mism:
+            row["qty_flag"] = "shipped qty != 810: " + "; ".join(mism)
+        return order
+
+    from app import tracking
+    if client is None:
+        from app.finale import FinaleClient, FinaleUnavailable
+        if FinaleClient.configured():
             client = FinaleClient()
+        elif live:
+            raise FinaleUnavailable("FINALE_* credentials not set")
+
+    if live and unresolved:
+        return {"mode": mode, "unresolved": unresolved, "results": results, "blocked": "unresolved ids",
+                "summary": {"built": len(prepared), "posted": 0, "draft": 0, "failed": 0, **counts}}
+
+    if client is not None:
+        # Read-only preflight for BOTH modes, so a dry run reports exactly what a
+        # live run would do (skip / retry / would-post / would-draft) -- the
+        # "prove the first run" preview must not overstate.
         existing = tracking.get_finale_invoices([r["transaction_id"] for r, _ in prepared])
         created_ids: list[str] = []
         for row, body in prepared:
             tid = row["transaction_id"]
-            prior = existing.get(tid)
-            if prior and prior.get("status") in ("draft", "posted"):
-                row["status"] = "skipped_exists"
-                row["invoice_id"], row["invoice_url"], row["invoice_id_user"] = prior.get("invoice_id"), prior.get("invoice_url"), prior.get("invoice_id_user")
-                row["error"] = f"already invoiced in Finale ({prior.get('invoice_id_user') or prior.get('invoice_id')}, {prior.get('status')})"
-                counts["skipped_exists"] += 1
+            try:
+                order = preflight(client, row, body, existing.get(tid))
+            except Exception as exc:
+                row["status"] = "failed"; row["error"] = str(exc); failed += 1
+                continue
+            if order is None:
+                continue
+            clean = row["reconcile_flag"] is None and row["qty_flag"] is None
+            if not live:
+                row["would"] = "posted" if clean else "draft"
                 continue
             try:
-                order = client.get_order(str(row["po_number"]))
-                if order is None:
-                    row["status"] = "skipped_no_order"
-                    row["error"] = f"no Finale order {row['po_number']}"
-                    counts["skipped_no_order"] += 1
-                    continue
-                live_invoices = [i for i in client.order_invoices(order) if i.get("statusId") != CANCELLED]
-                if live_invoices:
-                    row["status"] = "skipped_exists"
-                    row["error"] = ("order already carries invoice "
-                                    + ", ".join(str(i.get("invoiceIdUser") or i.get("invoiceId")) for i in live_invoices))
-                    counts["skipped_exists"] += 1
-                    continue
-                mism, verified = qty_check([l for l in body["invoiceItemList"] if l["invoiceItemTypeId"] == "INV_PROD_ITEM"],
-                                           client.shipment_qty_for_order(order))
-                if not verified:
-                    # Not shipped in Finale yet: leave it alone (no invoice, no receipt)
-                    # so the next poll picks it up once the shipment exists.
-                    row["status"] = "skipped_not_shipped"
-                    row["error"] = "not shipped in Finale yet -- will retry"
-                    counts["skipped_not_shipped"] += 1
-                    continue
-                if mism:
-                    row["qty_flag"] = "shipped qty != 810: " + "; ".join(mism)
                 created = client.create_invoice(body)
                 row["invoice_id"] = created.get("invoiceId")
                 row["invoice_url"] = created.get("invoiceUrl")
                 row["invoice_id_user"] = created.get("invoiceIdUser")
-                clean = row["reconcile_flag"] is None and row["qty_flag"] is None
                 if clean:
                     client.complete_invoice(row["invoice_url"])
                     row["status"] = "posted"; posted += 1
@@ -318,11 +342,12 @@ def push_finale_invoices(
                 row["status"] = "failed"
                 row["error"] = str(exc)
                 failed += 1
-        if created_ids:
+        if live and created_ids:
             try:
                 tracking.record_events(created_ids, "finale")
             except Exception as exc:  # noqa: BLE001
                 print(f"WARNING: finale invoices created but tracking failed: {exc}")
 
+    built = sum(1 for r in results if r.get("status") == "built")
     return {"mode": mode, "unresolved": unresolved, "results": results,
-            "summary": {"built": len(prepared), "posted": posted, "draft": draft, "failed": failed, **counts}}
+            "summary": {"built": built, "posted": posted, "draft": draft, "failed": failed, **counts}}

@@ -795,8 +795,10 @@ def _run_finale_push_job() -> None:
             invoices = list(_cache["invoices"])
         candidates = eligible_for_push(invoices)
         todo = tracking.get_unfinaled_ids([str(i["transaction_id"]) for i in candidates])
+        # Finale's OWN floor ("orders moving forward"), falling back to the shared one.
+        floor = str(_finale_config().get("go_live_after") or auto.get("go_live_after") or "") or None
         to_push, blocked = select_for_automation(candidates, todo,
-                                                 created_after=str(auto.get("go_live_after") or "") or None,
+                                                 created_after=floor,
                                                  created_within_days=auto.get("created_within_days"),
                                                  max_per_run=cap)
         if blocked:
