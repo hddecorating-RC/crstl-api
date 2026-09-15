@@ -21,6 +21,7 @@ from app.netsuite_csv import build_netsuite_csv
 from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation
 from app.finale_invoice import push_finale_invoices
 from app.finale_nonedi import push_nonedi_invoices
+from app.finale_dsd import push_dsd_prefill, select_dsd_asns
 from app.netsuite_payload import load_refs
 from app.report import (XLSX_MEDIA_TYPE, dates_for, flavor_of, product_for,
                         rows_for_transactions, window_label, workbook_bytes)
@@ -832,8 +833,10 @@ def _run_finale_push_job() -> None:
     """Every 15 minutes, two passes -- BOTH gated by the same two switches (config
     finale.enabled AND the dashboard toggle): (1) EDI: Accepted 810s not yet invoiced,
     shipped in Finale; (2) non-EDI: shipped Finale sale orders that are not Crstl POs
-    (HD Supply, Special Orders, future OMIS...). One pass failing never stops the other.
-    An order not yet shipped in Finale is skipped by the engine and retried next run."""
+    (HD Supply, Special Orders, future OMIS...); (3) when finale.dsd_prefill is on, DSD:
+    PRO/RTS from newly Accepted 856s onto their open Finale shipments. One pass failing
+    never stops the others. An order not yet shipped in Finale is skipped by the engine
+    and retried next run."""
     if not _finale_enabled():
         tracking.record_job_run("finale_push", "skipped", "disabled"); return
     try:
@@ -846,6 +849,52 @@ def _run_finale_push_job() -> None:
     except Exception as exc:
         print(f"WARNING: non-EDI Finale poll failed: {exc}")
         tracking.record_job_run("finale_nonedi", "error", str(exc)[:200])
+    if _dsd_prefill_enabled():
+        try:
+            _run_dsd_prefill(True, None, None)
+        except Exception as exc:
+            print(f"WARNING: DSD prefill poll failed: {exc}")
+            tracking.record_job_run("finale_dsd", "error", str(exc)[:200])
+
+
+def _dsd_prefill_enabled() -> bool:
+    return bool(_finale_config().get("dsd_prefill"))
+
+
+def _run_dsd_prefill(live: bool, ids: Optional[list[str]], limit: Optional[int]) -> dict:
+    """Copy PRO/RTS from Accepted DSD 856s onto their open Finale shipments (live) or
+    preview it (dry). `ids` names ASN ids; a manual run may name any Accepted ASN, the
+    automated pass (ids=None) applies the shared guards: go_live_after floor, the
+    created_within_days window, max_per_run, and one receipt per ASN."""
+    from app.finale import FinaleClient, FinaleUnavailable
+    if not FinaleClient.configured():
+        raise FinaleUnavailable("FINALE_* credentials not set")
+    crstl = _get_client()
+    fin, auto = _finale_config(), (load_refs().get("automation") or {})
+    blocked = None
+    if ids is None:
+        states = crstl.list_transaction_states(transaction_type="856")
+        todo = tracking.get_unprefilled_asn_ids(list(states))
+        ids, blocked = select_dsd_asns(states, set(states) - set(todo),
+                                       created_after=str(fin.get("go_live_after") or auto.get("go_live_after") or "") or None,
+                                       created_within_days=auto.get("created_within_days"),
+                                       max_per_run=fin.get("max_per_run"))
+    if blocked:
+        result = {"mode": "live" if live else "dry", "results": [], "blocked": blocked,
+                  "summary": {"candidates": 0}}
+    else:
+        asns = crstl.fetch_asn_refs(ids) if ids else []
+        result = push_dsd_prefill(asns, live=live, only=None, limit=limit, client=FinaleClient())
+    with _finale_push_lock:
+        _finale_push_state["dsd"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
+    s = result["summary"]
+    tracking.record_job_run("finale_dsd", "blocked" if blocked else ("ok" if not s.get("failed") else "partial"),
+                            (f"{blocked} -- refusing; run manually" if blocked else
+                             f"{s['candidates']} ASNs: {s.get('prefilled', 0)} prefilled, {s.get('would_prefill', 0)} would, "
+                             f"{s.get('skipped_no_shipment', 0) + s.get('skipped_no_order', 0)} waiting, "
+                             f"{s.get('skipped_shipped', 0)} already shipped, {s.get('failed', 0)} failed")
+                            + f" [{'live' if live else 'dry'}]")
+    return result
 
 
 def _crstl_po_set() -> set:
@@ -1363,6 +1412,21 @@ async def finale_nonedi_push(body: FinalePushRequest = FinalePushRequest()) -> J
     except Exception as exc:
         print(f"non-EDI Finale push failed: {exc}")
         return JSONResponse(status_code=500, content={"message": "non-EDI Finale push failed — see server logs"})
+    return JSONResponse(status_code=400 if result.get("blocked") else 200, content=result)
+
+
+@app.post("/api/finale/dsd")
+async def finale_dsd_prefill(body: FinalePushRequest = FinalePushRequest()) -> JSONResponse:
+    """Manual DSD pre-fill (PRO/RTS from Accepted 856s onto open Finale shipments). Dry
+    run unless dry_run=false; a live run must name the ASN ids."""
+    if not body.dry_run and not body.ids:
+        return JSONResponse(status_code=400, content={
+            "message": "A live DSD run must name the ASN ids (ids). Use dry_run for a preview."})
+    try:
+        result = await asyncio.to_thread(_run_dsd_prefill, not body.dry_run, body.ids, body.limit)
+    except Exception as exc:
+        print(f"DSD prefill failed: {exc}")
+        return JSONResponse(status_code=500, content={"message": "DSD prefill failed — see server logs"})
     return JSONResponse(status_code=400 if result.get("blocked") else 200, content=result)
 
 

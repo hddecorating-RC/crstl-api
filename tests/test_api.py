@@ -772,3 +772,60 @@ def test_digest_lists_stale_pickups_and_nonedi_line(client, monkeypatch):
     body = mail.call_args.kwargs["body_html"]
     assert "not shipped in Finale" in body and "6 days" in body
     assert "Finale (non-EDI orders)" in body and "1 invoice(s) posted" in body and "507872-00" in body
+
+
+def test_dsd_prefill_runs_in_the_finale_job_only_when_configured(monkeypatch):
+    from app.main import _run_finale_push_job
+    monkeypatch.setattr("app.main._finale_enabled", lambda: True)
+    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), \
+         patch("app.main._finale_config", return_value={"enabled": True, "dsd_prefill": True}), \
+         patch("app.main._run_dsd_prefill") as dsd:
+        _run_finale_push_job()
+    dsd.assert_called_once_with(True, None, None)
+    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), \
+         patch("app.main._finale_config", return_value={"enabled": True}), \
+         patch("app.main._run_dsd_prefill") as dsd2:
+        _run_finale_push_job()
+    dsd2.assert_not_called()
+    # a DSD failure is isolated, like the other passes
+    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), \
+         patch("app.main._finale_config", return_value={"enabled": True, "dsd_prefill": True}), \
+         patch("app.main._run_dsd_prefill", side_effect=RuntimeError("boom")), \
+         patch("app.tracking.record_job_run") as job:
+        _run_finale_push_job()
+    assert ("finale_dsd", "error") in {(c.args[0], c.args[1]) for c in job.call_args_list}
+
+
+def test_dsd_endpoint_live_requires_ids_and_dry_run_previews(client):
+    r = client.post("/api/finale/dsd", json={"dry_run": False})
+    assert r.status_code == 400 and "ASN ids" in r.json()["message"]
+    fake = {"mode": "dry", "results": [{"asn_id": "a1", "status": "would_prefill"}],
+            "summary": {"candidates": 1, "would_prefill": 1}}
+    with patch("app.main._run_dsd_prefill", return_value=fake) as run:
+        r2 = client.post("/api/finale/dsd", json={"dry_run": True, "ids": ["a1"]})
+    assert r2.status_code == 200 and r2.json()["summary"]["would_prefill"] == 1
+    run.assert_called_once_with(False, ["a1"], None)
+
+
+def test_run_dsd_prefill_applies_the_shared_guards_to_the_automated_pass(monkeypatch):
+    """ids=None (the 15-min pass): Accepted 856s after the floor, no receipt, under the
+    cap -- and only those get a detail fetch. A named run fetches exactly the ids given."""
+    from app.main import _run_dsd_prefill
+    from app import tracking
+    tracking.init_db()
+    states = {"new": {"state": "Accepted", "created_at": "2026-09-16T01:00:00Z", "po_number": "1"},
+              "old": {"state": "Accepted", "created_at": "2026-09-01T01:00:00Z", "po_number": "2"},
+              "draft": {"state": "Draft", "created_at": "2026-09-16T01:00:00Z", "po_number": "3"}}
+    crstl = type("C", (), {"list_transaction_states": lambda self, transaction_type="810": states,
+                           "fetch_asn_refs": lambda self, ids: [{"asn_id": i, "po_number": "1", "state": "Accepted",
+                                                                 "pro": "3200", "rts": "6100", "pickup_date": ""} for i in ids]})()
+    monkeypatch.setattr("app.main._get_client", lambda: crstl)
+    monkeypatch.setattr("app.main._finale_config", lambda: {"enabled": True, "dsd_prefill": True, "go_live_after": "2026-09-15", "max_per_run": 5})
+    monkeypatch.setattr("app.main.load_refs", lambda: {"automation": {"created_within_days": 365}})
+    with patch("app.finale.FinaleClient.configured", return_value=True), patch("app.finale.FinaleClient") as fc, \
+         patch("app.main.push_dsd_prefill", return_value={"mode": "dry", "results": [], "summary": {"candidates": 1}}) as push:
+        fc.configured.return_value = True
+        _run_dsd_prefill(False, None, None)
+        assert [a["asn_id"] for a in push.call_args[0][0]] == ["new"]
+        _run_dsd_prefill(False, ["old"], None)
+        assert [a["asn_id"] for a in push.call_args[0][0]] == ["old"]

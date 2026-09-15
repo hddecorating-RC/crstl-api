@@ -147,6 +147,9 @@ def build_finale_invoice(invoice: dict, po_entry: dict | None, product_index: di
         "invoiceDate": f"{str(invoice.get('invoice_date') or '')[:10]}T16:00:00.000Z",
         "invoiceItemList": items,
     }
+    if invoice.get("invoice_number"):
+        # What the warehouse keys by hand on every DSD invoice (40864264-1: "INV40864264").
+        body["referenceNumber"] = str(invoice["invoice_number"])
     d = m["delta"]
     return {
         "status": "built", "body": body, "channel": r["channel"],

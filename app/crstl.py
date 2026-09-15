@@ -5,7 +5,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from app.products import vendor_items_in
-from app.shipments import asn_date_index
+from app.shipments import asn_date_index, asn_shipping_refs
 from app.sac_codes import classify
 
 
@@ -49,12 +49,13 @@ class CrstlClient:
         resp.raise_for_status()
         return resp.json()
 
-    def list_transaction_states(self) -> dict[str, dict]:
-        """{transaction_id: {"state": "Accepted"|..., "updated_at": ..., "po_number": ...}} for
-        every 810, from the LIST call alone (paginated, no per-transaction detail).
+    def list_transaction_states(self, transaction_type: str = "810") -> dict[str, dict]:
+        """{transaction_id: {"state": "Accepted"|..., "updated_at": ..., "po_number": ...,
+        "created_at": ...}} for every transaction of this type (810 by default, 856 for
+        the DSD pass), from the LIST call alone (paginated, no per-transaction detail).
         The cheap poll the 15-minute Finale job uses to spot new acceptances."""
         out = {}
-        for tx in self._fetch_all_transactions():
+        for tx in self._fetch_all_transactions(transaction_type=transaction_type):
             m = tx.get("metadata") or tx
             tid = tx.get("id") or m.get("id") or tx.get("transaction_id")
             if not tid:
@@ -62,7 +63,40 @@ class CrstlClient:
             st = m.get("state") or {}
             out[str(tid)] = {"state": str(st.get("value") if isinstance(st, dict) else st or ""),
                              "updated_at": str((st.get("updated_at") if isinstance(st, dict) else "") or ""),
-                             "po_number": str(m.get("source_document_reference_id") or "")}
+                             "po_number": str(m.get("source_document_reference_id") or ""),
+                             "created_at": str(m.get("created_at") or ""),
+                             "flavor": str(m.get("trading_partner_flavor") or "")}
+        return out
+
+    def fetch_asn_refs(self, asn_ids) -> list[dict]:
+        """The DSD pickup numbers on these 856s: one row per ASN --
+        {asn_id, po_number, state, created_at, pro, rts, pickup_date} (see
+        app.shipments.asn_shipping_refs). Detail fetches only for the ids asked for,
+        because the 15-minute pass needs a handful, not the 370 on record. An
+        unreadable ASN is reported and skipped, never fatal."""
+        wanted = {str(a) for a in asn_ids}
+        if not wanted:
+            return []
+        rows = []
+        for asn in self._fetch_all_transactions(transaction_type="856"):
+            meta = asn.get("metadata") or asn
+            aid = str(asn.get("id") or meta.get("id") or "")
+            if aid not in wanted:
+                continue
+            st = meta.get("state") or {}
+            rows.append({"asn_id": aid,
+                         "po_number": str(meta.get("source_document_reference_id") or ""),
+                         "state": str(st.get("value") if isinstance(st, dict) else st or ""),
+                         "created_at": str(meta.get("created_at") or "")})
+        out = []
+        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as pool:
+            futures = {pool.submit(self._fetch_transaction_detail, r["asn_id"]): r for r in rows}
+            for future in as_completed(futures):
+                row = futures[future]
+                try:
+                    out.append({**row, **asn_shipping_refs(future.result())})
+                except Exception as exc:
+                    print(f"WARNING: failed to fetch 856 detail for {row['po_number']}: {exc}")
         return out
 
     def fetch_invoices(self, only_ids=None) -> list[dict]:

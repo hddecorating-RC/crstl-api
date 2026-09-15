@@ -84,6 +84,14 @@ def _live(client, refs=REFS, inv=INV, po_map=PO_MAP):
     return out, rec_inv, rec_ev
 
 
+def test_body_carries_the_810_invoice_number_as_reference():
+    """Parity with the warehouse's manual DSD invoices (40864264-1: referenceNumber INV40864264)."""
+    b = build_finale_invoice(INV, PO_MAP["PO1"], INDEX, REFS, ACCT, CONFIG)
+    assert b["body"]["referenceNumber"] == "INV1"
+    b2 = build_finale_invoice({**INV, "invoice_number": None}, PO_MAP["PO1"], INDEX, REFS, ACCT, CONFIG)
+    assert "referenceNumber" not in b2["body"]
+
+
 def test_resolve_refs_dropship_and_dsd_tax_province():
     r = resolve_finale_refs(INV, REFS, CONFIG)
     assert r["channel"] == "dropship" and r["province"] == "ON"

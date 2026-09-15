@@ -41,6 +41,29 @@ let a withdrawn date win. Same Accepted-only rule the report applies to 810s.
 SHIPPED = "Accepted"
 
 
+def asn_shipping_refs(detail: dict) -> dict:
+    """The two numbers a DSD pickup needs, read off one 856: {pro, rts, pickup_date}.
+
+    PRO (the pickup / bill-of-lading number, 3200...) is `bill_of_lading_number`;
+    RTS (the routing number, 6100...) is `carrier_reference_number`, which HD also
+    echoes as carrier_details.routing_description. Both are typed by the warehouse
+    into the ASN from HD's own system -- that manual entry is unavoidable, so the
+    ASN is the ONE place they are keyed and everything else copies from it.
+    A Dropship ASN carries neither (no BOL, courier tracking instead), so `pro`
+    blank means "not a DSD pickup". Reads the first shipment only: a DSD ASN is
+    one truck.
+    """
+    shipments = (((detail.get("file") or {}).get("generic_json_edi") or {})
+                 .get("detail") or {}).get("shipments") or []
+    sh = shipments[0] if shipments and isinstance(shipments[0], dict) else {}
+    carrier = sh.get("carrier_details") if isinstance(sh.get("carrier_details"), dict) else {}
+    return {
+        "pro": str(sh.get("bill_of_lading_number") or "").strip(),
+        "rts": str(sh.get("carrier_reference_number") or carrier.get("routing_description") or "").strip(),
+        "pickup_date": str(sh.get("shipment_date") or "").strip(),
+    }
+
+
 def asn_dates_in(detail: dict) -> list:
     """Every distinct movement date on one 856, sorted.
 

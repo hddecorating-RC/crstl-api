@@ -65,6 +65,15 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
             status          TEXT NOT NULL,
             updated_at      TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS finale_shipments (
+            asn_id          TEXT PRIMARY KEY,
+            po_number       TEXT,
+            shipment_id     TEXT,
+            pro             TEXT,
+            rts             TEXT,
+            status          TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        );
     """)
 
     if row is None:
@@ -357,6 +366,55 @@ def record_finale_invoice(transaction_id: str, po_number: str | None, invoice_id
                     (transaction_id, po_number, invoice_id, invoice_url, invoice_id_user, status, now))
     except Exception as exc:
         print(f"ERROR: finale_invoices write failed for {transaction_id!r}: {exc}")
+
+
+def record_finale_shipment(asn_id: str, po_number: str | None, shipment_id: str | None,
+                           pro: str | None, rts: str | None, status: str) -> None:
+    """Remember what the DSD pass did for this 856: the Finale shipment it wrote the
+    PRO/RTS onto ('prefilled'), or why it stopped for good ('skipped_equal' -- already
+    there; 'skipped_shipped' -- shipped before we got to it). Keyed on the ASN id so a
+    re-run never rewrites the same shipment. Best-effort."""
+    if not asn_id:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with contextlib.closing(_connect()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO finale_shipments (asn_id, po_number, shipment_id, pro, rts, status, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(asn_id) DO UPDATE SET po_number = excluded.po_number, "
+                    "shipment_id = excluded.shipment_id, pro = excluded.pro, rts = excluded.rts, "
+                    "status = excluded.status, updated_at = excluded.updated_at",
+                    (asn_id, po_number, shipment_id, pro, rts, status, now))
+    except Exception as exc:
+        print(f"ERROR: finale_shipments write failed for {asn_id!r}: {exc}")
+
+
+def get_finale_shipments(asn_ids: list[str]) -> dict[str, dict]:
+    """{asn_id: receipt row} for the ASNs the DSD pass has already dealt with."""
+    if not asn_ids:
+        return {}
+    placeholders = ",".join("?" * len(asn_ids))
+    try:
+        with contextlib.closing(_connect()) as conn:
+            rows = conn.execute(
+                f"SELECT asn_id, po_number, shipment_id, pro, rts, status, updated_at "
+                f"FROM finale_shipments WHERE asn_id IN ({placeholders})", asn_ids).fetchall()
+    except Exception as exc:
+        print(f"WARNING: tracking read failed: {exc}")
+        return {}
+    keys = ("asn_id", "po_number", "shipment_id", "pro", "rts", "status", "updated_at")
+    return {r[0]: dict(zip(keys, r)) for r in rows}
+
+
+def get_unprefilled_asn_ids(candidate_ids: list[str]) -> list[str]:
+    """The subset of `candidate_ids` with no finale_shipments receipt yet. Order
+    preserved. Mirrors get_unfinaled_ids."""
+    if not candidate_ids:
+        return []
+    done = set(get_finale_shipments(candidate_ids))
+    return [aid for aid in candidate_ids if aid not in done]
 
 
 def get_finale_invoices(transaction_ids: list[str]) -> dict[str, dict]:

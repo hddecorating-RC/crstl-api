@@ -207,6 +207,21 @@ class FinaleClient:
                     pass
         return qty if seen else None
 
+    def order_shipments(self, order: dict) -> list[dict]:
+        """Every shipment on this order (followed via shipmentUrlList), full records."""
+        return [self._get(u) for u in (order.get("shipmentUrlList") or [])]
+
+    def update_shipment(self, shipment_url: str, fields: dict) -> dict:
+        """POST {shipmentUrl} with a PARTIAL body -- Finale merges the fields given and
+        leaves the rest (status, pack location, items) untouched. Proven 2026-09-15 on
+        TEST_0005-3: trackingCode + publicNotes written on an INPUT and on a PACKED
+        shipment, status unchanged, and both survived the warehouse's manual Ship click.
+        Never send shipDateEstimated: the Ship dialog adopts it as the real ship date."""
+        body = {"shipmentUrl": shipment_url, **fields}
+        resp = self.session.post(self.HOST + shipment_url, json=body, timeout=self.TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+
     def create_invoice(self, body: dict) -> dict:
         """POST /api/invoice/ -- creates a DRAFT (INVOICE_IN_PROCESS) from exactly the
         invoiceItemList given. Returns the created invoice (invoiceId, invoiceUrl,

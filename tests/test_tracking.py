@@ -207,3 +207,13 @@ def test_migrates_old_schema_with_check_constraint(tmp_path, monkeypatch):
     # New event type now writes cleanly
     record_events(["tx-new"], "emailed")
     assert get_latest_events(["tx-new"])["tx-new"]["emailed_at"] is not None
+
+
+def test_finale_shipment_receipts_round_trip_and_unprefilled(db_path):
+    assert tracking.get_unprefilled_asn_ids(["a1", "a2"]) == ["a1", "a2"]
+    tracking.record_finale_shipment("a1", "40864264", "40864264-1", "3200416047", "6100994307", "prefilled")
+    tracking.record_finale_shipment("a1", "40864264", "40864264-1", "3200416047", "6100994307", "skipped_equal")  # upsert
+    rows = tracking.get_finale_shipments(["a1", "a2"])
+    assert set(rows) == {"a1"} and rows["a1"]["status"] == "skipped_equal" and rows["a1"]["pro"] == "3200416047"
+    assert tracking.get_unprefilled_asn_ids(["a1", "a2"]) == ["a2"]
+    assert tracking.get_unprefilled_asn_ids([]) == [] and tracking.get_finale_shipments([]) == {}
