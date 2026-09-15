@@ -576,15 +576,85 @@ def test_live_push_invoices_in_finale_only_when_enabled(monkeypatch):
 
 
 def test_finale_push_safe_honors_cap_and_never_raises(monkeypatch):
-    from app.main import _run_finale_push_safe
+    from app.main import _run_finale_push_safe, _cache
     from app import tracking
     tracking.init_db()
-    monkeypatch.setattr("app.main._finale_config", lambda: {"enabled": True, "max_per_run": 1})
-    with patch("app.main._run_finale_push") as run:
+    monkeypatch.setattr("app.main._finale_config", lambda: {"enabled": True, "max_per_run": 1, "go_live_after": "2026-09-15"})
+    monkeypatch.setattr("app.main.load_refs", lambda: {"automation": {"created_within_days": 365}})
+    inv = [{"transaction_id": "a", "created_at": "2026-09-16T01:00:00Z"}, {"transaction_id": "b", "created_at": "2026-09-16T01:00:00Z"}]
+    with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push") as run:
         _run_finale_push_safe(["a", "b"])                   # over the cap -> refused, nothing run
     run.assert_not_called()
-    with patch("app.main._run_finale_push", side_effect=RuntimeError("boom")):
+    with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push", side_effect=RuntimeError("boom")):
         _run_finale_push_safe(["a"])                        # failure is swallowed, never fails the push
+
+
+def test_finale_push_safe_applies_the_finale_floor_and_window(monkeypatch):
+    """A manual NetSuite push is unlimited by design; the Finale ride-along is not:
+    only ids inside Finale's own floor + rolling window are invoiced, the rest are
+    left to the warehouse. Unknown ids (not in the cache) are out of scope."""
+    from app.main import _run_finale_push_safe, _cache
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setattr("app.main._finale_config", lambda: {"enabled": True, "max_per_run": 75, "go_live_after": "2026-09-15"})
+    monkeypatch.setattr("app.main.load_refs", lambda: {"automation": {"go_live_after": "2026-09-11", "created_within_days": 365}})
+    inv = [{"transaction_id": "old", "created_at": "2026-09-12T01:00:00Z"},     # NetSuite floor ok, Finale floor not
+           {"transaction_id": "new", "created_at": "2026-09-16T01:00:00Z"}]
+    with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push") as run, \
+         patch("app.tracking.record_job_run") as job:
+        _run_finale_push_safe(["old", "new", "ghost"])
+    run.assert_called_once_with(True, ["new"], None)
+    assert any("2 sent to NetSuite left alone" in str(c.args) for c in job.call_args_list)
+    with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push") as run2:
+        _run_finale_push_safe(["old"])
+    run2.assert_not_called()
+
+
+def test_one_finale_run_at_a_time_across_every_entry_point(monkeypatch, client):
+    """The poll, the NetSuite ride-along and the manual endpoints share one lock: a
+    second run is refused (409 / skipped), never interleaved; the poll's own passes
+    re-enter the lock on the same thread."""
+    import threading
+    from app import main as m
+    from app import tracking
+    tracking.init_db()
+    fake = {"mode": "dry", "unresolved": [], "results": [], "summary": {"built": 0, "posted": 0, "draft": 0, "failed": 0}}
+    # hold the lock from another thread, as a running poll would
+    held, release = threading.Event(), threading.Event()
+    def hold():
+        with m._finale_run("poll"):
+            held.set(); release.wait(5)
+    th = threading.Thread(target=hold); th.start(); held.wait(5)
+    try:
+        with patch.dict(m._cache, {"invoices": [], "po_provinces": {}}), patch("app.main.push_finale_invoices", return_value=fake):
+            assert client.post("/api/finale", json={"dry_run": True}).status_code == 409
+            assert client.get("/api/finale-push/latest").json()["running"] is True
+        with patch("app.main.push_nonedi_invoices", return_value=fake), patch("app.finale.FinaleClient.configured", return_value=True), \
+             patch("app.finale.FinaleClient"):
+            assert client.post("/api/finale/nonedi", json={"dry_run": True}).status_code == 409
+        with patch.dict(m._cache, {"invoices": [{"transaction_id": "a", "created_at": "2026-09-16T01:00:00Z"}]}), \
+             patch("app.main._finale_config", return_value={"enabled": True, "go_live_after": "2026-09-15", "max_per_run": 75}), \
+             patch("app.main.load_refs", return_value={"automation": {"created_within_days": 365}}), \
+             patch("app.main.push_finale_invoices", return_value=fake) as push, patch("app.tracking.record_job_run") as job:
+            m._run_finale_push_safe(["a"])                       # ride-along: skipped, not queued, not raised
+        push.assert_not_called()
+        assert any("in progress" in str(c.args) for c in job.call_args_list)
+        with patch("app.main._finale_enabled", return_value=True), patch("app.main._finale_poll_passes") as passes, \
+             patch("app.tracking.record_job_run") as job2:
+            m._run_finale_push_job()                             # a second poll: skipped
+        passes.assert_not_called()
+        assert any(c.args[1] == "skipped" and "in progress" in c.args[2] for c in job2.call_args_list)
+    finally:
+        release.set(); th.join(5)
+    assert client.get("/api/finale-push/latest").json()["running"] is False
+    # released: the poll's passes run nested inside its own hold (re-entrant), and the endpoint works again
+    with patch("app.main._finale_enabled", return_value=True), patch("app.main._finale_edi_pass") as edi, \
+         patch("app.main._run_nonedi_push") as ne, patch("app.main._finale_config", return_value={"enabled": True}):
+        m._run_finale_push_job()
+    edi.assert_called_once(); ne.assert_called_once()
+    with patch.dict(m._cache, {"invoices": [], "po_provinces": {}}), patch("app.main.push_finale_invoices", return_value=fake), \
+         patch("app.tracking.record_job_run"):
+        assert client.post("/api/finale", json={"dry_run": True}).status_code == 200
 
 
 def test_finale_endpoint_live_requires_ids_and_dry_run_previews(client):

@@ -720,6 +720,42 @@ _finale_push_state: dict = {"last_run": None, "mode": None, "summary": None,
                             "results": None, "blocked": None, "error": None, "running": False,
                             "nonedi": None}
 
+# ONE run at a time across EVERY Finale-writing entry point -- the 15-min poll, the
+# NetSuite ride-along, and the three manual endpoints. Each runner takes this lock
+# itself, so no caller can forget it; the poll holds it across its three passes.
+# Re-entrant so a pass inside the poll re-acquires on the same thread. Non-blocking:
+# a second run does not queue up behind the first (it would only redo the same
+# reads), it is refused with FinaleBusy and the poll comes round in 15 minutes.
+# Why: preflight (receipt + order invoices) and the create POST are not atomic, and
+# Finale's collection POST always creates -- two overlapping runs could post two
+# invoices on one order.
+_finale_run_lock = threading.RLock()
+_finale_run_holder: Optional[str] = None
+
+
+class FinaleBusy(RuntimeError):
+    """Another Finale run holds the lock; nothing was done."""
+
+
+@contextlib.contextmanager
+def _finale_run(label: str):
+    global _finale_run_holder
+    if not _finale_run_lock.acquire(blocking=False):
+        raise FinaleBusy(f"another Finale run is in progress ({_finale_run_holder or 'unknown'})")
+    outer = _finale_run_holder is None
+    if outer:
+        _finale_run_holder = label
+        with _finale_push_lock:
+            _finale_push_state["running"] = True
+    try:
+        yield
+    finally:
+        if outer:
+            _finale_run_holder = None
+            with _finale_push_lock:
+                _finale_push_state["running"] = False
+        _finale_run_lock.release()
+
 
 def _finale_config() -> dict:
     return load_refs().get("finale") or {}
@@ -736,7 +772,8 @@ def _run_finale_push(live: bool, ids: Optional[list[str]], limit: Optional[int])
     with _cache_lock:
         invoices = list(_cache["invoices"])
         po_map = dict(_cache["po_provinces"])
-    result = push_finale_invoices(invoices, po_map, live=live, only=ids, limit=limit)
+    with _finale_run("edi"):
+        result = push_finale_invoices(invoices, po_map, live=live, only=ids, limit=limit)
     with _finale_push_lock:
         _finale_push_state.update({
             "last_run": datetime.now(timezone.utc).isoformat(), "mode": result["mode"],
@@ -751,16 +788,48 @@ def _run_finale_push(live: bool, ids: Optional[list[str]], limit: Optional[int])
     return result
 
 
+def _finale_floor() -> Optional[str]:
+    """Finale's OWN positive floor ("orders moving forward"), falling back to the
+    shared automation one. Every automated Finale write is scoped by it."""
+    auto = load_refs().get("automation") or {}
+    return str(_finale_config().get("go_live_after") or auto.get("go_live_after") or "") or None
+
+
+def _finale_scope(ids: list[str]) -> tuple[list[str], list[str], Optional[str]]:
+    """Apply the automation guards to these transaction ids: (in_scope, out_of_scope,
+    blocked_reason). Same floor / rolling window / cap as the 15-min poll, keyed on
+    the cached invoice's created_at -- an id the cache does not know is out of scope."""
+    auto = load_refs().get("automation") or {}
+    wanted = {str(i) for i in ids}
+    with _cache_lock:
+        cands = [i for i in _cache["invoices"] if str(i.get("transaction_id")) in wanted]
+    chosen, blocked = select_for_automation(cands, wanted, created_after=_finale_floor(),
+                                            created_within_days=auto.get("created_within_days"),
+                                            max_per_run=_finale_config().get("max_per_run"))
+    kept = [str(i["transaction_id"]) for i in chosen]
+    return kept, [i for i in ids if str(i) not in set(kept)], blocked
+
+
 def _run_finale_push_safe(sent_ids: list[str]) -> None:
     """Invoice in Finale the invoices a live NetSuite push just sent. Best-effort:
-    never fails the NetSuite push. Honors finale.max_per_run as a blast guard."""
-    cap = _finale_config().get("max_per_run")
-    if cap is not None and len(sent_ids) > cap:
-        tracking.record_job_run("finale_push", "blocked",
-                                f"{len(sent_ids)} to invoice exceeds max_per_run {cap} -- run manually")
+    never fails the NetSuite push. Scoped exactly like the poll -- the Finale floor,
+    the rolling window and max_per_run -- so a manual (unlimited) NetSuite push of an
+    old invoice never reaches into orders the warehouse invoiced by hand."""
+    ids, dropped, blocked = _finale_scope(sent_ids)
+    if blocked:
+        tracking.record_job_run("finale_push", "blocked", f"{blocked} -- run manually")
         return
+    if not ids:
+        tracking.record_job_run("finale_push", "skipped",
+                                f"{len(dropped)} sent to NetSuite, none inside the Finale floor/window")
+        return
+    if dropped:
+        tracking.record_job_run("finale_push", "skipped",
+                                f"{len(dropped)} sent to NetSuite left alone (before the Finale floor/window)")
     try:
-        _run_finale_push(True, sent_ids, None)
+        _run_finale_push(True, ids, None)
+    except FinaleBusy as exc:
+        tracking.record_job_run("finale_push", "skipped", f"{exc} -- the 15-min poll will invoice them")
     except Exception as exc:
         with _finale_push_lock:
             _finale_push_state["error"] = str(exc)
@@ -816,10 +885,8 @@ def _finale_edi_pass() -> None:
         invoices = list(_cache["invoices"])
     candidates = eligible_for_push(invoices)
     todo = tracking.get_unfinaled_ids([str(i["transaction_id"]) for i in candidates])
-    # Finale's OWN floor ("orders moving forward"), falling back to the shared one.
-    floor = str(_finale_config().get("go_live_after") or auto.get("go_live_after") or "") or None
     to_push, blocked = select_for_automation(candidates, todo,
-                                             created_after=floor,
+                                             created_after=_finale_floor(),
                                              created_within_days=auto.get("created_within_days"),
                                              max_per_run=cap)
     if blocked:
@@ -839,6 +906,14 @@ def _run_finale_push_job() -> None:
     and retried next run."""
     if not _finale_enabled():
         tracking.record_job_run("finale_push", "skipped", "disabled"); return
+    try:
+        with _finale_run("poll"):
+            _finale_poll_passes()
+    except FinaleBusy as exc:
+        tracking.record_job_run("finale_push", "skipped", f"{exc} -- next poll in 15 min")
+
+
+def _finale_poll_passes() -> None:
     try:
         _finale_edi_pass()
     except Exception as exc:
@@ -876,7 +951,7 @@ def _run_dsd_prefill(live: bool, ids: Optional[list[str]], limit: Optional[int])
         states = crstl.list_transaction_states(transaction_type="856")
         todo = tracking.get_unprefilled_asn_ids(list(states))
         ids, blocked = select_dsd_asns(states, set(states) - set(todo),
-                                       created_after=str(fin.get("go_live_after") or auto.get("go_live_after") or "") or None,
+                                       created_after=_finale_floor(),
                                        created_within_days=auto.get("created_within_days"),
                                        max_per_run=fin.get("max_per_run"))
     if blocked:
@@ -884,7 +959,8 @@ def _run_dsd_prefill(live: bool, ids: Optional[list[str]], limit: Optional[int])
                   "summary": {"candidates": 0}}
     else:
         asns = crstl.fetch_asn_refs(ids) if ids else []
-        result = push_dsd_prefill(asns, live=live, only=None, limit=limit, client=FinaleClient())
+        with _finale_run("dsd"):
+            result = push_dsd_prefill(asns, live=live, only=None, limit=limit, client=FinaleClient())
     with _finale_push_lock:
         _finale_push_state["dsd"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
     s = result["summary"]
@@ -915,9 +991,10 @@ def _run_nonedi_push(live: bool, ids: Optional[list[str]], limit: Optional[int])
         raise FinaleUnavailable("FINALE_* credentials not set")
     client = FinaleClient()
     fin = _finale_config()
-    result = push_nonedi_invoices(client.list_sale_orders(), _crstl_po_set(), live=live, only=ids, limit=limit,
-                                  client=client, floor=str(fin.get("nonedi_go_live_after") or "") or None,
-                                  max_per_run=fin.get("max_per_run"), auto_reopen=bool(fin.get("auto_reopen")))
+    with _finale_run("nonedi"):
+        result = push_nonedi_invoices(client.list_sale_orders(), _crstl_po_set(), live=live, only=ids, limit=limit,
+                                      client=client, floor=str(fin.get("nonedi_go_live_after") or "") or None,
+                                      max_per_run=fin.get("max_per_run"), auto_reopen=bool(fin.get("auto_reopen")))
     with _finale_push_lock:
         _finale_push_state["nonedi"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
     s = result["summary"]
@@ -1381,20 +1458,15 @@ async def finale_push(body: FinalePushRequest = FinalePushRequest()) -> JSONResp
     if not body.dry_run and not body.ids:
         return JSONResponse(status_code=400, content={
             "message": "A live Finale run must name the invoices to create (ids). Use dry_run for a preview."})
-    with _finale_push_lock:
-        if _finale_push_state.get("running"):
-            return JSONResponse(status_code=409, content={"message": "A Finale run is already in progress"})
-        _finale_push_state["running"] = True
     try:
         result = await asyncio.to_thread(_run_finale_push, not body.dry_run, body.ids, body.limit)
+    except FinaleBusy as exc:
+        return JSONResponse(status_code=409, content={"message": str(exc)})
     except Exception as exc:
         print(f"Finale push failed: {exc}")
         with _finale_push_lock:
             _finale_push_state["error"] = "push failed — see server logs"
         return JSONResponse(status_code=500, content={"message": "Finale push failed — see server logs"})
-    finally:
-        with _finale_push_lock:
-            _finale_push_state["running"] = False
     with _finale_push_lock:
         last_run = _finale_push_state["last_run"]
     return JSONResponse(status_code=400 if result.get("blocked") else 200, content={**result, "last_run": last_run})
@@ -1409,6 +1481,8 @@ async def finale_nonedi_push(body: FinalePushRequest = FinalePushRequest()) -> J
             "message": "A live non-EDI run must name the Finale order ids (ids). Use dry_run for a preview."})
     try:
         result = await asyncio.to_thread(_run_nonedi_push, not body.dry_run, body.ids, body.limit)
+    except FinaleBusy as exc:
+        return JSONResponse(status_code=409, content={"message": str(exc)})
     except Exception as exc:
         print(f"non-EDI Finale push failed: {exc}")
         return JSONResponse(status_code=500, content={"message": "non-EDI Finale push failed — see server logs"})
@@ -1424,6 +1498,8 @@ async def finale_dsd_prefill(body: FinalePushRequest = FinalePushRequest()) -> J
             "message": "A live DSD run must name the ASN ids (ids). Use dry_run for a preview."})
     try:
         result = await asyncio.to_thread(_run_dsd_prefill, not body.dry_run, body.ids, body.limit)
+    except FinaleBusy as exc:
+        return JSONResponse(status_code=409, content={"message": str(exc)})
     except Exception as exc:
         print(f"DSD prefill failed: {exc}")
         return JSONResponse(status_code=500, content={"message": "DSD prefill failed — see server logs"})
