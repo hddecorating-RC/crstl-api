@@ -170,3 +170,16 @@ def test_hollow_completed_nonedi_order_is_a_candidate_and_reopens_when_gate_on()
     out2, _, _ = _run(c2, live=True, orders=[hollow], auto_reopen=True)
     assert out2["results"][0]["status"] == "posted" and out2["results"][0]["reopened"] is True
     assert [x[0] for x in c2.calls] == ["get_order", "reopen", "create", "complete", "complete_order"]
+
+
+def test_lone_unreceipted_draft_is_adopted_not_duplicated():
+    draft = {"invoiceId": "100450", "invoiceUrl": "/hddecorating/api/invoice/100450", "invoiceIdUser": "507872-00-1",
+             "statusId": "INVOICE_IN_PROCESS", "statusIdHistoryList": [{"userLoginUrl": "/hddecorating/api/userlogin/API_KEY_U_BLINDS"}]}
+    c = FakeFinale(invoices=[draft], shipped={P_A: 24.0, P_B: 2.0})
+    out, rec_inv, _ = _run(c, live=True)
+    r = out["results"][0]
+    assert r["status"] == "posted" and r["adopted"] == "507872-00-1" and "create" not in [x[0] for x in c.calls]
+    assert rec_inv.call_args.args[-1] == "posted"
+    theirs = FakeFinale(invoices=[{**draft, "statusIdHistoryList": [{"userLoginUrl": "/x/userlogin/someone"}]}], shipped={P_A: 24.0, P_B: 2.0})
+    out2, rec2, _ = _run(theirs, live=True)
+    assert out2["results"][0]["status"] == "draft" and "complete" not in [x[0] for x in theirs.calls]

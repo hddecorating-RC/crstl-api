@@ -74,7 +74,7 @@ def select_dsd_asns(states: dict[str, dict], done_ids, *, created_after: str | N
     to the shipments it is about to write, not to this pending set."""
     candidates = [{"transaction_id": aid, "created_at": s.get("created_at"), "po_number": s.get("po_number")}
                   for aid, s in states.items()
-                  if s.get("state") == "Accepted" and s.get("flavor", DSD_FLAVOR) == DSD_FLAVOR]
+                  if s.get("state") == "Accepted" and (s.get("flavor") or DSD_FLAVOR) == DSD_FLAVOR]   # blank = unknown: fetch, let the BOL decide
     todo = [c["transaction_id"] for c in candidates if c["transaction_id"] not in set(done_ids or [])]
     chosen, _ = select_for_automation(candidates, todo, created_after=created_after,
                                       created_within_days=created_within_days, max_per_run=None)

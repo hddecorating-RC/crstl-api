@@ -33,6 +33,7 @@ from __future__ import annotations
 from app.netsuite import _load_config, resolve_customer
 from app.netsuite_payload import load_refs
 from app.netsuite_push import _select, eligible_for_push
+from app.finale import API_LOGIN, adoptable_draft, created_by
 
 INVOICE_TYPE = "SALES_INVOICE"
 CANCELLED = "INVOICE_CANCELLED"
@@ -304,11 +305,19 @@ def push_finale_invoices(
                 # still say posted/draft; it just notes the reopen the live run does.
                 row["would_reopen"] = True
         if live_invoices:
-            row["status"] = "skipped_exists"
-            row["error"] = ("order already carries invoice "
-                            + ", ".join(str(i.get("invoiceIdUser") or i.get("invoiceId")) for i in live_invoices))
-            counts["skipped_exists"] += 1
-            return None
+            orphan = adoptable_draft(live_invoices)
+            if orphan is None:
+                row["status"] = "skipped_exists"
+                row["error"] = ("order already carries invoice "
+                                + ", ".join(str(i.get("invoiceIdUser") or i.get("invoiceId")) for i in live_invoices))
+                counts["skipped_exists"] += 1
+                return None
+            # A lone un-posted draft with no receipt: ours from a half-failed run, or
+            # keyed by hand. Adopt it instead of creating a second one -- posted below
+            # when it is ours and the build is clean, else receipted as a draft to review.
+            row["adopt"] = {"invoice_id": orphan.get("invoiceId"), "invoice_url": orphan.get("invoiceUrl"),
+                            "invoice_id_user": orphan.get("invoiceIdUser"), "ours": created_by(orphan) == API_LOGIN}
+            row["adopted"] = orphan.get("invoiceIdUser") or orphan.get("invoiceId")
         mism, verified = qty_check([l for l in body["invoiceItemList"] if l["invoiceItemTypeId"] == "INV_PROD_ITEM"],
                                    client.shipment_qty_for_order(order))
         if not verified:
@@ -352,8 +361,10 @@ def push_finale_invoices(
             if order is None:
                 continue
             clean = row["reconcile_flag"] is None and row["qty_flag"] is None
-            row["would"] = "posted" if clean else "draft"
-            writers.append((row, body, order, clean))
+            adopt = row.get("adopt")
+            postable = clean and (adopt is None or adopt["ours"])   # never post a draft someone else keyed
+            row["would"] = "posted" if postable else "draft"
+            writers.append((row, body, order, postable))
         # The cap counts what is about to be WRITTEN. Checked before the first
         # create so a refusal leaves Finale exactly as it was.
         if max_per_run is not None and len(writers) > max_per_run:
@@ -362,10 +373,14 @@ def push_finale_invoices(
             tid = row["transaction_id"]
             row.pop("would", None)
             try:
-                created = client.create_invoice(body)
-                row["invoice_id"] = created.get("invoiceId")
-                row["invoice_url"] = created.get("invoiceUrl")
-                row["invoice_id_user"] = created.get("invoiceIdUser")
+                adopt = row.pop("adopt", None)
+                if adopt:
+                    row["invoice_id"], row["invoice_url"], row["invoice_id_user"] = adopt["invoice_id"], adopt["invoice_url"], adopt["invoice_id_user"]
+                else:
+                    created = client.create_invoice(body)
+                    row["invoice_id"] = created.get("invoiceId")
+                    row["invoice_url"] = created.get("invoiceUrl")
+                    row["invoice_id_user"] = created.get("invoiceIdUser")
                 if clean:
                     client.complete_invoice(row["invoice_url"])
                     row["status"] = "posted"; posted += 1

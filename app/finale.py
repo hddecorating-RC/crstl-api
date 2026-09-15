@@ -35,6 +35,32 @@ import requests
 # Both mean the goods have left. Filtering to SHIPMENT_SHIPPED alone drops the
 # 122 records that have since been marked delivered.
 MOVED = ("SHIPMENT_SHIPPED", "SHIPMENT_DELIVERED")
+DRAFT = "INVOICE_IN_PROCESS"
+CANCELLED_INVOICE = "INVOICE_CANCELLED"
+# The login Finale stamps on everything our API key writes (statusIdHistoryList).
+# Override only if the key is ever re-issued under another name.
+API_LOGIN = os.environ.get("FINALE_API_LOGIN", "API_KEY_U_BLINDS")
+
+
+def created_by(record: dict) -> str:
+    """The login that created this Finale record: the first statusIdHistoryList entry's
+    userLoginUrl tail ('API_KEY_U_BLINDS' for our key, a person's login by hand)."""
+    hist = record.get("statusIdHistoryList") or []
+    first = hist[0] if hist and isinstance(hist[0], dict) else {}
+    return str(first.get("userLoginUrl") or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def adoptable_draft(invoices: list[dict]) -> dict | None:
+    """The ONE un-posted draft an order carries, if that is all it carries -- an
+    invoice a previous run created and then lost track of (the create landed, the
+    post or the receipt did not), or one keyed by hand. Rather than reporting
+    skipped_exists every 15 minutes forever, the engines adopt it: receipt it as
+    ours, post it when it is ours and clean. Anything else on the order (a posted
+    invoice, several invoices) is skipped_exists as before."""
+    live = [i for i in invoices if i.get("statusId") != CANCELLED_INVOICE]
+    if len(live) == 1 and live[0].get("statusId") == DRAFT:
+        return live[0]
+    return None
 
 ENV_KEYS = ("FINALE_ACCOUNT_ID", "FINALE_API_KEY", "FINALE_API_SECRET")
 
@@ -284,7 +310,10 @@ class FinaleClient:
             raise RuntimeError(f"order {order.get('orderId')} exposes no edit action; cannot reopen")
         resp = self.session.post(self.HOST + edit, json={}, timeout=self.TIMEOUT)
         resp.raise_for_status()
-        reopened = self.get_order(str(order.get("orderId"))) or {}
+        reopened = self.get_order(str(order.get("orderId")))
+        if reopened is None:
+            # Never report an order we just unlocked as a benign retry.
+            raise RuntimeError(f"order {order.get('orderId')} not readable after edit -- left ORDER_CREATED, re-lock by hand")
         if reopened.get("statusId") == "ORDER_CREATED" and reopened.get("actionUrlLock"):
             resp = self.session.post(self.HOST + reopened["actionUrlLock"], json={}, timeout=self.TIMEOUT)
             resp.raise_for_status()

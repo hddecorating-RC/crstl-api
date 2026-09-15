@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 
 from app.netsuite import _load_config
 from app.netsuite_payload import load_refs
+from app.finale import API_LOGIN, adoptable_draft, created_by
 
 EDI_SOURCES = {"HD Dropship", "HD DSD", "CRSTL"}
 OPEN_STATUSES = {"ORDER_CREATED", "ORDER_LOCKED"}
@@ -183,11 +184,18 @@ def push_nonedi_invoices(orders: list[dict], crstl_pos, *, live: bool = False, o
                 row.update(status="skipped_no_order", error=f"no Finale order {oid}"); counts["skipped_no_order"] += 1
                 continue
             live_inv = [i for i in client.order_invoices(order) if i.get("statusId") != CANCELLED]
+            adopt = None
             if live_inv:
-                row.update(status="skipped_exists", error="order already carries invoice "
-                           + ", ".join(str(i.get("invoiceIdUser") or i.get("invoiceId")) for i in live_inv))
-                counts["skipped_exists"] += 1
-                continue
+                orphan = adoptable_draft(live_inv)
+                if orphan is None:
+                    row.update(status="skipped_exists", error="order already carries invoice "
+                               + ", ".join(str(i.get("invoiceIdUser") or i.get("invoiceId")) for i in live_inv))
+                    counts["skipped_exists"] += 1
+                    continue
+                # lone un-posted draft, no receipt: adopt it (see app.finale.adoptable_draft)
+                adopt = {"invoice_id": orphan.get("invoiceId"), "invoice_url": orphan.get("invoiceUrl"),
+                         "invoice_id_user": orphan.get("invoiceIdUser"), "ours": created_by(orphan) == API_LOGIN}
+                row["adopted"] = orphan.get("invoiceIdUser") or orphan.get("invoiceId")
             if order.get("statusId") == "ORDER_COMPLETED":
                 # hollow completion (no invoice): reopen by Ritchie's rule, or report it
                 if not auto_reopen:
@@ -214,8 +222,9 @@ def push_nonedi_invoices(orders: list[dict], crstl_pos, *, live: bool = False, o
                 continue
             row.update({k: v for k, v in b.items() if k not in ("body", "flag")}); row["qty_flag"] = b["flag"]
             clean = row["qty_flag"] is None
-            row["status"] = "built"; row["would"] = "posted" if clean else "draft"
-            writers.append((row, b["body"], order, clean, key, oid))
+            postable = clean and (adopt is None or adopt["ours"])   # never post a draft someone else keyed
+            row["status"] = "built"; row["would"] = "posted" if postable else "draft"
+            writers.append((row, b["body"], order, postable, key, oid, adopt))
         except Exception as exc:   # one bad order must not stop the batch
             row.update(status="failed", error=str(exc)); failed += 1
     # The cap counts invoices about to be created, never the pending set (unshipped
@@ -223,11 +232,14 @@ def push_nonedi_invoices(orders: list[dict], crstl_pos, *, live: bool = False, o
     blocked = None
     if max_per_run is not None and len(writers) > max_per_run:
         blocked = f"{len(writers)} invoices to create exceeds max_per_run {max_per_run} -- nothing written"
-    for row, body, order, clean, key, oid in (writers if (live and not blocked) else []):
+    for row, body, order, clean, key, oid, adopt in (writers if (live and not blocked) else []):
         row.pop("would", None)
         try:
-            made = client.create_invoice(body)
-            row["invoice_id"], row["invoice_url"], row["invoice_id_user"] = made.get("invoiceId"), made.get("invoiceUrl"), made.get("invoiceIdUser")
+            if adopt:
+                row["invoice_id"], row["invoice_url"], row["invoice_id_user"] = adopt["invoice_id"], adopt["invoice_url"], adopt["invoice_id_user"]
+            else:
+                made = client.create_invoice(body)
+                row["invoice_id"], row["invoice_url"], row["invoice_id_user"] = made.get("invoiceId"), made.get("invoiceUrl"), made.get("invoiceIdUser")
             if clean:
                 client.complete_invoice(row["invoice_url"]); row["status"] = "posted"; posted += 1
                 try:

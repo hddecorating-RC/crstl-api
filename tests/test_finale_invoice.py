@@ -373,3 +373,36 @@ def test_cap_counts_invoices_about_to_be_created_not_the_pending_set():
     with patch("app.tracking.get_finale_invoices", return_value={}):
         dry = push_finale_invoices([INV, inv2], po_map, live=False, refs=REFS, client=TwoOrders(both._by_po), max_per_run=1)
     assert dry["blocked"] and dry["mode"] == "dry"                                  # a dry run shows the refusal too
+
+
+def _draft(by="API_KEY_U_BLINDS"):
+    return {"invoiceId": "100450", "invoiceUrl": "/hddecorating/api/invoice/100450", "invoiceIdUser": "PO1-1",
+            "statusId": "INVOICE_IN_PROCESS", "statusIdHistoryList": [{"statusId": None, "userLoginUrl": f"/hddecorating/api/userlogin/{by}"}]}
+
+
+def test_lone_unreceipted_draft_is_adopted_not_duplicated():
+    """A previous run created the draft but lost the post/receipt: instead of
+    skipped_exists forever, adopt it -- post it (ours + clean), receipt it, complete
+    the order. No second invoice is ever created."""
+    shipped = {"/hddecorating/api/product/138VB5236WHTC": 1.0}
+    ours = FakeFinale(invoices=[_draft()], shipped=shipped)
+    out, rec_inv, _ = _live(ours)
+    r = out["results"][0]
+    assert r["status"] == "posted" and r["adopted"] == "PO1-1" and r["invoice_id_user"] == "PO1-1"
+    assert [c[0] for c in ours.calls] == ["get_order", "complete", "complete_order"]        # no create
+    assert rec_inv.call_args.args[-1] == "posted"
+    # keyed by a person: adopt as a draft to review, never post someone else's draft
+    theirs = FakeFinale(invoices=[_draft(by="edward.schiavon")], shipped=shipped)
+    out2, rec2, _ = _live(theirs)
+    assert out2["results"][0]["status"] == "draft" and "complete" not in [c[0] for c in theirs.calls]
+    assert rec2.call_args.args[-1] == "draft"
+    # a posted invoice, or more than one, is still skipped_exists
+    posted = FakeFinale(invoices=[{**_draft(), "statusId": "INVOICE_APPROVED"}], shipped=shipped)
+    assert _live(posted)[0]["results"][0]["status"] == "skipped_exists"
+    two = FakeFinale(invoices=[_draft(), {**_draft(), "invoiceId": "100451"}], shipped=shipped)
+    assert _live(two)[0]["results"][0]["status"] == "skipped_exists"
+    # dry run previews the adoption and writes nothing
+    dry = FakeFinale(invoices=[_draft()], shipped=shipped)
+    with patch("app.tracking.get_finale_invoices", return_value={}):
+        out3 = push_finale_invoices([INV], PO_MAP, live=False, refs=REFS, client=dry)
+    assert out3["results"][0]["would"] == "posted" and out3["results"][0]["adopted"] == "PO1-1" and dry.calls == [("get_order", "PO1")]

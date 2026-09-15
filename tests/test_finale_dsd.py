@@ -91,9 +91,10 @@ def test_select_applies_accepted_floor_receipts_and_cap():
               "b": {"state": "Draft", "created_at": "2026-09-16T01:00:00Z"},
               "c": {"state": "Accepted", "created_at": "2026-09-10T01:00:00Z"},   # before the floor
               "d": {"state": "Accepted", "created_at": "2026-09-16T02:00:00Z"},
-              "e": {"state": "Accepted", "created_at": "2026-09-16T03:00:00Z", "flavor": "Dropship"}}
+              "e": {"state": "Accepted", "created_at": "2026-09-16T03:00:00Z", "flavor": "Dropship"},
+              "f": {"state": "Accepted", "created_at": "2026-09-16T04:00:00Z", "flavor": ""}}
     ids = select_dsd_asns(states, {"d"}, created_after="2026-09-15", created_within_days=None)
-    assert ids == ["a"]                                          # e: Dropship by flavor, never fetched
+    assert ids == ["a", "f"]                                     # e: Dropship by flavor, never fetched; f: blank flavor = unknown, fetched
 
 
 def test_cap_counts_shipments_about_to_be_written_not_pending_asns():

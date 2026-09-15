@@ -500,13 +500,24 @@ def _so_digest_data() -> dict:
     # Excel column and the issues list. Empty when Finale invoicing is off.
     finale = tracking.get_finale_invoices([str(i["transaction_id"]) for i in new_sos])
     fin_cfg = _finale_config()
-    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    # Non-EDI receipts since the last digest that was actually SENT (a digest fires
+    # after each push as well as at 7:15), so a figure is never re-reported as new.
+    since = _last_digest_sent_at() or (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     nonedi = [r for r in tracking.recent_finale_invoices(since) if str(r.get("key", "")).startswith("order:")]
     stale = _stale_pickups(scoped, events, fin_cfg.get("stale_pickup_days")) if _finale_enabled() else []
     return {"cutoff": cutoff, "new_sos": new_sos, "gaps": gaps,
             "row_by_tx": row_by_tx, "eids": eids, "ns_ids": ns_ids, "so_map": so_map,
             "finale": finale, "finale_enabled": _finale_enabled(),
-            "nonedi": nonedi, "stale_pickups": stale}
+            "nonedi": nonedi, "nonedi_since": since,
+            "stale_pickups": stale, "stale_days": fin_cfg.get("stale_pickup_days")}
+
+
+def _last_digest_sent_at() -> str | None:
+    """When the last digest email actually went out (job_runs), or None."""
+    for run in tracking.recent_job_runs(limit=20, job="daily_digest"):
+        if run.get("status") == "ok" and not str(run.get("detail") or "").startswith("nothing to report"):
+            return run.get("ran_at")
+    return None
 
 
 def _so_digest_rows(data: dict) -> list[dict]:
@@ -568,7 +579,7 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
     n_posted = [r for r in nonedi if r.get("status") == "posted"]
     n_draft = [r for r in nonedi if r.get("status") == "draft"]
     if nonedi:
-        line = f"<strong>Finale (non-EDI orders):</strong> {len(n_posted)} invoice(s) posted"
+        line = f"<strong>Finale (non-EDI orders, since {html.escape(str(data.get('nonedi_since') or '')[:16].replace('T', ' '))}Z):</strong> {len(n_posted)} invoice(s) posted"
         if n_draft:
             line += f", <strong>{len(n_draft)} held as draft</strong>"
         h += f"<p>{line} — {html.escape(', '.join(str(r.get('po_number') or '') for r in nonedi[:12]))}.</p>"
@@ -598,7 +609,7 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
                   f"(did not tie to the 810 or shipped qty differs — review in Finale):</p><ul>{dl}</ul>")
         if f_missing:
             ml2 = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))}</li>" for r in f_missing)
-            h += f"<p><strong>{len(f_missing)} SO(s) with no Finale invoice</strong> (create failed or skipped):</p><ul>{ml2}</ul>"
+            h += f"<p><strong>{len(f_missing)} SO(s) with no Finale invoice yet</strong> (usually not shipped in Finale yet — the poll retries; otherwise the create failed):</p><ul>{ml2}</ul>"
         if n_draft:
             nl = "".join(f"<li>{html.escape(str(r.get('po_number') or ''))} — Finale {html.escape(str(r.get('invoice_id_user') or ''))}</li>" for r in n_draft)
             h += f"<p><strong>{len(n_draft)} non-EDI Finale invoice(s) held as draft</strong> (a shipped product the order does not price — review in Finale):</p><ul>{nl}</ul>"
@@ -607,7 +618,7 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
                          f"{html.escape(str(s.get('province') or '—'))} — accepted <strong>{s['days']} days</strong> ago"
                          f"{' — no Finale order' if s.get('order_missing') else ''}</li>" for s in stale)
             h += (f"<p><strong>{len(stale)} pickup(s) not shipped in Finale</strong> "
-                  f"(810 accepted over {data.get('stale_days', 4)} days ago, still no shipment):</p><ul>{sl}</ul>")
+                  f"(810 accepted over {data.get('stale_days')} days ago, still no shipment):</p><ul>{sl}</ul>")
     return h
 
 
@@ -856,8 +867,8 @@ def _refresh_new_accepted() -> int:
             return 0
         fresh = client.fetch_invoices(only_ids=changed)
         missing_pos = sorted({str(i.get("po_number") or "") for i in fresh} - set(po_map) - {""})
-        if missing_pos:
-            po_map.update(client.fetch_po_provinces(only_pos=missing_pos))
+        fetched_pos = client.fetch_po_provinces(only_pos=missing_pos) if missing_pos else {}
+        po_map.update(fetched_pos)
         _attach_provinces(fresh, po_map)
         _annotate_tax_suggestion(fresh)
         by_id = {str(i.get("transaction_id")): i for i in fresh}
@@ -865,7 +876,9 @@ def _refresh_new_accepted() -> int:
             merged = [by_id.pop(str(i.get("transaction_id")), i) for i in _cache["invoices"]]
             merged.extend(by_id.values())
             _cache["invoices"] = merged
-            _cache["po_provinces"] = po_map
+            # Merge, don't replace: the 4:45 full refresh may have landed while this
+            # poll was fetching, and its 850 map must not be overwritten by our copy.
+            _cache["po_provinces"] = {**_cache["po_provinces"], **fetched_pos}
             _cache["last_incremental"] = datetime.now(timezone.utc).isoformat()
         return len(fresh)
     except Exception as exc:
@@ -1011,10 +1024,11 @@ def _stale_pickups(scoped: list[dict], events: dict, days: int) -> list[dict]:
     if days is None or not FinaleClient.configured():
         return []
     now = datetime.now(timezone.utc)
+    receipts = tracking.get_finale_invoices([str(i["transaction_id"]) for i in scoped])
     old = []
     for i in scoped:
         tx = str(i["transaction_id"])
-        if events.get(tx, {}).get("finale_at"):
+        if events.get(tx, {}).get("finale_at") or tx in receipts:
             continue
         try:
             created = datetime.fromisoformat(str(i.get("created_at") or "").replace("Z", "+00:00"))

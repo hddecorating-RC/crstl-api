@@ -766,6 +766,15 @@ def test_refresh_new_accepted_fetches_only_changed_and_merges(monkeypatch):
     assert fake.calls == [("fetch_invoices", ["b", "c"]), ("fetch_po_provinces", ["PO-B", "PO-C"])]
     assert by["b"]["status"] == "Accepted" and "c" in by and by["a"]["status"] == "Accepted"
     assert pos == {"PO-A", "PO-B", "PO-C"} and by["b"]["province"] == "ON"
+    # a PO the 4:45 full refresh added WHILE this poll was fetching survives the merge
+    class Racing(FakeCrstl):
+        def fetch_invoices(self, only_ids=None):
+            _cache["po_provinces"]["PO-NEW"] = {"province": "QC"}
+            return super().fetch_invoices(only_ids)
+    monkeypatch.setattr("app.main._get_client", lambda: Racing())
+    with patch.dict(_cache, {"invoices": list(start), "po_provinces": {"PO-A": {"province": "ON"}}}):
+        _refresh_new_accepted()
+        assert "PO-NEW" in _cache["po_provinces"] and "PO-B" in _cache["po_provinces"]
 
 
 
@@ -840,8 +849,33 @@ def test_digest_lists_stale_pickups_and_nonedi_line(client, monkeypatch):
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         _send_daily_digest()
     body = mail.call_args.kwargs["body_html"]
-    assert "not shipped in Finale" in body and "6 days" in body
-    assert "Finale (non-EDI orders)" in body and "1 invoice(s) posted" in body and "507872-00" in body
+    assert "not shipped in Finale" in body and "6 days" in body and "over 4 days ago" in body
+    assert "Finale (non-EDI orders, since" in body and "1 invoice(s) posted" in body and "507872-00" in body
+    # the configured threshold is what the text says, and a Finale RECEIPT counts as invoiced
+    # even when the batch event write was lost
+    tracking.record_finale_invoice(invs[0]["transaction_id"], invs[0]["po_number"], "1", "/i/1", "x-1", "posted")
+    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail2, \
+         patch("app.main._finale_enabled", return_value=True), \
+         patch("app.main._finale_config", return_value={"enabled": True, "stale_pickup_days": 6, "max_per_run": 75}), \
+         patch("app.finale.FinaleClient") as FC:
+        FC.configured.return_value = True; FC.return_value = FakeFinale()
+        _send_daily_digest()
+    body2 = mail2.call_args.kwargs["body_html"]
+    assert "over 6 days ago" in body2 and "over 4 days ago" not in body2
+    assert str(invs[0]["invoice_number"]) not in body2.split("not shipped in Finale")[-1]   # receipted: not stale
+    assert str(invs[1]["invoice_number"]) in body2.split("not shipped in Finale")[-1]       # un-receipted: still stale
+
+
+def test_digest_nonedi_window_starts_at_the_last_sent_digest(client):
+    from app.main import _last_digest_sent_at
+    from app import tracking
+    tracking.init_db()
+    assert _last_digest_sent_at() is None
+    tracking.record_job_run("daily_digest", "ok", "nothing to report")
+    assert _last_digest_sent_at() is None                       # nothing went out: window does not move
+    tracking.record_job_run("daily_digest", "ok", "sent 3 SO(s) [post-push]")
+    tracking.record_job_run("daily_digest", "error", "smtp down")
+    assert _last_digest_sent_at()                               # the last actual send, errors ignored
 
 
 def test_dsd_prefill_runs_in_the_finale_job_only_when_configured(monkeypatch):
