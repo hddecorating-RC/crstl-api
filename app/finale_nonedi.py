@@ -43,8 +43,13 @@ def receipt_key(order_id) -> str:
 
 
 def is_non_edi(order: dict, crstl_pos) -> bool:
+    """Non-EDI = not a Crstl PO and not an EDI sale source. TEST_* order ids are
+    never candidates -- they are fixtures for exercising Finale/ShipStation, and
+    a posted invoice on one would be noise to clean up."""
     oid = str(order.get("orderId") or "")
-    return bool(oid) and oid not in crstl_pos and str(order.get("saleSourceId") or "") not in EDI_SOURCES
+    if not oid or oid.upper().startswith("TEST"):
+        return False
+    return oid not in crstl_pos and str(order.get("saleSourceId") or "") not in EDI_SOURCES
 
 
 def select_candidates(orders: list[dict], crstl_pos, *, floor: str | None = None,

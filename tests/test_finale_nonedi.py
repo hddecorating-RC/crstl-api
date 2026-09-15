@@ -59,6 +59,7 @@ def test_classification_is_by_exclusion_not_customer():
     assert not is_non_edi({**ORDER, "orderId": "538831979"}, CRSTL_POS)            # a Crstl PO -> EDI
     assert not is_non_edi({**ORDER, "saleSourceId": "HD Dropship"}, CRSTL_POS)     # EDI source tag -> EDI
     assert is_non_edi({**ORDER, "saleSourceId": "HD Supply"}, CRSTL_POS)
+    assert not is_non_edi({**ORDER, "orderId": "TEST_0005"}, CRSTL_POS)          # fixtures are never invoiced
     # completed / cancelled / pre-floor orders are never candidates
     orders = [ORDER, {**ORDER, "orderId": "x", "statusId": "ORDER_COMPLETED"},
               {**ORDER, "orderId": "y", "statusId": "ORDER_CANCELLED"}, {**ORDER, "orderId": "z", "orderDate": "2026-09-01"}]
