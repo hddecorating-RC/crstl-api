@@ -43,6 +43,9 @@ class FakeFinale:
 
 
 def _run(client, live, asns=(ASN,), existing=None, **kw):
+    # Carrier defaults OFF unless a test passes refs: the PRO/RTS tests must not
+    # depend on what config/netsuite_customers.json says today.
+    kw.setdefault("refs", {"finale": {}})
     with patch("app.tracking.get_finale_shipments", return_value=existing or {}), \
          patch("app.tracking.record_finale_shipment") as rec:
         out = push_dsd_prefill(list(asns), live=live, client=client, **kw)
