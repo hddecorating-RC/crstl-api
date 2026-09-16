@@ -587,6 +587,7 @@ def _so_digest_rows(data: dict) -> list[dict]:
             "po_number": i.get("po_number"),
             "customer": r.get("customer_name") or (_netsuite_customer(i) or {}).get("name"),
             "province": i.get("province") or r.get("where"),
+            "channel": r.get("channel") or ("dsd" if i.get("store") else "dropship"),
             "product": i.get("product"),
             "total": r.get("total"),
             "reconcile_flag": r.get("reconcile_flag"),
@@ -606,19 +607,32 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
     SO whose total is off its 810. Nothing about Finale: that is not accounting's
     concern and lives on the Excel's Finale sheet (Ritchie, 2026-09-16)."""
     total = sum((r["total"] or 0) for r in rows)
-    prod: dict[str, list] = {}
+    # Channel x product, with a subtotal per channel (DSD first) and a grand total.
+    label = {"dsd": "DSD", "dropship": "Dropship"}
+    by_ch: dict[str, dict[str, list]] = {}
     for r in rows:
+        ch = label.get(str(r.get("channel") or ""), str(r.get("channel") or "—"))
         d = r["product"] or "—"
-        prod.setdefault(d, [0, 0.0]); prod[d][0] += 1; prod[d][1] += (r["total"] or 0)
+        cell = by_ch.setdefault(ch, {}).setdefault(d, [0, 0.0])
+        cell[0] += 1; cell[1] += (r["total"] or 0)
+    order = sorted(by_ch, key=lambda c: (c != "DSD", c != "Dropship", c))
+    body_rows = ""
+    for ch in order:
+        prods = by_ch[ch]
+        for k, (cnt, val) in sorted(prods.items()):
+            body_rows += (f'<tr><td>{html.escape(ch)}</td><td>{html.escape(k)}</td><td align="right">{cnt}</td>'
+                          f'<td align="right">${val:,.2f}</td></tr>')
+        if len(order) > 1:
+            body_rows += (f'<tr style="background:#f6f8fb;font-weight:bold"><td>{html.escape(ch)} total</td><td></td>'
+                          f'<td align="right">{sum(c for c, _ in prods.values())}</td>'
+                          f'<td align="right">${sum(v for _, v in prods.values()):,.2f}</td></tr>')
     product_table = (
         '<table cellpadding="6" cellspacing="0" border="1" '
         'style="border-collapse:collapse;font-size:13px;margin:6px 0 14px">'
-        '<tr style="background:#1f3a5f;color:#ffffff"><th align="left">Product</th>'
+        '<tr style="background:#1f3a5f;color:#ffffff"><th align="left">Channel</th><th align="left">Product</th>'
         '<th align="right">SOs</th><th align="right">Value (CAD)</th></tr>'
-        + "".join(f'<tr><td>{html.escape(k)}</td><td align="right">{cnt}</td>'
-                  f'<td align="right">${val:,.2f}</td></tr>'
-                  for k, (cnt, val) in sorted(prod.items()))
-        + f'<tr style="background:#eef2f7;font-weight:bold"><td>Total</td>'
+        + body_rows
+        + f'<tr style="background:#eef2f7;font-weight:bold"><td>Total</td><td></td>'
           f'<td align="right">{len(rows)}</td><td align="right">${total:,.2f}</td></tr></table>')
 
     h = f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite.</p>" + product_table

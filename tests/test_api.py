@@ -453,6 +453,7 @@ def test_so_digest_lists_pushed_sos_gaps_and_marks_reported(client, monkeypatch)
     assert result["count"] == 1 and result["gaps"] == 1
     body = mail.call_args.kwargs["body_html"]
     assert "Product" in body and "Drape Panel" in body        # blinds-vs-drapes summary table
+    assert "<td>Dropship</td><td>Drape Panel</td>" in body     # ...by channel (the fixtures are dropship: no store)
     assert '<th align="left">Province</th><th align="right">SOs</th>' not in body   # province summary removed per feedback
     assert "INV-SO-2" in _attention(body) and "No SO in NetSuite" in _attention(body)   # the gap, in the one table
     assert "INV-SO-1" not in body                              # created-SO detail lives in the Excel, not the email
@@ -992,6 +993,25 @@ def test_digest_reads_a_hand_made_invoice_before_the_poll_receipts_it(client, mo
     ws = load_workbook(io.BytesIO(mail.call_args.kwargs["attachments"][0][1]))["Invoices"]
     heads = [c.value for c in ws[1]]
     assert heads[-2:] == ["Finale invoice", "Finale vs 810"]
+
+
+def test_digest_summary_table_splits_dsd_and_dropship(client, monkeypatch):
+    """The summary table is channel x product with a subtotal per channel, DSD first."""
+    from app.main import _cache, _send_daily_digest
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    monkeypatch.setenv("NETSUITE_ACCOUNT_ID", "734463")
+    invs = _so_ready_invoices()
+    invs[0]["store"] = "VAUGHAN"; invs[0]["product"] = "Blind"          # a DSD blind, and a dropship drape
+    tracking.record_events(["so-1", "so-2"], "netsuite")
+    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail:
+        _send_daily_digest()
+    body = mail.call_args.kwargs["body_html"]
+    assert body.index("<td>DSD</td><td>Blind</td>") < body.index("<td>DSD total</td>") \
+        < body.index("<td>Dropship</td><td>Drape Panel</td>") < body.index("<td>Dropship total</td>") < body.index("<td>Total</td>")
+    assert '<td>DSD total</td><td></td><td align="right">1</td><td align="right">$107.14</td>' in body
+    assert '<td>Total</td><td></td><td align="right">2</td><td align="right">$321.41</td>' in body
 
 
 def test_digest_backfills_a_receipt_from_before_the_reconciliation_columns(client, monkeypatch):
