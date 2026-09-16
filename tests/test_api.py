@@ -406,10 +406,10 @@ def test_explicit_id_selection_is_honoured_even_for_a_draft(client):
 
 def _so_ready_invoices():
     """Two Accepted, on/after-cutoff, mappable dropship invoices for the SO digest."""
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
     base = {"status": "Accepted", "due_date": "", "store": None, "province": "ON",
             "product": "Drape Panel", "invoice_date": "2026-09-12",
-            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}   # inside the Finale floor
+            "created_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")}   # inside the Finale floor
     return [
         {**base, "transaction_id": "so-1", "source_document_id": "sd1", "invoice_number": "INV-SO-1",
          "po_number": "PO1", "subtotal": 100.0, "allowance_amount": 5.19, "discount_amount": 0.0,
@@ -688,8 +688,8 @@ def test_so_digest_reports_finale_line_and_holds(client, monkeypatch):
     body = mail.call_args.kwargs["body_html"]
     assert "Finale:" in body and "0 invoice(s) posted" in body and "1 held as draft" in body
     assert "PO-1-1" in body                                   # the draft is named under Issues
-    assert "INV-SO-2" in body.split("not invoiced in Finale")[-1]   # the other SO has no Finale invoice at all
-    assert "2 issue(s)" in mail.call_args.kwargs["subject"]
+    assert "INV-SO-2" in body.split("no SO in NetSuite")[-1].split("held as draft")[0]   # never pushed, no push run yet: a gap
+    assert "2 issue(s)" in mail.call_args.kwargs["subject"]                # the gap + the held draft
 
 
 def test_so_digest_workbook_adds_finale_column(monkeypatch):
@@ -880,6 +880,7 @@ def test_digest_reconciles_finale_rolling_within_the_floor(client, monkeypatch):
     assert "2 SO(s) in NetSuite but not invoiced in Finale" in body and f"orders since {floor}" in body
     assert "not shipped in Finale" in tail and "<strong>6 days ago</strong>" in tail and "over 4 days ago" in body
     assert "INV-SO-0" not in tail and "INV-SO-9" not in tail          # pre-floor / not in NetSuite: not Finale's problem
+    assert "Needs attention" in body and "3 issue(s)" in mail.call_args.kwargs["subject"]   # 2 stale + the NetSuite gap
     assert "Finale (non-EDI orders, since" in body and "1 invoice(s) posted" in body and "507872-00" in body
     # a receipt -- ours or someone's -- takes the SO off the missing list; a delta puts it
     # on the 'does not tie' list, naming who keyed it
@@ -899,6 +900,50 @@ def test_digest_reconciles_finale_rolling_within_the_floor(client, monkeypatch):
     assert "INV-SO-1" not in miss2 and "INV-SO-2" in miss2
     assert "1 Finale invoice(s) do not tie to the 810" in body2
     assert "INV-SO-1 — Finale x-1 by edward.schiavon — Finale $107.19 vs 810 $107.14 (<strong>off by +0.05</strong>)" in body2
+
+
+def test_digest_keeps_the_normal_pipeline_out_of_needs_attention(client, monkeypatch):
+    """An SO not shipped yet (and not stale), and an 810 accepted after the last
+    NetSuite push, are information -- no red section, no issue count in the subject.
+    The same 810 accepted BEFORE the last push is a real gap."""
+    from app.main import _cache, _send_daily_digest
+    from app import tracking
+    from datetime import datetime, timezone, timedelta
+    tracking.init_db()
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    monkeypatch.setenv("NETSUITE_ACCOUNT_ID", "734463")
+    invs = _so_ready_invoices()                       # created_at = now
+    tracking.record_events(["so-1"], "netsuite")       # so-1 in NetSuite, waiting on the warehouse; so-2 not pushed yet
+    tracking.record_job_run("netsuite_push", "ok", "nothing new to push")   # ran BEFORE so-2 was accepted...
+    invs[1]["created_at"] = (datetime.now(timezone.utc) + timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail, \
+         patch("app.main._finale_enabled", return_value=True), \
+         patch("app.main._finale_config", return_value={"enabled": True, "stale_pickup_days": 4, "max_per_run": 75}), \
+         patch("app.main._finale_floor", return_value="2026-09-15"), \
+         patch("app.main.push_finale_invoices", side_effect=_not_shipped), \
+         patch("app.finale.FinaleClient") as FC:
+        FC.configured.return_value = True
+        _send_daily_digest()
+    body = mail.call_args.kwargs["body_html"]; subject = mail.call_args.kwargs["subject"]
+    assert "Needs attention" not in body and "issue(s)" not in subject
+    info = body.split("For information")[-1]
+    assert "1 SO(s) awaiting shipment in Finale" in info and "INV-SO-1" in info
+    assert "1 invoice(s) accepted in CRSTL after the last NetSuite push" in info and "INV-SO-2" in info and " ET)" in info
+    # the push ran AFTER so-2 was accepted and still no SO: that is a gap to act on
+    invs[1]["created_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tracking.record_job_run("netsuite_push", "ok", "1 pushed")
+    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail2, \
+         patch("app.main._finale_enabled", return_value=True), \
+         patch("app.main._finale_config", return_value={"enabled": True, "stale_pickup_days": 4, "max_per_run": 75}), \
+         patch("app.main._finale_floor", return_value="2026-09-15"), \
+         patch("app.main.push_finale_invoices", side_effect=_not_shipped), \
+         patch("app.finale.FinaleClient") as FC:
+        FC.configured.return_value = True
+        _send_daily_digest()
+    body2 = mail2.call_args.kwargs["body_html"]
+    assert "1 issue(s)" in mail2.call_args.kwargs["subject"]
+    assert "INV-SO-2" in body2.split("Needs attention")[-1].split("For information")[0]
+    assert "no SO in NetSuite" in body2 and "before the last push at" in body2
 
 
 def test_digest_reads_a_hand_made_invoice_before_the_poll_receipts_it(client, monkeypatch):

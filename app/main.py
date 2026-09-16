@@ -478,7 +478,17 @@ def _so_digest_data() -> dict:
         return events.get(str(i["transaction_id"]), {}).get(k)
 
     new_sos = [i for i in scoped if ev(i, "netsuite_at") and not ev(i, "so_digest_at")]
-    gaps = [i for i in scoped if not ev(i, "netsuite_at")]
+    # No SO in NetSuite is only a problem once the scheduled push has had its chance:
+    # an 810 accepted AFTER the last push run is simply waiting for tonight's.
+    last_push = _last_netsuite_push_at()
+    push_dt = _parse_iso(last_push)
+    gaps_all = [i for i in scoped if not ev(i, "netsuite_at")]
+
+    def accepted_after_push(i) -> bool:
+        created = _parse_iso(i.get("created_at"))
+        return bool(push_dt and created and created >= push_dt)
+    gaps = [i for i in gaps_all if not accepted_after_push(i)]
+    gaps_waiting = [i for i in gaps_all if accepted_after_push(i)]
     dry = (push_invoices(invoices, live=False,
                          only=[str(i["transaction_id"]) for i in new_sos])["results"]
            if new_sos else [])
@@ -513,10 +523,47 @@ def _so_digest_data() -> dict:
         tx = str(i["transaction_id"])
         if tx not in finale and tx in recon["by_tx"]:
             finale[tx] = recon["by_tx"][tx]
-    return {"cutoff": cutoff, "new_sos": new_sos, "gaps": gaps,
+    return {"cutoff": cutoff, "new_sos": new_sos, "gaps": gaps, "gaps_waiting": gaps_waiting,
+            "last_push": last_push,
             "row_by_tx": row_by_tx, "eids": eids, "ns_ids": ns_ids, "so_map": so_map,
             "finale": finale, "finale_enabled": _finale_enabled(),
             "nonedi": nonedi, "nonedi_since": since, "recon": recon}
+
+
+def _last_netsuite_push_at() -> str | None:
+    """When the scheduled NetSuite push last actually RAN (ok, partial, blocked or
+    error -- anything but skipped/disabled), UTC ISO, or None if it never has."""
+    for run in tracking.recent_job_runs(limit=50, job="netsuite_push"):
+        if run.get("status") != "skipped":
+            return run.get("ran_at")
+    return None
+
+
+def _parse_iso(iso) -> datetime | None:
+    """A UTC ISO timestamp (with or without 'Z' / fraction / offset) as an aware
+    datetime, or None. Source formats differ (CRSTL 'Z', sqlite '+00:00'), so
+    never compare them as strings."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _et(iso: str | None) -> str:
+    """A UTC ISO timestamp as 'YYYY-MM-DD HH:MM ET' for the email."""
+    if not iso:
+        return ""
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo("America/Toronto")).strftime("%Y-%m-%d %H:%M ET")
+    except ValueError:
+        return str(iso)
 
 
 def _last_digest_sent_at() -> str | None:
@@ -599,37 +646,43 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
     gaps = data["gaps"]
     mism = [r for r in rows if r["reconcile_flag"]]
     recon = data.get("recon") or _EMPTY_RECON
-    f_missing, f_delta, f_held = recon["missing"], recon["deltas"], recon["drafts"]
-    if gaps or mism or f_missing or f_delta or f_held or n_draft:
-        h += '<h3 style="color:#b32020;margin-top:16px">Issues</h3>'
+    f_delta, f_held = recon["deltas"], recon["drafts"]
+    f_attn = [r for r in recon["missing"] if r.get("attention")]
+    f_wait = [r for r in recon["missing"] if not r.get("attention")]
+    since = html.escape(str(recon.get("floor") or ""))
+    days = recon.get("stale_days")
+
+    def _inv(r):
+        return html.escape(str(r.get("invoice_number") or ""))
+
+    # ---- Needs attention: something a person has to act on.
+    if gaps or mism or f_attn or f_delta or f_held or n_draft:
+        h += '<h3 style="color:#b32020;margin-top:16px">Needs attention</h3>'
         if gaps:
             gl = "".join(
-                f"<li>{html.escape(str(g.get('invoice_number') or ''))} — "
-                f"{html.escape(str(g.get('province') or '—'))} — "
-                f"{html.escape(str(g.get('product') or '—'))} — "
-                f"${(g.get('total_amount') or 0):,.2f}</li>" for g in gaps[:100])
+                f"<li>{_inv(g)} — {html.escape(str(g.get('province') or '—'))} — "
+                f"{html.escape(str(g.get('product') or '—'))} — ${(g.get('total_amount') or 0):,.2f}</li>" for g in gaps[:100])
             h += (f"<p><strong>{len(gaps)} invoiced in CRSTL but no SO in NetSuite</strong> "
-                  f"(accepted, on/after {html.escape(data['cutoff'])}):</p><ul>{gl}</ul>")
+                  f"(accepted on/after {html.escape(data['cutoff'])}, before the last push"
+                  + (f" at {html.escape(_et(data.get('last_push')))}" if data.get("last_push") else "")
+                  + f"):</p><ul>{gl}</ul>")
         if mism:
-            ml = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))}: "
-                         f"{html.escape(str(r['reconcile_flag']))}</li>" for r in mism)
+            ml = "".join(f"<li>{_inv(r)}: {html.escape(str(r['reconcile_flag']))}</li>" for r in mism)
             h += f"<p><strong>{len(mism)} SO(s) do not tie to the 810:</strong></p><ul>{ml}</ul>"
-        since = html.escape(str(recon.get("floor") or ""))
-        if f_missing:
-            days = recon.get("stale_days")
-            ml2 = "".join(
-                f"<li>{html.escape(str(r.get('invoice_number') or ''))} — PO {html.escape(str(r.get('po_number') or ''))} — "
+        if f_attn:
+            al = "".join(
+                f"<li>{_inv(r)} — PO {html.escape(str(r.get('po_number') or ''))} — "
                 f"{html.escape(str(r.get('province') or '—'))} — {html.escape(str(r.get('reason') or ''))}"
-                + (f" — accepted <strong>{r['days']} days ago</strong>" if r.get("stale") else
-                   (f" — accepted {r['days']} day(s) ago" if r.get("days") is not None else ""))
-                + "</li>" for r in f_missing[:100])
-            h += (f"<p><strong>{len(f_missing)} SO(s) in NetSuite but not invoiced in Finale</strong> "
-                  f"(orders since {since}; rechecked every 15 min"
-                  + (f"; <strong>bold</strong> = 810 accepted over {days} days ago, still no shipment" if days else "")
-                  + f"):</p><ul>{ml2}</ul>")
+                + (f" — accepted <strong>{r['days']} days ago</strong>" if r.get("stale") else "")
+                + "</li>" for r in f_attn[:100])
+            h += (f"<p><strong>{len(f_attn)} SO(s) in NetSuite but not invoiced in Finale</strong> "
+                  f"(orders since {since}"
+                  + (f"; 810 accepted over {days} days ago with no shipment, or the invoice could not be created" if days
+                     else "; the invoice could not be created")
+                  + f"):</p><ul>{al}</ul>")
         if f_delta:
             dl = "".join(
-                f"<li>{html.escape(str(r.get('invoice_number') or ''))} — Finale {html.escape(str(r.get('finale_id') or ''))}"
+                f"<li>{_inv(r)} — Finale {html.escape(str(r.get('finale_id') or ''))}"
                 f"{(' by ' + html.escape(str(r['created_by']))) if r.get('created_by') else ''} — "
                 f"Finale ${(r.get('finale_total') or 0):,.2f} vs 810 ${(r.get('hd_total') or 0):,.2f} "
                 f"(<strong>off by {r['delta']:+.2f}</strong>)</li>" for r in f_delta[:100])
@@ -637,13 +690,26 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
                   f"(orders since {since}):</p><ul>{dl}</ul>")
         if f_held:
             hl = "".join(
-                f"<li>{html.escape(str(r.get('invoice_number') or ''))} — Finale {html.escape(str(r.get('finale_id') or ''))}"
+                f"<li>{_inv(r)} — Finale {html.escape(str(r.get('finale_id') or ''))}"
                 f"{(' by ' + html.escape(str(r['created_by']))) if r.get('created_by') else ''}</li>" for r in f_held[:100])
             h += (f"<p><strong>{len(f_held)} Finale invoice(s) held as draft</strong> "
                   f"(did not tie to the 810 or shipped qty differs — review in Finale; orders since {since}):</p><ul>{hl}</ul>")
         if n_draft:
             nl = "".join(f"<li>{html.escape(str(r.get('po_number') or ''))} — Finale {html.escape(str(r.get('invoice_id_user') or ''))}</li>" for r in n_draft)
             h += f"<p><strong>{len(n_draft)} non-EDI Finale invoice(s) held as draft</strong> (a shipped product the order does not price — review in Finale):</p><ul>{nl}</ul>"
+
+    # ---- For information: waiting on the normal pipeline, nothing to do yet.
+    waiting = data.get("gaps_waiting") or []
+    if waiting or f_wait:
+        h += '<h3 style="color:#555;margin-top:16px">For information</h3>'
+        if waiting:
+            h += (f"<p>{len(waiting)} invoice(s) accepted in CRSTL after the last NetSuite push"
+                  f"{(' (' + html.escape(_et(data.get('last_push'))) + ')') if data.get('last_push') else ''}"
+                  f" — pushed tonight: {html.escape(', '.join(str(g.get('invoice_number') or '') for g in waiting[:30]))}.</p>")
+        if f_wait:
+            h += (f"<p>{len(f_wait)} SO(s) awaiting shipment in Finale (invoiced automatically once shipped; "
+                  f"flagged if still unshipped after {days} days): "
+                  f"{html.escape(', '.join(str(r.get('invoice_number') or '') for r in f_wait[:30]))}.</p>")
     return h
 
 
@@ -732,7 +798,8 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
     n = len(rows)
     subject = f"HD Sales Orders for invoicing — {today} — {n} SO(s)"
     recon = data.get("recon") or _EMPTY_RECON
-    n_issues = len(data["gaps"]) + len(recon["missing"]) + len(recon["deltas"]) + len(recon["drafts"])
+    n_issues = (len(data["gaps"]) + sum(1 for r in recon["missing"] if r.get("attention"))
+                + len(recon["deltas"]) + len(recon["drafts"]))
     if n_issues:
         subject += f" · {n_issues} issue(s)"
     body_html = _so_digest_html(data, rows)
@@ -1131,10 +1198,16 @@ def _finale_reconciliation(invoices: list[dict], stale_days) -> dict:
             except ValueError:
                 days = None
             r = reasons.get(tx)
+            st = (r or {}).get("status")
+            stale = bool(stale_days is not None and days is not None and days >= stale_days
+                         and st in (None, "skipped_not_shipped"))
+            # Waiting on the warehouse (not shipped yet, or shipped and about to be
+            # invoiced) is the pipeline's normal state -- information, not an issue --
+            # until it has waited too long. A real failure needs attention now.
+            waiting = st in ("skipped_not_shipped", "built") or (r is None and err is None)
             out["missing"].append({"invoice_number": i.get("invoice_number"), "po_number": i.get("po_number"),
-                                   "province": i.get("province"), "days": days,
-                                   "stale": bool(stale_days is not None and days is not None and days >= stale_days
-                                                 and (r or {}).get("status") in (None, "skipped_not_shipped")),
+                                   "province": i.get("province"), "days": days, "stale": stale,
+                                   "attention": bool(stale or not waiting),
                                    "reason": _missing_reason(r, err)})
             continue
         out["by_tx"][tx] = rec
