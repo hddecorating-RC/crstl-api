@@ -600,11 +600,11 @@ def _so_digest_rows(data: dict) -> list[dict]:
 
 
 def _so_digest_html(data: dict, rows: list[dict]) -> str:
-    """The accounting email: a short headline + a Blinds-vs-Drapes summary table
-    (the one cut not in the Excel). The full per-SO detail -- each row linking to
-    its SO -- lives in the attached Excel. An Issues section renders ONLY when there
-    is something to flag (invoiced-but-no-SO, or an SO that doesn't tie to its 810),
-    and lists the specifics."""
+    """The accounting email: a headline, the Blinds-vs-Drapes summary table, and --
+    only when there is something accounting must act on -- ONE 'Needs attention'
+    table: an 810 with no SO in NetSuite after the push has had its chance, or an
+    SO whose total is off its 810. Nothing about Finale: that is not accounting's
+    concern and lives on the Excel's Finale sheet (Ritchie, 2026-09-16)."""
     total = sum((r["total"] or 0) for r in rows)
     prod: dict[str, list] = {}
     for r in rows:
@@ -621,109 +621,50 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
         + f'<tr style="background:#eef2f7;font-weight:bold"><td>Total</td>'
           f'<td align="right">{len(rows)}</td><td align="right">${total:,.2f}</td></tr></table>')
 
-    h = f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite.</p>"
-    # Finale: ONE line, only when the feature is on or something was invoiced.
-    f_posted = [r for r in rows if r.get("finale_status") == "posted"]
-    f_draft = [r for r in rows if r.get("finale_status") == "draft"]
-    f_hand = [r for r in rows if r.get("finale_status") == "external"]
-    if data.get("finale_enabled") or f_posted or f_draft or f_hand:
-        line = f"<strong>Finale:</strong> {len(f_posted)} invoice(s) posted"
-        if f_draft:
-            line += f", <strong>{len(f_draft)} held as draft</strong>"
-        if f_hand:
-            line += f", {len(f_hand)} already invoiced by hand"
-        h += f"<p>{line}.</p>"
-    nonedi = data.get("nonedi") or []
-    n_posted = [r for r in nonedi if r.get("status") == "posted"]
-    n_draft = [r for r in nonedi if r.get("status") == "draft"]
-    if nonedi:
-        line = f"<strong>Finale (non-EDI orders, since {html.escape(str(data.get('nonedi_since') or '')[:16].replace('T', ' '))}Z):</strong> {len(n_posted)} invoice(s) posted"
-        if n_draft:
-            line += f", <strong>{len(n_draft)} held as draft</strong>"
-        h += f"<p>{line} — {html.escape(', '.join(str(r.get('po_number') or '') for r in nonedi[:12]))}.</p>"
-    h += product_table
+    h = f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite.</p>" + product_table
 
-    gaps = data["gaps"]
-    mism = [r for r in rows if r["reconcile_flag"]]
-    recon = data.get("recon") or _EMPTY_RECON
-    f_delta, f_held = recon["deltas"], recon["drafts"]
-    f_attn = [r for r in recon["missing"] if r.get("attention")]
-    f_wait = [r for r in recon["missing"] if not r.get("attention")]
-    since = html.escape(str(recon.get("floor") or ""))
-    days = recon.get("stale_days")
-
-    def _inv(r):
-        return html.escape(str(r.get("invoice_number") or ""))
-
-    # ---- Needs attention: something a person has to act on.
-    if gaps or mism or f_attn or f_delta or f_held or n_draft:
-        h += '<h3 style="color:#b32020;margin-top:16px">Needs attention</h3>'
-        if gaps:
-            gl = "".join(
-                f"<li>{_inv(g)} — {html.escape(str(g.get('province') or '—'))} — "
-                f"{html.escape(str(g.get('product') or '—'))} — ${(g.get('total_amount') or 0):,.2f}</li>" for g in gaps[:100])
-            h += (f"<p><strong>{len(gaps)} invoiced in CRSTL but no SO in NetSuite</strong> "
-                  f"(accepted on/after {html.escape(data['cutoff'])}, before the last push"
-                  + (f" at {html.escape(_et(data.get('last_push')))}" if data.get("last_push") else "")
-                  + f"):</p><ul>{gl}</ul>")
-        if mism:
-            ml = "".join(f"<li>{_inv(r)}: {html.escape(str(r['reconcile_flag']))}</li>" for r in mism)
-            h += f"<p><strong>{len(mism)} SO(s) do not tie to the 810:</strong></p><ul>{ml}</ul>"
-        if f_attn:
-            al = "".join(
-                f"<li>{_inv(r)} — PO {html.escape(str(r.get('po_number') or ''))} — "
-                f"{html.escape(str(r.get('province') or '—'))} — {html.escape(str(r.get('reason') or ''))}"
-                + (f" — accepted <strong>{r['days']} days ago</strong>" if r.get("stale") else "")
-                + "</li>" for r in f_attn[:100])
-            h += (f"<p><strong>{len(f_attn)} SO(s) in NetSuite but not invoiced in Finale</strong> "
-                  f"(orders since {since}"
-                  + (f"; 810 accepted over {days} days ago with no shipment, or the invoice could not be created" if days
-                     else "; the invoice could not be created")
-                  + f"):</p><ul>{al}</ul>")
-        if f_delta:
-            dl = "".join(
-                f"<li>{_inv(r)} — Finale {html.escape(str(r.get('finale_id') or ''))}"
-                f"{(' by ' + html.escape(str(r['created_by']))) if r.get('created_by') else ''} — "
-                f"Finale ${(r.get('finale_total') or 0):,.2f} vs 810 ${(r.get('hd_total') or 0):,.2f} "
-                f"(<strong>off by {r['delta']:+.2f}</strong>)</li>" for r in f_delta[:100])
-            h += (f"<p><strong>{len(f_delta)} Finale invoice(s) do not tie to the 810</strong> "
-                  f"(orders since {since}):</p><ul>{dl}</ul>")
-        if f_held:
-            hl = "".join(
-                f"<li>{_inv(r)} — Finale {html.escape(str(r.get('finale_id') or ''))}"
-                f"{(' by ' + html.escape(str(r['created_by']))) if r.get('created_by') else ''}</li>" for r in f_held[:100])
-            h += (f"<p><strong>{len(f_held)} Finale invoice(s) held as draft</strong> "
-                  f"(did not tie to the 810 or shipped qty differs — review in Finale; orders since {since}):</p><ul>{hl}</ul>")
-        if n_draft:
-            nl = "".join(f"<li>{html.escape(str(r.get('po_number') or ''))} — Finale {html.escape(str(r.get('invoice_id_user') or ''))}</li>" for r in n_draft)
-            h += f"<p><strong>{len(n_draft)} non-EDI Finale invoice(s) held as draft</strong> (a shipped product the order does not price — review in Finale):</p><ul>{nl}</ul>"
-
-    # ---- For information: waiting on the normal pipeline, nothing to do yet.
-    waiting = data.get("gaps_waiting") or []
-    if waiting or f_wait:
-        h += '<h3 style="color:#555;margin-top:16px">For information</h3>'
-        if waiting:
-            h += (f"<p>{len(waiting)} invoice(s) accepted in CRSTL after the last NetSuite push"
-                  f"{(' (' + html.escape(_et(data.get('last_push'))) + ')') if data.get('last_push') else ''}"
-                  f" — pushed tonight: {html.escape(', '.join(str(g.get('invoice_number') or '') for g in waiting[:30]))}.</p>")
-        if f_wait:
-            h += (f"<p>{len(f_wait)} SO(s) awaiting shipment in Finale (invoiced automatically once shipped; "
-                  f"flagged if still unshipped after {days} days): "
-                  f"{html.escape(', '.join(str(r.get('invoice_number') or '') for r in f_wait[:30]))}.</p>")
+    issues = []
+    for g in data["gaps"]:
+        issues.append((g.get("invoice_number"), g.get("po_number"), g.get("province"), g.get("product"),
+                       g.get("total_amount"), "No SO in NetSuite"))
+    for r in rows:
+        if r["reconcile_flag"]:
+            issues.append((r["invoice_number"], r.get("po_number"), r.get("province"), r.get("product"),
+                           r["total"], f"SO {r['reconcile_flag']}"))
+    if issues:
+        cell = lambda v, align="left": f'<td align="{align}">{html.escape(str(v if v not in (None, "") else "—"))}</td>'
+        body_rows = "".join(
+            "<tr>" + cell(inv) + cell(po) + cell(prov) + cell(prd)
+            + f'<td align="right">${(amt or 0):,.2f}</td>' + cell(why) + "</tr>"
+            for inv, po, prov, prd, amt, why in issues[:200])
+        h += ('<h3 style="color:#b32020;margin-top:16px">Needs attention</h3>'
+              '<table cellpadding="6" cellspacing="0" border="1" '
+              'style="border-collapse:collapse;font-size:13px;margin:6px 0 14px">'
+              '<tr style="background:#b32020;color:#ffffff"><th align="left">Invoice</th><th align="left">PO</th>'
+              '<th align="left">Province</th><th align="left">Product</th><th align="right">Total</th>'
+              '<th align="left">Problem</th></tr>' + body_rows + "</table>")
     return h
 
 
-def _so_digest_workbook(new_sos: list[dict], so_map: dict, finale_map: dict | None = None) -> bytes:
+def _so_digest_workbook(new_sos: list[dict], so_map: dict, finale_map: dict | None = None,
+                        finale_rows: list[dict] | None = None, nonedi: list[dict] | None = None) -> bytes:
     """The accounting Excel: the SAME export workbook (built from the 810s, so the
     figures match the Export button exactly) PLUS a 'Netsuite SO created' column whose
-    cell links straight to each SO. so_map is {invoice_number: (created_date, so_url)}."""
+    cell links straight to each SO. so_map is {invoice_number: (created_date, so_url)}.
+    finale_rows (the rolling Finale reconciliation) and nonedi (recent non-EDI Finale
+    receipts) go on a second 'Finale' sheet -- for Ritchie and the other departments,
+    never in the email body."""
     import io
     import re
-    from openpyxl import load_workbook
+    from openpyxl import Workbook, load_workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
-    wb = load_workbook(io.BytesIO(_workbook_for(new_sos)))
+    if new_sos:
+        wb = load_workbook(io.BytesIO(_workbook_for(new_sos)))
+    else:
+        wb = Workbook(); wb.active.title = "Invoices"; wb.active.append(["Invoice"])
+        wb.active.auto_filter.ref = "A1:A1"
     ws = wb["Invoices"]
     col = ws.max_column + 1
     hdr = ws.cell(row=1, column=col, value="Netsuite SO created")
@@ -773,6 +714,25 @@ def _so_digest_workbook(new_sos: list[dict], so_map: dict, finale_map: dict | No
     m = re.match(r"A1:([A-Z]+)(\d+)", ws.auto_filter.ref or "")
     if m:  # extend the filter to cover the new column(s)
         ws.auto_filter.ref = f"A1:{get_column_letter(col)}{m.group(2)}"
+    if finale_rows is not None:
+        fs = wb.create_sheet("Finale")
+        heads = ["Invoice", "PO", "Finale invoice", "Created by", "Status", "Finale total", "810 total", "Finale vs 810", "Note"]
+        fs.append(heads)
+        for c in range(1, len(heads) + 1):
+            hc = fs.cell(row=1, column=c)
+            hc.fill = PatternFill("solid", fgColor="1F3864"); hc.font = Font(bold=True, color="FFFFFF", size=10)
+            hc.alignment = Alignment(horizontal="center", vertical="center")
+        for r in finale_rows:
+            d = r.get("delta")
+            fs.append([r.get("invoice_number"), r.get("po_number"), r.get("finale_id") or "—", r.get("created_by") or "—",
+                       r.get("status") or "—", r.get("finale_total"), r.get("hd_total"),
+                       ("—" if d is None else ("tied" if abs(d) <= 0.01 else f"{d:+.2f}")), r.get("note") or ""])
+        for r in nonedi or []:
+            fs.append(["(non-EDI)", r.get("po_number"), r.get("invoice_id_user") or r.get("invoice_id"), r.get("created_by") or "—",
+                       r.get("status") or "—", r.get("finale_total"), None, "—", "non-EDI order, no 810"])
+        for c, w in zip("ABCDEFGHI", (16, 14, 18, 20, 10, 13, 13, 14, 60)):
+            fs.column_dimensions[c].width = w
+        fs.auto_filter.ref = f"A1:I{max(fs.max_row, 1)}"
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -798,21 +758,23 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
     n = len(rows)
     subject = f"HD Sales Orders for invoicing — {today} — {n} SO(s)"
     recon = data.get("recon") or _EMPTY_RECON
-    n_issues = (len(data["gaps"]) + sum(1 for r in recon["missing"] if r.get("attention"))
-                + len(recon["deltas"]) + len(recon["drafts"]))
+    n_issues = len(data["gaps"]) + sum(1 for r in rows if r.get("reconcile_flag"))
     if n_issues:
         subject += f" · {n_issues} issue(s)"
     body_html = _so_digest_html(data, rows)
 
     attachments = None
-    if data["new_sos"]:
+    finale_rows = recon.get("rows") if data.get("finale_enabled") else None
+    if data["new_sos"] or finale_rows or data.get("nonedi"):
         finale_by_inv = {str(i.get("invoice_number")): (f.get("invoice_id_user") or f.get("invoice_id") or "", f.get("status") or "",
                                                         f.get("created_by"), f.get("delta"))
                          for i in data["new_sos"]
                          for f in [data["finale"].get(str(i["transaction_id"]))] if f}
         attachments = [(f"hd_sales_orders_{today}.xlsx",
                         _so_digest_workbook(data["new_sos"], data["so_map"],
-                                            finale_by_inv if (data.get("finale_enabled") or finale_by_inv) else None),
+                                            finale_by_inv if (data.get("finale_enabled") or finale_by_inv) else None,
+                                            finale_rows=(finale_rows if (finale_rows is not None or data.get("nonedi")) else None),
+                                            nonedi=data.get("nonedi")),
                         XLSX_MEDIA_TYPE)]
 
     # Send FIRST; only mark reported once the mail is away, so a send failure leaves
@@ -1130,7 +1092,7 @@ def _run_nonedi_push(live: bool, ids: Optional[list[str]], limit: Optional[int])
     return result
 
 
-_EMPTY_RECON: dict = {"floor": None, "stale_days": None, "missing": [], "deltas": [], "drafts": [], "by_tx": {}}
+_EMPTY_RECON: dict = {"floor": None, "stale_days": None, "missing": [], "deltas": [], "drafts": [], "by_tx": {}, "rows": []}
 
 
 def _finale_reconciliation(invoices: list[dict], stale_days) -> dict:
@@ -1171,7 +1133,7 @@ def _finale_reconciliation(invoices: list[dict], stale_days) -> dict:
                 tracking.record_finale_invoice(tx, rec.get("po_number"), rec.get("invoice_id"), rec.get("invoice_url"),
                                                rec.get("invoice_id_user"), "posted", created_by=approved_by(live) or rec.get("created_by"),
                                                finale_total=rec.get("finale_total"), delta=rec.get("delta"))
-                receipts[tx] = {**rec, "status": "posted"}
+                receipts[tx] = {**rec, "status": "posted", "created_by": approved_by(live) or rec.get("created_by")}
     missing_ids = [tx for tx in ids if tx not in receipts]
     reasons: dict[str, dict] = {}
     err = None if configured else "Finale not configured"
@@ -1184,7 +1146,7 @@ def _finale_reconciliation(invoices: list[dict], stale_days) -> dict:
         except Exception as exc:  # noqa: BLE001 -- the digest still goes out
             err = f"Finale check failed: {str(exc)[:120]}"
     now = datetime.now(timezone.utc)
-    out = {"floor": floor, "stale_days": stale_days, "missing": [], "deltas": [], "drafts": [], "by_tx": {}}
+    out = {"floor": floor, "stale_days": stale_days, "missing": [], "deltas": [], "drafts": [], "by_tx": {}, "rows": []}
     for i in scoped:
         tx = str(i["transaction_id"])
         rec = receipts.get(tx)
@@ -1205,10 +1167,13 @@ def _finale_reconciliation(invoices: list[dict], stale_days) -> dict:
             # invoiced) is the pipeline's normal state -- information, not an issue --
             # until it has waited too long. A real failure needs attention now.
             waiting = st in ("skipped_not_shipped", "built") or (r is None and err is None)
+            reason = _missing_reason(r, err)
             out["missing"].append({"invoice_number": i.get("invoice_number"), "po_number": i.get("po_number"),
                                    "province": i.get("province"), "days": days, "stale": stale,
-                                   "attention": bool(stale or not waiting),
-                                   "reason": _missing_reason(r, err)})
+                                   "attention": bool(stale or not waiting), "reason": reason})
+            out["rows"].append({"invoice_number": i.get("invoice_number"), "po_number": i.get("po_number"),
+                                "status": "missing", "hd_total": i.get("total_amount"),
+                                "note": reason + (f" — accepted {days} days ago" if days is not None else "")})
             continue
         out["by_tx"][tx] = rec
         base = {"invoice_number": i.get("invoice_number"), "po_number": i.get("po_number"),
@@ -1219,6 +1184,11 @@ def _finale_reconciliation(invoices: list[dict], stale_days) -> dict:
         if d is not None and abs(d) > 0.01:
             out["deltas"].append({**base, "delta": d, "finale_total": rec.get("finale_total"),
                                   "hd_total": i.get("total_amount")})
+        status = {"external": "by hand", "posted": "posted", "draft": "draft"}.get(str(rec.get("status")), str(rec.get("status")))
+        note = {"draft": "held as draft: did not tie to the 810 or shipped qty differs — review in Finale",
+                "external": "keyed by hand, not by the app"}.get(str(rec.get("status")), "")
+        out["rows"].append({**base, "status": status, "delta": d, "finale_total": rec.get("finale_total"),
+                            "hd_total": i.get("total_amount"), "note": note})
     return out
 
 

@@ -404,6 +404,21 @@ def test_explicit_id_selection_is_honoured_even_for_a_draft(client):
     assert _invoice_numbers(content) == ["INV-tx-dr1"]
 
 
+def _finale_sheet(mail):
+    """Rows of the attached Excel's 'Finale' sheet (header first), or None."""
+    att = mail.call_args.kwargs.get("attachments")
+    if not att:
+        return None
+    wb = load_workbook(io.BytesIO(att[0][1]))
+    if "Finale" not in wb.sheetnames:
+        return None
+    return [[c.value for c in r] for r in wb["Finale"].iter_rows()]
+
+
+def _attention(body):
+    return body.split("Needs attention")[-1] if "Needs attention" in body else ""
+
+
 def _so_ready_invoices():
     """Two Accepted, on/after-cutoff, mappable dropship invoices for the SO digest."""
     from datetime import datetime, timezone, timedelta
@@ -438,8 +453,8 @@ def test_so_digest_lists_pushed_sos_gaps_and_marks_reported(client, monkeypatch)
     assert result["count"] == 1 and result["gaps"] == 1
     body = mail.call_args.kwargs["body_html"]
     assert "Product" in body and "Drape Panel" in body        # blinds-vs-drapes summary table
-    assert "Province" not in body                             # province table removed per feedback
-    assert "INV-SO-2" in body                                  # the gap called out in issues
+    assert '<th align="left">Province</th><th align="right">SOs</th>' not in body   # province summary removed per feedback
+    assert "INV-SO-2" in _attention(body) and "No SO in NetSuite" in _attention(body)   # the gap, in the one table
     assert "INV-SO-1" not in body                              # created-SO detail lives in the Excel, not the email
     # reported SO is marked so it won't repeat in the next digest
     assert tracking.get_latest_events(["so-1"])["so-1"]["so_digest_at"] is not None
@@ -686,10 +701,13 @@ def test_so_digest_reports_finale_line_and_holds(client, monkeypatch):
          patch("app.main._finale_enabled", return_value=True):
         _send_daily_digest()
     body = mail.call_args.kwargs["body_html"]
-    assert "Finale:" in body and "0 invoice(s) posted" in body and "1 held as draft" in body
-    assert "PO-1-1" in body                                   # the draft is named under Issues
-    assert "INV-SO-2" in body.split("no SO in NetSuite")[-1].split("held as draft")[0]   # never pushed, no push run yet: a gap
-    assert "2 issue(s)" in mail.call_args.kwargs["subject"]                # the gap + the held draft
+    assert "Finale" not in body                                # nothing Finale in accounting's email
+    assert "INV-SO-2" in _attention(body) and "1 issue(s)" in mail.call_args.kwargs["subject"]   # the NetSuite gap only
+    sheet = _finale_sheet(mail)
+    assert sheet[0][:5] == ["Invoice", "PO", "Finale invoice", "Created by", "Status"]
+    row = next(r for r in sheet if r[0] == "INV-SO-1")
+    assert row[2] == "PO-1-1" and row[4] == "draft" and "held as draft" in row[8]
+    assert not [r for r in sheet if r[0] == "INV-SO-2"]        # not in NetSuite: not part of the Finale reconciliation
 
 
 def test_so_digest_workbook_adds_finale_column(monkeypatch):
@@ -876,12 +894,13 @@ def test_digest_reconciles_finale_rolling_within_the_floor(client, monkeypatch):
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         _send_daily_digest()
     body = mail.call_args.kwargs["body_html"]
-    tail = body.split("not invoiced in Finale")[-1]
-    assert "2 SO(s) in NetSuite but not invoiced in Finale" in body and f"orders since {floor}" in body
-    assert "not shipped in Finale" in tail and "<strong>6 days ago</strong>" in tail and "over 4 days ago" in body
-    assert "INV-SO-0" not in tail and "INV-SO-9" not in tail          # pre-floor / not in NetSuite: not Finale's problem
-    assert "Needs attention" in body and "3 issue(s)" in mail.call_args.kwargs["subject"]   # 2 stale + the NetSuite gap
-    assert "Finale (non-EDI orders, since" in body and "1 invoice(s) posted" in body and "507872-00" in body
+    assert "Finale" not in body
+    assert "INV-SO-9" in _attention(body) and "1 issue(s)" in mail.call_args.kwargs["subject"]   # only the NetSuite gap
+    sheet = _finale_sheet(mail)
+    by_inv = {r[0]: r for r in sheet[1:]}
+    assert by_inv["INV-SO-1"][4] == "missing" and "not shipped in Finale" in by_inv["INV-SO-1"][8] and "6 days ago" in by_inv["INV-SO-1"][8]
+    assert "INV-SO-2" in by_inv and "INV-SO-0" not in by_inv and "INV-SO-9" not in by_inv   # pre-floor / not in NetSuite: not on the sheet
+    assert by_inv["(non-EDI)"][1] == "507872-00" and by_inv["(non-EDI)"][4] == "posted"
     # a receipt -- ours or someone's -- takes the SO off the missing list; a delta puts it
     # on the 'does not tie' list, naming who keyed it
     tracking.record_finale_invoice(invs[0]["transaction_id"], invs[0]["po_number"], "1", "/i/1", "x-1", "external",
@@ -894,12 +913,10 @@ def test_digest_reconciles_finale_rolling_within_the_floor(client, monkeypatch):
          patch("app.finale.FinaleClient") as FC:
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         _send_daily_digest()
-    body2 = mail2.call_args.kwargs["body_html"]
-    assert "over 6 days ago" in body2 and "over 4 days ago" not in body2
-    miss2 = body2.split("not invoiced in Finale")[-1].split("do not tie")[0]
-    assert "INV-SO-1" not in miss2 and "INV-SO-2" in miss2
-    assert "1 Finale invoice(s) do not tie to the 810" in body2
-    assert "INV-SO-1 — Finale x-1 by edward.schiavon — Finale $107.19 vs 810 $107.14 (<strong>off by +0.05</strong>)" in body2
+    sheet2 = _finale_sheet(mail2)
+    by_inv = {r[0]: r for r in sheet2[1:]}
+    assert by_inv["INV-SO-1"][2:9] == ["x-1", "edward.schiavon", "by hand", 107.19, 107.14, "+0.05", "keyed by hand, not by the app"]
+    assert by_inv["INV-SO-2"][4] == "missing"
 
 
 def test_digest_keeps_the_normal_pipeline_out_of_needs_attention(client, monkeypatch):
@@ -925,10 +942,10 @@ def test_digest_keeps_the_normal_pipeline_out_of_needs_attention(client, monkeyp
         FC.configured.return_value = True
         _send_daily_digest()
     body = mail.call_args.kwargs["body_html"]; subject = mail.call_args.kwargs["subject"]
-    assert "Needs attention" not in body and "issue(s)" not in subject
-    info = body.split("For information")[-1]
-    assert "1 SO(s) awaiting shipment in Finale" in info and "INV-SO-1" in info
-    assert "1 invoice(s) accepted in CRSTL after the last NetSuite push" in info and "INV-SO-2" in info and " ET)" in info
+    assert "Needs attention" not in body and "issue(s)" not in subject and "INV-SO-2" not in body
+    sheet = _finale_sheet(mail)
+    row = next(r for r in sheet if r[0] == "INV-SO-1")
+    assert row[4] == "missing" and "not shipped in Finale" in row[8]
     # the push ran AFTER so-2 was accepted and still no SO: that is a gap to act on
     invs[1]["created_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     tracking.record_job_run("netsuite_push", "ok", "1 pushed")
@@ -942,8 +959,7 @@ def test_digest_keeps_the_normal_pipeline_out_of_needs_attention(client, monkeyp
         _send_daily_digest()
     body2 = mail2.call_args.kwargs["body_html"]
     assert "1 issue(s)" in mail2.call_args.kwargs["subject"]
-    assert "INV-SO-2" in body2.split("Needs attention")[-1].split("For information")[0]
-    assert "no SO in NetSuite" in body2 and "before the last push at" in body2
+    assert "INV-SO-2" in _attention(body2) and "No SO in NetSuite" in _attention(body2)
 
 
 def test_digest_reads_a_hand_made_invoice_before_the_poll_receipts_it(client, monkeypatch):
@@ -969,8 +985,13 @@ def test_digest_reads_a_hand_made_invoice_before_the_poll_receipts_it(client, mo
         FC.configured.return_value = True
         _send_daily_digest()
     body = mail.call_args.kwargs["body_html"]
-    assert "1 already invoiced by hand" in body and "not invoiced in Finale" not in body
-    assert "PO1-1 by edward.schiavon" in body and "off by +0.50" in body
+    assert "Finale" not in body and "Needs attention" not in body
+    row = next(r for r in _finale_sheet(mail) if r[0] == "INV-SO-1")
+    assert row[2:8] == ["PO1-1", "edward.schiavon", "by hand", 107.64, 107.14, "+0.50"]
+    # and the Invoices sheet's own Finale columns say the same for the new SO
+    ws = load_workbook(io.BytesIO(mail.call_args.kwargs["attachments"][0][1]))["Invoices"]
+    heads = [c.value for c in ws[1]]
+    assert heads[-2:] == ["Finale invoice", "Finale vs 810"]
 
 
 def test_digest_drops_a_held_draft_once_someone_posts_it(client, monkeypatch):
@@ -994,8 +1015,8 @@ def test_digest_drops_a_held_draft_once_someone_posts_it(client, monkeypatch):
          patch("app.finale.FinaleClient") as FC:
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         _send_daily_digest()
-    body = mail.call_args.kwargs["body_html"]
-    assert "held as draft" not in body and "1 invoice(s) posted" in body
+    row = next(r for r in _finale_sheet(mail) if r[0] == "INV-SO-1")
+    assert row[4] == "posted" and row[3] == "edward.schiavon"
     assert tracking.get_finale_invoices(["so-1"])["so-1"]["status"] == "posted"
     assert tracking.get_finale_invoices(["so-1"])["so-1"]["created_by"] == "edward.schiavon"
 
