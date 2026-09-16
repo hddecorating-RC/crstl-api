@@ -12,7 +12,7 @@ PRO into the shipment's tracking field at ship time. When an ASN is Accepted, th
 shipment is still open (INPUT or PACKED), so the pass writes
 
     trackingCode = PRO (bill_of_lading_number, 3200...)
-    publicNotes  = "RTS <carrier_reference_number>" (6100...)
+    publicNotes  = "RTS: <carrier_reference_number>" (6100...)
 
 exactly where the warehouse puts them by hand (40864264-1 is the reference), and
 nothing else -- in particular never shipDateEstimated, which the Ship dialog would
@@ -23,7 +23,7 @@ Not a digest concern: this is a warehouse convenience; alerts/monitoring come la
 """
 from app.netsuite_push import select_for_automation
 
-RTS_PREFIX = "RTS "
+RTS_PREFIX = "RTS: "
 DSD_FLAVOR = "Direct Store Delivery (DSD)"   # Crstl's trading_partner_flavor on the 856 listing
 OPEN = ("SHIPMENT_INPUT", "SHIPMENT_PACKED")
 CANCELLED = "SHIPMENT_CANCELLED"
@@ -53,7 +53,7 @@ def plan_shipment(asn: dict, shipment: dict, carrier_url: str | None = None, rts
     fields = {}
     if pro and have_pro != pro:
         fields["trackingCode"] = pro
-    # The warehouse writes the bare number ("6100994307"); we write "RTS 6100994307".
+    # The warehouse writes the bare number ("6100994307"); we write "RTS: 6100994307".
     # Either counts as present -- the number is what matters.
     if rts and rts not in have_note:
         fields["publicNotes"] = rts_note(rts)
