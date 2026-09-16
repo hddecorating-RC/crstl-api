@@ -20,6 +20,7 @@ from app.netsuite import transform_invoice, resolve_customer, external_id_for
 from app.netsuite_csv import build_netsuite_csv
 from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation
 from app.finale_invoice import push_finale_invoices
+from app.shipstation import ShipStationClient, push_shipstation_close
 from app.finale_nonedi import push_nonedi_invoices
 from app.finale_dsd import push_dsd_prefill, select_dsd_asns
 from app.netsuite_payload import load_refs
@@ -1031,6 +1032,12 @@ def _finale_poll_passes() -> None:
         except Exception as exc:
             print(f"WARNING: DSD prefill poll failed: {exc}")
             tracking.record_job_run("finale_dsd", "error", str(exc)[:200])
+    if _shipstation_config().get("enabled"):
+        try:
+            _run_shipstation_close(True, None, None)
+        except Exception as exc:
+            print(f"WARNING: ShipStation close poll failed: {exc}")
+            tracking.record_job_run("shipstation_close", "error", str(exc)[:200])
 
 
 def _dsd_prefill_enabled() -> bool:
@@ -1070,6 +1077,42 @@ def _run_dsd_prefill(live: bool, ids: Optional[list[str]], limit: Optional[int])
                              f"{s.get('skipped_no_shipment', 0) + s.get('skipped_no_order', 0)} waiting, "
                              f"{s.get('skipped_shipped', 0)} already shipped, {s.get('failed', 0)} failed")
                             + f" [{'live' if live else 'dry'}]")
+    return result
+
+
+def _shipstation_config() -> dict:
+    return load_refs().get("shipstation") or {}
+
+
+def _run_shipstation_close(live: bool, ids: Optional[list[str]], limit: Optional[int]) -> dict:
+    """Mark the DSD store's open ShipStation orders shipped once Finale shows them
+    shipped (live) or preview it (dry). `ids` names ShipStation order NUMBERS (HD
+    POs); a manual run may name any open order, the automated pass (ids=None)
+    applies the floor and the cap. Reads ShipStation + Finale; the only write is
+    ShipStation's Mark as Shipped."""
+    from app.finale import FinaleClient, FinaleUnavailable
+    if not ShipStationClient.configured():
+        raise FinaleUnavailable("SHIPSTATION_V1_KEY / SHIPSTATION_V1_SECRET not set")
+    if not FinaleClient.configured():
+        raise FinaleUnavailable("FINALE_* credentials not set")
+    cfg = _shipstation_config()
+    automated = ids is None
+    client = ShipStationClient()
+    orders = client.list_open_orders(int(cfg.get("dsd_store_id") or 0))
+    result = push_shipstation_close(orders, live=live, only=ids, limit=limit, client=client, finale=FinaleClient(),
+                                    created_after=(str(cfg.get("go_live_after") or "") or None) if automated else None,
+                                    carrier_code=str(cfg.get("carrier_code") or "other"),
+                                    max_per_run=cfg.get("max_per_run") if automated else None)
+    blocked = result.get("blocked")
+    with _finale_push_lock:
+        _finale_push_state["shipstation"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
+    c = result["summary"]
+    tracking.record_job_run("shipstation_close", "blocked" if blocked else ("ok" if not c.get("failed") else "partial"),
+                            (f"{blocked} -- refusing; run manually" if blocked else
+                             f"{c['candidates']} open: {c.get('close_done', 0)} closed, {c.get('would_close', 0)} would, "
+                             f"{c.get('skipped_not_shipped', 0) + c.get('skipped_no_finale', 0)} waiting, "
+                             f"{c.get('skipped_floor', 0)} pre-floor, {c.get('skipped_cancelled', 0)} cancelled in Finale, "
+                             f"{c.get('failed', 0)} failed") + f" [{'live' if live else 'dry'}]")
     return result
 
 
@@ -1703,6 +1746,19 @@ async def finale_dsd_prefill(body: FinalePushRequest = FinalePushRequest()) -> J
         print(f"DSD prefill failed: {exc}")
         return JSONResponse(status_code=500, content={"message": "DSD prefill failed — see server logs"})
     return JSONResponse(status_code=400 if result.get("blocked") else 200, content=result)
+
+
+@app.post("/api/shipstation/close")
+async def shipstation_close(body: FinalePushRequest = FinalePushRequest()) -> JSONResponse:
+    """Mark DSD ShipStation orders shipped once Finale has shipped them. Dry by
+    default; a live run must name order numbers (ids) like every other writer."""
+    if not body.dry_run and not body.ids:
+        return JSONResponse(status_code=400, content={"message": "live run requires ids (ShipStation order numbers)"})
+    try:
+        result = _run_shipstation_close(not body.dry_run, body.ids, body.limit)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=503, content={"message": str(exc)[:200]})
+    return JSONResponse(content=result)
 
 
 @app.get("/api/finale-push/latest")

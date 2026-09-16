@@ -68,6 +68,14 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
             finale_total    REAL,
             delta           REAL
         );
+        CREATE TABLE IF NOT EXISTS shipstation_marks (
+            order_id     TEXT PRIMARY KEY,
+            order_number TEXT,
+            tracking     TEXT,
+            ship_date    TEXT,
+            status       TEXT NOT NULL,
+            updated_at   TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS finale_shipments (
             asn_id          TEXT PRIMARY KEY,
             po_number       TEXT,
@@ -406,6 +414,42 @@ def record_finale_shipment(asn_id: str, po_number: str | None, shipment_id: str 
                     (asn_id, po_number, shipment_id, pro, rts, status, now))
     except Exception as exc:
         print(f"ERROR: finale_shipments write failed for {asn_id!r}: {exc}")
+
+
+def record_shipstation_mark(order_id: str, order_number: str | None, tracking: str | None,
+                            ship_date: str | None, status: str) -> None:
+    """Remember that this ShipStation order was marked shipped by the DSD close pass
+    (status 'closed'), keyed on ShipStation's orderId so it is done once. Best-effort."""
+    if not order_id:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with contextlib.closing(_connect()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO shipstation_marks (order_id, order_number, tracking, ship_date, status, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET order_number = excluded.order_number, "
+                    "tracking = excluded.tracking, ship_date = excluded.ship_date, status = excluded.status, "
+                    "updated_at = excluded.updated_at",
+                    (order_id, order_number, tracking, ship_date, status, now))
+    except Exception as exc:
+        print(f"ERROR: shipstation_marks write failed for {order_id!r}: {exc}")
+
+
+def get_shipstation_marks(order_ids: list[str]) -> dict[str, dict]:
+    """{order_id: receipt row} for the ShipStation orders the close pass has done."""
+    ids = [i for i in order_ids if i]
+    if not ids:
+        return {}
+    try:
+        with contextlib.closing(_connect()) as conn:
+            rows = conn.execute(
+                f"SELECT order_id, order_number, tracking, ship_date, status, updated_at FROM shipstation_marks "
+                f"WHERE order_id IN ({','.join('?' * len(ids))})", ids).fetchall()
+        return {r[0]: {"order_number": r[1], "tracking": r[2], "ship_date": r[3], "status": r[4], "updated_at": r[5]} for r in rows}
+    except Exception as exc:
+        print(f"WARNING: shipstation_marks read failed: {exc}")
+        return {}
 
 
 def get_finale_shipments(asn_ids: list[str]) -> dict[str, dict]:

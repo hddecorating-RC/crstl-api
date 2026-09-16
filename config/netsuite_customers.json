@@ -103,6 +103,9 @@
     "max_per_run": 75
   },
 
+  "_comment_shipstation": "ShipStation DSD close (app.shipstation, Ritchie 2026-09-16): DSD orders ship on HD trucks and never get a ShipStation label, so they sit in Awaiting Shipment/Awaiting Payment forever. When Finale shows the DSD shipment SHIPPED, the 15-min Finale poll marks the ShipStation order shipped (carrier 'other', tracking = the Finale shipment's tracking = the 6100 PRO, shipDate = Finale's ship date, notifyCustomer/notifySalesChannel false). Mark as Shipped does NOT fire the SHIP_NOTIFY webhook CRSTL builds ASNs from (proven 2026-09-16 on 31 orders). dsd_store_id = the 'HD DSD' store; go_live_after = positive floor on the ShipStation order's create date (history before it was cleaned by hand, or is left for review); max_per_run refuses a bigger run. enabled=false = dry runs only. Creds: SHIPSTATION_V1_KEY / SHIPSTATION_V1_SECRET in .env.",
+  "shipstation": {"enabled": false, "dsd_store_id": 2746880, "go_live_after": "2026-09-01", "max_per_run": 20, "carrier_code": "other"},
+
   "_comment_finale": "Finale invoice creation (app.finale_invoice) -- ONE tool invoices BOTH DSD and Dropship, EDI-driven (850 product/810 qty+price), exact CRSTL discount + our tax, auto-POSTED when it ties to the 810 to the cent, left as a DRAFT + flagged otherwise. Finale invoices go nowhere downstream (internal record for teams without NetSuite). Ids read from the Finale catalogue 2026-09-15 (GET /api/productpromo, /api/taxauthorityrateproduct): promo presets DSD 100037 'DSD - 6.18875%', Dropship 100038 'Dropship - 5.18875%'; tax-rate products GST 5%=100000 (AB/BC/MB: we bill GST-only, no PST), HST 15%=100001 (NB/NL/PE), HST 13%=100002 (ON), GST+QST=100003 (QC), HST 14%=100004 (NS), GST+Sask PST=100005 (SK). enabled=false ships it OFF; the scheduled path is also capped by max_per_run and only ever invoices what the NetSuite push just sent.",
   "finale": {
     "enabled": true,

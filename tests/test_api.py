@@ -1156,3 +1156,25 @@ def test_run_dsd_prefill_applies_the_shared_guards_to_the_automated_pass(monkeyp
         assert [a["asn_id"] for a in push.call_args[0][0]] == ["new"]
         _run_dsd_prefill(False, ["old"], None)
         assert [a["asn_id"] for a in push.call_args[0][0]] == ["old"]
+
+
+def test_finale_poll_runs_the_shipstation_close_only_when_enabled(monkeypatch):
+    """The DSD close pass rides the 15-min Finale poll and is gated by config
+    shipstation.enabled; a manual live run must name order numbers."""
+    from app.main import _finale_poll_passes
+    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
+         patch("app.main._shipstation_config", return_value={"enabled": False}), patch("app.main._run_shipstation_close") as close:
+        _finale_poll_passes()
+    close.assert_not_called()
+    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
+         patch("app.main._shipstation_config", return_value={"enabled": True}), patch("app.main._run_shipstation_close") as close2:
+        _finale_poll_passes()
+    close2.assert_called_once_with(True, None, None)
+
+
+def test_shipstation_close_endpoint_requires_ids_for_live(client):
+    r = client.post("/api/shipstation/close", json={"dry_run": False})
+    assert r.status_code == 400 and "ids" in r.json()["message"]
+    with patch("app.main._run_shipstation_close", return_value={"mode": "dry", "results": [], "summary": {"candidates": 0}}) as run:
+        r2 = client.post("/api/shipstation/close", json={"dry_run": True})
+    assert r2.status_code == 200 and run.call_args.args == (False, None, None)

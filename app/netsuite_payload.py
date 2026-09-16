@@ -49,6 +49,8 @@ def load_refs() -> dict:
         # channel/province, its own enabled flag and per-run cap. Default {} so a
         # config without the block leaves Finale invoicing off and unresolved.
         "finale": cfg.get("finale", {}),
+        # ShipStation DSD close (app.shipstation): store id, floor, cap, enabled flag.
+        "shipstation": cfg.get("shipstation", {}),
     }
 
 
