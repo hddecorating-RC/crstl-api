@@ -18,7 +18,7 @@ DROP_DETAIL = {"file": {"generic_json_edi": {"detail": {"shipments": [{
     "carrier_details": {"routing_description": "UNSP"}, "shipped_date": "2026-09-15"}]}}}}
 
 ASN = {"asn_id": "a1", "po_number": "40864264", "state": "Accepted", "created_at": "2026-09-16T10:00:00Z",
-       "pro": "3200416047", "rts": "6100994307", "pickup_date": "2026-09-15"}
+       "pro": "6100994307", "rts": "3200416047", "pickup_date": "2026-09-15"}
 URL = "/hddecorating/api/shipment/100519"
 
 
@@ -57,13 +57,13 @@ def _run(client, live, asns=(ASN,), existing=None, **kw):
 
 # ---------------------------------------------------------------- reading rule
 def test_asn_shipping_refs_reads_pro_rts_pickup_from_a_dsd_856():
-    assert asn_shipping_refs(DSD_DETAIL) == {"pro": "3200416047", "rts": "6100994307", "pickup_date": "2026-09-15"}
-    assert is_dsd_asn({"pro": "3200416047"})
+    assert asn_shipping_refs(DSD_DETAIL) == {"pro": "6100994307", "rts": "3200416047", "pickup_date": "2026-09-15"}
+    assert is_dsd_asn({"rts": "3200416047"})
 
 
 def test_dropship_856_has_no_pro_and_is_not_dsd():
     refs = asn_shipping_refs(DROP_DETAIL)
-    assert refs["pro"] == "" and refs["pickup_date"] == ""
+    assert refs["rts"] == "" and refs["pro"] == "" and refs["pickup_date"] == ""
     assert not is_dsd_asn(refs)
     assert asn_shipping_refs({}) == {"pro": "", "rts": "", "pickup_date": ""}
 
@@ -73,19 +73,19 @@ def test_dropship_856_has_no_pro_and_is_not_dsd():
 def test_plan_writes_exactly_tracking_and_note_on_an_open_shipment(status):
     p = plan_shipment(ASN, ship(status))
     assert p["action"] == "write"
-    assert p["fields"] == {"trackingCode": "3200416047", "publicNotes": "RTS: 6100994307"}   # never shipDateEstimated
+    assert p["fields"] == {"trackingCode": "6100994307", "publicNotes": "Routing: 3200416047"}   # never shipDateEstimated
 
 
 def test_plan_writes_only_what_is_missing():
-    p = plan_shipment(ASN, ship(tracking="3200416047"))            # warehouse already typed the PRO
-    assert p["fields"] == {"publicNotes": "RTS: 6100994307"}
-    # the warehouse's bare number counts as present (40864264-1 carries "6100994307")
-    assert plan_shipment(ASN, ship("SHIPMENT_SHIPPED", tracking="3200416047", notes="6100994307"))["action"] == "equal"
+    p = plan_shipment(ASN, ship(tracking="6100994307"))            # PRO already on the shipment
+    assert p["fields"] == {"publicNotes": "Routing: 3200416047"}
+    # a bare number in the notes counts as present
+    assert plan_shipment(ASN, ship("SHIPMENT_SHIPPED", tracking="6100994307", notes="3200416047"))["action"] == "equal"
 
 
 def test_plan_equal_shipped_cancelled():
-    assert plan_shipment(ASN, ship(tracking="3200416047", notes="RTS: 6100994307"))["action"] == "equal"
-    shipped = plan_shipment(ASN, ship("SHIPMENT_SHIPPED", tracking="3200416047", notes="RTS: 6100994307"))
+    assert plan_shipment(ASN, ship(tracking="6100994307", notes="Routing: 3200416047"))["action"] == "equal"
+    shipped = plan_shipment(ASN, ship("SHIPMENT_SHIPPED", tracking="6100994307", notes="Routing: 3200416047"))
     assert shipped["action"] == "equal"                              # same numbers: nothing to do, even if shipped
     differs = plan_shipment(ASN, ship("SHIPMENT_SHIPPED", tracking="9999"))
     assert differs["action"] == "shipped" and "9999" in differs["reason"] and differs["fields"] == {}
@@ -124,7 +124,7 @@ def test_dry_run_reports_would_prefill_and_writes_nothing():
     f = FakeFinale(shipments=[ship()])
     out, rec = _run(f, live=False)
     assert out["mode"] == "dry" and out["results"][0]["status"] == "would_prefill"
-    assert out["results"][0]["shipments"][0]["fields"] == {"trackingCode": "3200416047", "publicNotes": "RTS: 6100994307"}
+    assert out["results"][0]["shipments"][0]["fields"] == {"trackingCode": "6100994307", "publicNotes": "Routing: 3200416047"}
     assert not [c for c in f.calls if c[0] == "update"] and rec.assert_not_called() is None
 
 
@@ -133,8 +133,8 @@ def test_live_writes_the_fields_and_records_a_receipt():
     out, rec = _run(f, live=True)
     r = out["results"][0]
     assert r["status"] == "prefilled" and r["shipment_id_user"] == "40864264-1"
-    assert f.calls[-1] == ("update", URL, {"trackingCode": "3200416047", "publicNotes": "RTS: 6100994307"})
-    rec.assert_called_once_with("a1", "40864264", "40864264-1", "3200416047", "6100994307", "prefilled")
+    assert f.calls[-1] == ("update", URL, {"trackingCode": "6100994307", "publicNotes": "Routing: 3200416047"})
+    rec.assert_called_once_with("a1", "40864264", "40864264-1", "6100994307", "3200416047", "prefilled")
     assert out["summary"]["prefilled"] == 1
 
 
@@ -147,7 +147,7 @@ def test_missing_order_or_shipment_is_retried_not_receipted():
 
 
 def test_equal_and_shipped_are_terminal_with_receipts_in_live_only():
-    done = ship(tracking="3200416047", notes="RTS: 6100994307")
+    done = ship(tracking="6100994307", notes="Routing: 3200416047")
     out, rec = _run(FakeFinale(shipments=[done]), live=True)
     assert out["results"][0]["status"] == "skipped_equal"
     assert rec.call_args[0][-1] == "skipped_equal"
@@ -166,7 +166,7 @@ def test_prior_receipt_not_accepted_and_not_dsd_are_skipped_before_finale():
     assert out["results"][0]["status"] == "skipped_done"
     out, _ = _run(f, live=True, asns=[{**ASN, "state": "Draft"}])
     assert out["results"][0]["status"] == "skipped_not_accepted"
-    out, rec = _run(f, live=True, asns=[{**ASN, "pro": ""}])
+    out, rec = _run(f, live=True, asns=[{**ASN, "rts": ""}])          # no BOL number = not a DSD pickup
     assert out["results"][0]["status"] == "skipped_not_dsd"
     rec.assert_called_once_with("a1", "40864264", None, None, None, "skipped_not_dsd")   # terminal: never re-read
     assert f.calls == []
@@ -192,9 +192,9 @@ CARRIERS_ON = {"finale": {"carriers": {"enabled": True, "dsd": "HDOC", "dropship
 def test_plan_adds_the_dsd_carrier_when_it_differs():
     p = plan_shipment(ASN, ship(), HDOC)
     assert p["action"] == "write" and p["fields"]["carrierPartyUrl"] == HDOC
-    done = {**ship(tracking="3200416047", notes="RTS: 6100994307"), "carrierPartyUrl": HDOC}
+    done = {**ship(tracking="6100994307", notes="Routing: 3200416047"), "carrierPartyUrl": HDOC}
     assert plan_shipment(ASN, done, HDOC)["action"] == "equal"
-    only_carrier = plan_shipment(ASN, {**ship(tracking="3200416047", notes="RTS: 6100994307")}, HDOC)
+    only_carrier = plan_shipment(ASN, {**ship(tracking="6100994307", notes="Routing: 3200416047")}, HDOC)
     assert only_carrier["fields"] == {"carrierPartyUrl": HDOC}
     assert "carrierPartyUrl" not in plan_shipment(ASN, ship(), None)["fields"]       # defaults off: untouched
 
@@ -203,7 +203,7 @@ def test_live_dsd_pass_writes_the_carrier_with_pro_rts_only_when_enabled():
     client = FakeFinale(shipments=[ship()])
     out, rec = _run(client, True, refs=CARRIERS_ON)
     assert out["results"][0]["status"] == "prefilled"
-    assert client.calls[-1] == ("update", URL, {"trackingCode": "3200416047", "publicNotes": "RTS: 6100994307", "carrierPartyUrl": HDOC})
+    assert client.calls[-1] == ("update", URL, {"trackingCode": "6100994307", "publicNotes": "Routing: 3200416047", "carrierPartyUrl": HDOC})
     assert out["results"][0]["carrier"] == {"wanted": "HDOC", "enabled": True, "note": None}
     off = FakeFinale(shipments=[ship()])
     out2, _ = _run(off, True, refs={"finale": {"carriers": {"enabled": False, "dsd": "HDOC"}}})
@@ -221,16 +221,16 @@ def test_plan_order_and_rts_leaves_the_notes_when_mapped_to_the_order():
     from app.finale_dsd import plan_order
     locked = {"orderId": "40864264", "statusId": "ORDER_LOCKED",
               "userFieldDataList": [{"attrName": "integration_ssconnection_100000", "attrValue": "HASH"}]}
-    assert plan_order(ASN, locked, {"rts": "user_10000"}) == {"fields": {"user_10000": "6100994307"}, "editable": True}
-    have = {**locked, "userFieldDataList": locked["userFieldDataList"] + [{"attrName": "user_10000", "attrValue": "6100994307"}]}
+    assert plan_order(ASN, locked, {"rts": "user_10000"}) == {"fields": {"user_10000": "3200416047"}, "editable": True}
+    have = {**locked, "userFieldDataList": locked["userFieldDataList"] + [{"attrName": "user_10000", "attrValue": "3200416047"}]}
     assert plan_order(ASN, have, {"rts": "user_10000"})["fields"] == {}
     done = {**locked, "statusId": "ORDER_COMPLETED"}
-    assert plan_order(ASN, done, {"rts": "user_10000"}) == {"fields": {"user_10000": "6100994307"}, "editable": False}
+    assert plan_order(ASN, done, {"rts": "user_10000"}) == {"fields": {"user_10000": "3200416047"}, "editable": False}
     assert plan_order({**ASN, "rts": ""}, locked, {"rts": "user_10000"})["fields"] == {}      # no RTS on the ASN: nothing
     # the RTS goes in the shipment notes too, so the shipment page shows it
     p = plan_shipment(ASN, ship(), None, rts_on_order=True)
-    assert p["fields"] == {"trackingCode": "3200416047", "publicNotes": "RTS: 6100994307"}
-    assert plan_shipment(ASN, ship(tracking="3200416047", notes="RTS: 6100994307"), None, rts_on_order=True)["action"] == "equal"
+    assert p["fields"] == {"trackingCode": "6100994307", "publicNotes": "Routing: 3200416047"}
+    assert plan_shipment(ASN, ship(tracking="6100994307", notes="Routing: 3200416047"), None, rts_on_order=True)["action"] == "equal"
 
 
 def test_live_dsd_pass_writes_the_rts_onto_the_order_and_never_a_completed_one():
@@ -239,12 +239,12 @@ def test_live_dsd_pass_writes_the_rts_onto_the_order_and_never_a_completed_one()
                      "userFieldDataList": [{"attrName": "integration_ssconnection_100000", "attrValue": "HASH"}]}
     out, rec = _run(client, True, refs=RTS_ON)
     r = out["results"][0]
-    assert r["status"] == "prefilled" and r["order_fields"] == {"fields": {"user_10000": "6100994307"}, "order_status": "ORDER_LOCKED", "note": None, "written": True}
-    assert ("update", URL, {"trackingCode": "3200416047", "publicNotes": "RTS: 6100994307"}) in client.calls   # PRO + RTS on the shipment
-    assert ("order_fields", "40864264", {"user_10000": "6100994307"}) in client.calls
+    assert r["status"] == "prefilled" and r["order_fields"] == {"fields": {"user_10000": "3200416047"}, "order_status": "ORDER_LOCKED", "note": None, "written": True}
+    assert ("update", URL, {"trackingCode": "6100994307", "publicNotes": "Routing: 3200416047"}) in client.calls   # PRO + RTS on the shipment
+    assert ("order_fields", "40864264", {"user_10000": "3200416047"}) in client.calls
     rec.assert_called_once()
     # shipment already has PRO + RTS but the order lacks the RTS: still a write
-    client2 = FakeFinale(shipments=[ship(tracking="3200416047", notes="RTS: 6100994307")])
+    client2 = FakeFinale(shipments=[ship(tracking="6100994307", notes="Routing: 3200416047")])
     client2._order = {**client2._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}
     out2, _ = _run(client2, True, refs=RTS_ON)
     assert out2["results"][0]["status"] == "prefilled" and [c[0] for c in client2.calls if c[0] != "get_order"] == ["order_fields"]
@@ -257,11 +257,11 @@ def test_live_dsd_pass_writes_the_rts_onto_the_order_and_never_a_completed_one()
     # dry: reported, nothing written; off: RTS back in the notes
     dry = FakeFinale(shipments=[ship()]); dry._order = {**dry._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}
     out4, rec4 = _run(dry, False, refs=RTS_ON)
-    assert out4["results"][0]["status"] == "would_prefill" and out4["results"][0]["order_fields"]["fields"] == {"user_10000": "6100994307"}
+    assert out4["results"][0]["status"] == "would_prefill" and out4["results"][0]["order_fields"]["fields"] == {"user_10000": "3200416047"}
     assert [c[0] for c in dry.calls] == ["get_order"]; rec4.assert_not_called()
     off = FakeFinale(shipments=[ship()]); off._order = {**off._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}
     out5, _ = _run(off, True, refs={"finale": {"dsd_order_fields": {"enabled": False, "rts": "user_10000"}}})
-    assert off.calls[-1] == ("update", URL, {"trackingCode": "3200416047", "publicNotes": "RTS: 6100994307"})
+    assert off.calls[-1] == ("update", URL, {"trackingCode": "6100994307", "publicNotes": "Routing: 3200416047"})
     # an order write failing marks the ASN failed (retried next pass), the shipment write already stands
     bad = FakeFinale(shipments=[ship()]); bad._order = {**bad._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}; bad.fail_order = True
     out6, rec6 = _run(bad, True, refs=RTS_ON)

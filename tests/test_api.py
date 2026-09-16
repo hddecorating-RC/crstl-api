@@ -1145,7 +1145,7 @@ def test_run_dsd_prefill_applies_the_shared_guards_to_the_automated_pass(monkeyp
               "draft": {"state": "Draft", "created_at": "2026-09-16T01:00:00Z", "po_number": "3"}}
     crstl = type("C", (), {"list_transaction_states": lambda self, transaction_type="810": states,
                            "fetch_asn_refs": lambda self, ids: [{"asn_id": i, "po_number": "1", "state": "Accepted",
-                                                                 "pro": "3200", "rts": "6100", "pickup_date": ""} for i in ids]})()
+                                                                 "pro": "6100", "rts": "3200", "pickup_date": ""} for i in ids]})()
     monkeypatch.setattr("app.main._get_client", lambda: crstl)
     monkeypatch.setattr("app.main._finale_config", lambda: {"enabled": True, "go_live_after": "2026-09-15", "max_per_run": 5})
     monkeypatch.setattr("app.main.load_refs", lambda: {"automation": {"created_within_days": 365}})

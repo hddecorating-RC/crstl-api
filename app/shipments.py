@@ -44,22 +44,26 @@ SHIPPED = "Accepted"
 def asn_shipping_refs(detail: dict) -> dict:
     """The two numbers a DSD pickup needs, read off one 856: {pro, rts, pickup_date}.
 
-    PRO (the pickup / bill-of-lading number, 3200...) is `bill_of_lading_number`;
-    RTS (the routing number, 6100...) is `carrier_reference_number`, which HD also
-    echoes as carrier_details.routing_description. Both are typed by the warehouse
-    into the ASN from HD's own system -- that manual entry is unavoidable, so the
-    ASN is the ONE place they are keyed and everything else copies from it.
-    A Dropship ASN carries neither (no BOL, courier tracking instead), so `pro`
+    Per the warehouse (Ritchie, 2026-09-16): RTS is the 3200... number, which sits
+    in the ASN's `bill_of_lading_number`; PRO (the carrier's, printed as SCAC/PRO)
+    is the 6100... number, `carrier_reference_number`, which HD also echoes as
+    carrier_details.routing_description. Both are typed by the warehouse into the
+    ASN from HD's own system -- that manual entry is unavoidable, so the ASN is the
+    ONE place they are keyed and everything else copies from it. This module only
+    READS the ASN; the labels are for our Finale records, the 856 is never changed.
+    A Dropship ASN carries neither (no BOL, courier tracking instead), so `rts`
     blank means "not a DSD pickup". Reads the first shipment only: a DSD ASN is
-    one truck.
+    one truck. The routing_description fallback is taken only when it is a number
+    (Dropship ASNs carry the literal "UNSP" there).
     """
     shipments = (((detail.get("file") or {}).get("generic_json_edi") or {})
                  .get("detail") or {}).get("shipments") or []
     sh = shipments[0] if shipments and isinstance(shipments[0], dict) else {}
     carrier = sh.get("carrier_details") if isinstance(sh.get("carrier_details"), dict) else {}
+    routing = str(carrier.get("routing_description") or "").strip()
     return {
-        "pro": str(sh.get("bill_of_lading_number") or "").strip(),
-        "rts": str(sh.get("carrier_reference_number") or carrier.get("routing_description") or "").strip(),
+        "rts": str(sh.get("bill_of_lading_number") or "").strip(),
+        "pro": str(sh.get("carrier_reference_number") or (routing if routing.isdigit() else "") or "").strip(),
         "pickup_date": str(sh.get("shipment_date") or "").strip(),
     }
 
