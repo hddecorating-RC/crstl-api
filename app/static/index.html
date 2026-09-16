@@ -118,6 +118,7 @@
               <option value="Any">All states</option>
               <option value="Pushed">Pushed to NetSuite ⬡</option>
               <option value="NotPushed">Not pushed to NetSuite</option>
+              <option value="Backlog">Backlog — before go-live, handled outside</option>
               <option value="Emailed">Emailed ✉</option>
               <option value="NotEmailed">Not emailed</option>
               <option value="Exported">CSV exported ↓</option>
@@ -631,7 +632,11 @@ function dashboard() {
     activeFilter: 'Accepted',   // default view = Accepted (push-eligible); a saved choice overrides in init()
     // Export-state dimension, independent of status filter above. Default to
     // NotPushed (the working view); a saved choice overrides in init().
-    // 'Any' | 'Pushed' | 'NotPushed' | 'Emailed' | 'NotEmailed' | 'Exported' | 'NotExported'
+    // 'Any' | 'Pushed' | 'NotPushed' | 'Backlog' | 'Emailed' | 'NotEmailed' | 'Exported' | 'NotExported'
+    // NotPushed is the WORKING view: not pushed AND created on/after the go-live
+    // floor (the automation's own scope). Anything created before the floor was
+    // handled outside this tool (keyed by hand / CSV) and never becomes actionable
+    // here, so it lives under Backlog instead of cluttering the work queue forever.
     exportStateFilter: 'NotPushed',
     search: '',
     dateFrom: '',
@@ -688,7 +693,7 @@ function dashboard() {
       // disabled), so guard every access and fall back to the default.
       const ALLOWED = {
         activeFilter: ['All', 'Draft', 'Sent', 'Accepted'],
-        exportStateFilter: ['Any', 'Pushed', 'NotPushed', 'Emailed', 'NotEmailed', 'Exported', 'NotExported'],
+        exportStateFilter: ['Any', 'Pushed', 'NotPushed', 'Backlog', 'Emailed', 'NotEmailed', 'Exported', 'NotExported'],
       };
       ['activeFilter', 'exportStateFilter', 'dateFrom', 'dateTo'].forEach(k => {
         try {
@@ -998,10 +1003,14 @@ function dashboard() {
         // Emailed / NotEmailed / Exported / NotExported = filter by presence
         // of the respective timestamp on the invoice.
         const es = this.exportStateFilter;
+        // In scope = created (by CRSTL) on/after the go-live floor -- the same
+        // created_at rule the automation applies. Pre-floor rows are backlog.
+        const inScope = !this.goLiveAfter || (inv.created_at || '').slice(0, 10) >= this.goLiveAfter;
         const matchExport =
           es === 'Any' ||
           (es === 'Pushed'       && !!inv.netsuite_at) ||
-          (es === 'NotPushed'    && !inv.netsuite_at) ||
+          (es === 'NotPushed'    && !inv.netsuite_at && inScope) ||
+          (es === 'Backlog'      && !inv.netsuite_at && !inScope) ||
           (es === 'Emailed'      && !!inv.emailed_at) ||
           (es === 'NotEmailed'   && !inv.emailed_at) ||
           (es === 'Exported'     && !!inv.exported_at) ||
