@@ -227,10 +227,10 @@ def test_plan_order_and_rts_leaves_the_notes_when_mapped_to_the_order():
     done = {**locked, "statusId": "ORDER_COMPLETED"}
     assert plan_order(ASN, done, {"rts": "user_10000"}) == {"fields": {"user_10000": "6100994307"}, "editable": False}
     assert plan_order({**ASN, "rts": ""}, locked, {"rts": "user_10000"})["fields"] == {}      # no RTS on the ASN: nothing
-    # the shipment plan drops the notes when the RTS lives on the order
+    # the RTS goes in the shipment notes too, so the shipment page shows it
     p = plan_shipment(ASN, ship(), None, rts_on_order=True)
-    assert p["fields"] == {"trackingCode": "3200416047"}
-    assert plan_shipment(ASN, ship(tracking="3200416047"), None, rts_on_order=True)["action"] == "equal"
+    assert p["fields"] == {"trackingCode": "3200416047", "publicNotes": "RTS 6100994307"}
+    assert plan_shipment(ASN, ship(tracking="3200416047", notes="RTS 6100994307"), None, rts_on_order=True)["action"] == "equal"
 
 
 def test_live_dsd_pass_writes_the_rts_onto_the_order_and_never_a_completed_one():
@@ -240,11 +240,11 @@ def test_live_dsd_pass_writes_the_rts_onto_the_order_and_never_a_completed_one()
     out, rec = _run(client, True, refs=RTS_ON)
     r = out["results"][0]
     assert r["status"] == "prefilled" and r["order_fields"] == {"fields": {"user_10000": "6100994307"}, "order_status": "ORDER_LOCKED", "note": None, "written": True}
-    assert ("update", URL, {"trackingCode": "3200416047"}) in client.calls               # PRO on the shipment, no notes
+    assert ("update", URL, {"trackingCode": "3200416047", "publicNotes": "RTS 6100994307"}) in client.calls   # PRO + RTS on the shipment
     assert ("order_fields", "40864264", {"user_10000": "6100994307"}) in client.calls
     rec.assert_called_once()
-    # shipment already has the PRO but the order lacks the RTS: still a write
-    client2 = FakeFinale(shipments=[ship(tracking="3200416047")])
+    # shipment already has PRO + RTS but the order lacks the RTS: still a write
+    client2 = FakeFinale(shipments=[ship(tracking="3200416047", notes="RTS 6100994307")])
     client2._order = {**client2._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}
     out2, _ = _run(client2, True, refs=RTS_ON)
     assert out2["results"][0]["status"] == "prefilled" and [c[0] for c in client2.calls if c[0] != "get_order"] == ["order_fields"]

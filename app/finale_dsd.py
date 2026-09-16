@@ -43,8 +43,10 @@ def plan_shipment(asn: dict, shipment: dict, carrier_url: str | None = None, rts
     """What to do with ONE Finale shipment for this ASN: {action, fields, reason}.
     action: write | equal | shipped | cancelled. Pure -- no I/O. `carrier_url` is the
     DSD carrier default (HDOC), written alongside PRO/RTS when the shipment's carrier
-    differs, so the warehouse never picks it by hand. `rts_on_order`: the RTS lives in
-    the order's custom field (see plan_order) and is NOT put in the shipment notes."""
+    differs, so the warehouse never picks it by hand. `rts_on_order` is accepted for
+    compatibility and ignored: the RTS is written to the shipment notes REGARDLESS, so
+    the shipment page shows it (Ritchie, 2026-09-16 -- "all shipping info on the same
+    page"); the order's custom field (plan_order) is what the bill of lading prints."""
     status = str(shipment.get("statusId") or "")
     pro, rts = str(asn.get("pro") or ""), str(asn.get("rts") or "")
     have_pro, have_note = str(shipment.get("trackingCode") or ""), str(shipment.get("publicNotes") or "")
@@ -53,7 +55,7 @@ def plan_shipment(asn: dict, shipment: dict, carrier_url: str | None = None, rts
         fields["trackingCode"] = pro
     # The warehouse writes the bare number ("6100994307"); we write "RTS 6100994307".
     # Either counts as present -- the number is what matters.
-    if rts and not rts_on_order and rts not in have_note:
+    if rts and rts not in have_note:
         fields["publicNotes"] = rts_note(rts)
     if carrier_url and str(shipment.get("carrierPartyUrl") or "") != carrier_url:
         fields["carrierPartyUrl"] = carrier_url
@@ -145,8 +147,8 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
         carrier_note = carrier["reason"] or None
     carrier_url = carrier["url"] if carrier["enabled"] else None
     # Order custom fields (config finale.dsd_order_fields, OFF by default): the RTS
-    # goes on the sales order so the bill of lading can print it. Off = the RTS
-    # stays in the shipment notes as before.
+    # ALSO goes on the sales order so the bill of lading can print it; the shipment
+    # notes get it either way (the shipment page has nowhere else to show it).
     of_cfg = fin.get("dsd_order_fields") or {}
     order_mapping = {k: v for k, v in of_cfg.items() if k in ("rts", "pro") and v} if of_cfg.get("enabled") else {}
 
