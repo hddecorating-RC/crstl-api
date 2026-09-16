@@ -52,6 +52,18 @@ class ShipStationClient:
                 page += 1
         return out
 
+    def list_shipments(self, store_id: int, ship_date_start: str) -> list[dict]:
+        """Every shipment (label) in this store shipped on/after the date, all pages."""
+        out: list[dict] = []
+        page = 1
+        while True:
+            res = self._get("/shipments", storeId=store_id, shipDateStart=ship_date_start, pageSize=500, page=page)
+            out += res.get("shipments") or []
+            if page >= int(res.get("pages") or 1):
+                break
+            page += 1
+        return out
+
     def orders_by_number(self, order_number: str) -> list[dict]:
         return self._get("/orders", orderNumber=order_number, pageSize=50).get("orders") or []
 

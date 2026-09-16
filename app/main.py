@@ -21,6 +21,7 @@ from app.netsuite_csv import build_netsuite_csv
 from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation
 from app.finale_invoice import push_finale_invoices
 from app.shipstation import ShipStationClient, push_shipstation_close
+from app.alerts import alert_recipients, run_alerts
 from app.finale_nonedi import push_nonedi_invoices
 from app.finale_dsd import push_dsd_prefill, select_dsd_asns
 from app.netsuite_payload import load_refs
@@ -1038,6 +1039,12 @@ def _finale_poll_passes() -> None:
         except Exception as exc:
             print(f"WARNING: ShipStation close poll failed: {exc}")
             tracking.record_job_run("shipstation_close", "error", str(exc)[:200])
+    if _alerts_config().get("enabled"):
+        try:
+            _run_alerts(True)
+        except Exception as exc:
+            print(f"WARNING: order alerts poll failed: {exc}")
+            tracking.record_job_run("order_alerts", "error", str(exc)[:200])
 
 
 def _dsd_prefill_enabled() -> bool:
@@ -1113,6 +1120,34 @@ def _run_shipstation_close(live: bool, ids: Optional[list[str]], limit: Optional
                              f"{c.get('skipped_not_shipped', 0) + c.get('skipped_no_finale', 0)} waiting, "
                              f"{c.get('skipped_floor', 0)} pre-floor, {c.get('skipped_cancelled', 0)} cancelled in Finale, "
                              f"{c.get('failed', 0)} failed") + f" [{'live' if live else 'dry'}]")
+    return result
+
+
+def _alerts_config() -> dict:
+    return load_refs().get("alerts") or {}
+
+
+def _run_alerts(live: bool) -> dict:
+    """Find order outliers (today: ShipStation label with no CRSTL 856) and email the
+    new ones to ALERT_RECIPIENTS in ONE message (live), or preview it (dry)."""
+    from app.finale import FinaleUnavailable
+    if not ShipStationClient.configured():
+        raise FinaleUnavailable("SHIPSTATION_V1_KEY / SHIPSTATION_V1_SECRET not set")
+    cfg = _alerts_config()
+    since = (datetime.now(timezone.utc) - timedelta(days=int(cfg.get("lookback_days") or 7))).strftime("%Y-%m-%d")
+    shipments = ShipStationClient().list_shipments(int(cfg.get("dropship_store_id") or 0), since)
+    crstl = _get_client()
+    asn_pos = {v["po_number"] for v in crstl.list_transaction_states("856").values()}
+    po_ids = {str((tx.get("metadata") or tx).get("reference_id")): str((tx.get("metadata") or tx).get("id"))
+              for tx in crstl._fetch_all_transactions("850")}
+    result = run_alerts(shipments, asn_pos, po_ids, config=cfg, live=live, recipients=alert_recipients(), send=send_mail)
+    with _finale_push_lock:
+        _finale_push_state["alerts"] = {"last_run": datetime.now(timezone.utc).isoformat(),
+                                        **{k: v for k, v in result.items() if k != "body_html"}}
+    c = result["summary"]
+    tracking.record_job_run("order_alerts", "ok",
+                            f"{c['found']} outlier(s): {c['new']} new{' (emailed)' if result['sent'] else ''}, "
+                            f"{c['still_open']} still open, {c['resolved']} resolved [{'live' if live else 'dry'}]")
     return result
 
 
@@ -1756,6 +1791,16 @@ async def shipstation_close(body: FinalePushRequest = FinalePushRequest()) -> JS
         return JSONResponse(status_code=400, content={"message": "live run requires ids (ShipStation order numbers)"})
     try:
         result = _run_shipstation_close(not body.dry_run, body.ids, body.limit)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=503, content={"message": str(exc)[:200]})
+    return JSONResponse(content=result)
+
+
+@app.post("/api/alerts/check")
+async def alerts_check(body: FinalePushRequest = FinalePushRequest()) -> JSONResponse:
+    """Find order outliers; dry (default) previews the email, live sends it."""
+    try:
+        result = _run_alerts(not body.dry_run)
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=503, content={"message": str(exc)[:200]})
     return JSONResponse(content=result)

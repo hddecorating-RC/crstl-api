@@ -51,6 +51,8 @@ def load_refs() -> dict:
         "finale": cfg.get("finale", {}),
         # ShipStation DSD close (app.shipstation): store id, floor, cap, enabled flag.
         "shipstation": cfg.get("shipstation", {}),
+        # Order alerts (app.alerts): issue thresholds, store id, enabled flag.
+        "alerts": cfg.get("alerts", {}),
     }
 
 

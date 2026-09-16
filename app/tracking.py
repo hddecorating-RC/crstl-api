@@ -68,6 +68,13 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
             finale_total    REAL,
             delta           REAL
         );
+        CREATE TABLE IF NOT EXISTS alerts (
+            key         TEXT PRIMARY KEY,
+            po_number   TEXT,
+            issue       TEXT NOT NULL,
+            sent_at     TEXT NOT NULL,
+            resolved_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS shipstation_marks (
             order_id     TEXT PRIMARY KEY,
             order_number TEXT,
@@ -414,6 +421,52 @@ def record_finale_shipment(asn_id: str, po_number: str | None, shipment_id: str 
                     (asn_id, po_number, shipment_id, pro, rts, status, now))
     except Exception as exc:
         print(f"ERROR: finale_shipments write failed for {asn_id!r}: {exc}")
+
+
+def record_alert(key: str, po_number: str | None, issue: str) -> None:
+    """One receipt per alerted outlier (key = issue:shipment id), so it is emailed once."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with contextlib.closing(_connect()) as conn:
+            with conn:
+                conn.execute("INSERT INTO alerts (key, po_number, issue, sent_at) VALUES (?, ?, ?, ?) "
+                             "ON CONFLICT(key) DO UPDATE SET sent_at = excluded.sent_at, resolved_at = NULL", (key, po_number, issue, now))
+    except Exception as exc:
+        print(f"ERROR: alerts write failed for {key!r}: {exc}")
+
+
+def resolve_alert(key: str) -> None:
+    try:
+        with contextlib.closing(_connect()) as conn:
+            with conn:
+                conn.execute("UPDATE alerts SET resolved_at = ? WHERE key = ? AND resolved_at IS NULL",
+                             (datetime.now(timezone.utc).isoformat(), key))
+    except Exception as exc:
+        print(f"ERROR: alerts resolve failed for {key!r}: {exc}")
+
+
+def get_alert_receipts(keys: list[str]) -> dict[str, dict]:
+    ks = [k for k in keys if k]
+    if not ks:
+        return {}
+    try:
+        with contextlib.closing(_connect()) as conn:
+            rows = conn.execute(f"SELECT key, po_number, issue, sent_at, resolved_at FROM alerts WHERE key IN ({','.join('?' * len(ks))})", ks).fetchall()
+        return {r[0]: {"key": r[0], "po_number": r[1], "issue": r[2], "sent_at": r[3], "resolved_at": r[4]} for r in rows}
+    except Exception as exc:
+        print(f"WARNING: alerts read failed: {exc}")
+        return {}
+
+
+def open_alert_receipts() -> list[dict]:
+    """Every alerted outlier not yet resolved, oldest first."""
+    try:
+        with contextlib.closing(_connect()) as conn:
+            rows = conn.execute("SELECT key, po_number, issue, sent_at, resolved_at FROM alerts WHERE resolved_at IS NULL ORDER BY sent_at").fetchall()
+        return [{"key": r[0], "po_number": r[1], "issue": r[2], "sent_at": r[3], "resolved_at": r[4]} for r in rows]
+    except Exception as exc:
+        print(f"WARNING: alerts read failed: {exc}")
+        return []
 
 
 def record_shipstation_mark(order_id: str, order_number: str | None, tracking: str | None,

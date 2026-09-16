@@ -1178,3 +1178,18 @@ def test_shipstation_close_endpoint_requires_ids_for_live(client):
     with patch("app.main._run_shipstation_close", return_value={"mode": "dry", "results": [], "summary": {"candidates": 0}}) as run:
         r2 = client.post("/api/shipstation/close", json={"dry_run": True})
     assert r2.status_code == 200 and run.call_args.args == (False, None, None)
+
+
+def test_poll_runs_alerts_only_when_enabled_and_endpoint_previews(client):
+    from app.main import _finale_poll_passes
+    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
+         patch("app.main._alerts_config", return_value={"enabled": False}), patch("app.main._run_alerts") as run:
+        _finale_poll_passes()
+    run.assert_not_called()
+    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
+         patch("app.main._alerts_config", return_value={"enabled": True}), patch("app.main._run_alerts") as run2:
+        _finale_poll_passes()
+    run2.assert_called_once_with(True)
+    with patch("app.main._run_alerts", return_value={"mode": "dry", "summary": {"found": 0}, "sent": False}) as run3:
+        r = client.post("/api/alerts/check", json={"dry_run": True})
+    assert r.status_code == 200 and run3.call_args.args == (False,)

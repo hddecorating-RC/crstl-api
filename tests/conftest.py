@@ -15,7 +15,7 @@ LIVE_ENV = ("SHIPSTATION_KEY", "SHIPSTATION_V1_KEY", "SHIPSTATION_V1_SECRET",
             "FINALE_ACCOUNT_ID", "FINALE_API_KEY", "FINALE_API_SECRET",
             "CRSTL_API_KEY", "NETSUITE_ACCOUNT_ID", "NETSUITE_CONSUMER_KEY", "NETSUITE_CONSUMER_SECRET",
             "NETSUITE_TOKEN_ID", "NETSUITE_TOKEN_SECRET", "GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET",
-            "MAIL_SENDER", "MAIL_RECIPIENTS")
+            "MAIL_SENDER", "MAIL_RECIPIENTS", "ALERT_RECIPIENTS")
 
 
 @pytest.fixture(autouse=True)
@@ -31,5 +31,6 @@ def _no_live_credentials(monkeypatch):
 def _config_gated_passes_off():
     """ShipStation close is OFF for every test; a test that wants it on patches
     app.main._shipstation_config itself (an inner patch wins)."""
-    with patch("app.main._shipstation_config", return_value={"enabled": False}):
+    with patch("app.main._shipstation_config", return_value={"enabled": False}), \
+         patch("app.main._alerts_config", return_value={"enabled": False}):
         yield
