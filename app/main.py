@@ -726,6 +726,9 @@ AUTO_DIGEST_SETTING = "auto_digest_enabled"
 # one 810-Accepted moment. Two gates, BOTH must be on: config finale.enabled (ships
 # OFF) and this runtime toggle (dashboard; default OFF). Manual: POST /api/finale.
 AUTO_FINALE_SETTING = "auto_finale_enabled"
+# DSD pickup numbers (PRO/RTS from the Accepted 856 onto the Finale shipment). Runs
+# inside the Finale invoicing poll, so it is ALSO off whenever that job is off.
+AUTO_DSD_SETTING = "auto_dsd_prefill_enabled"
 _finale_push_lock = threading.Lock()
 _finale_push_state: dict = {"last_run": None, "mode": None, "summary": None,
                             "results": None, "blocked": None, "error": None, "running": False,
@@ -913,7 +916,7 @@ def _run_finale_push_job() -> None:
     """Every 15 minutes, two passes -- BOTH gated by the same two switches (config
     finale.enabled AND the dashboard toggle): (1) EDI: Accepted 810s not yet invoiced,
     shipped in Finale; (2) non-EDI: shipped Finale sale orders that are not Crstl POs
-    (HD Supply, Special Orders, future OMIS...); (3) when finale.dsd_prefill is on, DSD:
+    (HD Supply, Special Orders, future OMIS...); (3) when the DSD toggle is on, DSD:
     PRO/RTS from newly Accepted 856s onto their open Finale shipments. One pass failing
     never stops the others. An order not yet shipped in Finale is skipped by the engine
     and retried next run."""
@@ -946,7 +949,9 @@ def _finale_poll_passes() -> None:
 
 
 def _dsd_prefill_enabled() -> bool:
-    return bool(_finale_config().get("dsd_prefill"))
+    """The dashboard toggle (Automation panel, default OFF). No config switch: the
+    pass already sits inside the Finale poll, which has its own two gates."""
+    return _job_enabled(AUTO_DSD_SETTING, default="false")
 
 
 def _run_dsd_prefill(live: bool, ids: Optional[list[str]], limit: Optional[int]) -> dict:
@@ -1126,6 +1131,10 @@ AUTOMATION_JOBS = [
     {"id": "netsuite_push", "label": "NetSuite auto-push",   "schedule": "Mon–Fri · 5:00 AM ET", "setting": AUTO_NS_PUSH_SETTING, "default": "false"},
     {"id": "daily_digest",  "label": "Daily digest email",   "schedule": "Mon–Fri · 7:15 AM ET", "setting": AUTO_DIGEST_SETTING,  "default": "true"},
     {"id": "finale_push",   "label": "Finale invoicing",     "schedule": "Every 15 min",         "setting": AUTO_FINALE_SETTING,  "default": "false"},
+    # Not its own scheduler job: it is the third pass of finale_push (runs_with),
+    # so its next run is that job's, and it is silent whenever that job is off.
+    {"id": "finale_dsd",    "label": "DSD pickup numbers → Finale (PRO / RTS)", "schedule": "Every 15 min · inside Finale invoicing",
+     "setting": AUTO_DSD_SETTING, "default": "false", "runs_with": "finale_push"},
 ]
 _JOB_BY_ID = {j["id"]: j for j in AUTOMATION_JOBS}
 
@@ -1652,7 +1661,7 @@ def automation_status() -> dict:
     jobs = [{
         "id": j["id"], "label": j["label"], "schedule": j["schedule"],
         "enabled": _job_enabled(j["setting"], j["default"]),
-        "next_run": next_runs.get(j["id"]),
+        "next_run": next_runs.get(j.get("runs_with") or j["id"]),
         "last_run": last.get(j["id"]),
     } for j in AUTOMATION_JOBS]
     return {"jobs": jobs, "scheduler_running": _scheduler is not None}

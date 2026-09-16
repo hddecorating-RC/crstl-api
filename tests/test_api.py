@@ -487,7 +487,7 @@ def test_automation_status_and_toggle(client):
     resp = client.get("/api/automation")
     assert resp.status_code == 200
     jobs = {j["id"]: j for j in resp.json()["jobs"]}
-    assert set(jobs) == {"daily_refresh", "netsuite_push", "daily_digest", "finale_push"}
+    assert set(jobs) == {"daily_refresh", "netsuite_push", "daily_digest", "finale_push", "finale_dsd"}
     assert jobs["netsuite_push"]["enabled"] is False   # off by default
     assert jobs["daily_digest"]["enabled"] is True
     # toggle push on, verify persisted
@@ -878,22 +878,36 @@ def test_digest_nonedi_window_starts_at_the_last_sent_digest(client):
     assert _last_digest_sent_at()                               # the last actual send, errors ignored
 
 
-def test_dsd_prefill_runs_in_the_finale_job_only_when_configured(monkeypatch):
-    from app.main import _run_finale_push_job
+def test_dsd_prefill_runs_in_the_finale_job_only_when_toggled_on(monkeypatch, client):
+    """The DSD pass is a dashboard toggle (Automation panel, default off) that rides
+    inside the Finale poll; the panel lists it and its next run is the poll's."""
+    from app.main import _run_finale_push_job, AUTO_DSD_SETTING
+    from app import tracking
     monkeypatch.setattr("app.main._finale_enabled", lambda: True)
     with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), \
-         patch("app.main._finale_config", return_value={"enabled": True, "dsd_prefill": True}), \
+         patch("app.main._finale_config", return_value={"enabled": True}), \
+         patch("app.main._run_dsd_prefill") as dsd0:
+        _run_finale_push_job()                                   # default: off
+    dsd0.assert_not_called()
+    r = client.post("/api/automation", json={"job": "finale_dsd", "enabled": True})
+    assert r.status_code == 200 and tracking.get_setting(AUTO_DSD_SETTING) == "true"
+    row = [j for j in client.get("/api/automation").json()["jobs"] if j["id"] == "finale_dsd"][0]
+    assert row["enabled"] is True and "PRO" in row["label"]
+    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), \
+         patch("app.main._finale_config", return_value={"enabled": True}), \
          patch("app.main._run_dsd_prefill") as dsd:
         _run_finale_push_job()
     dsd.assert_called_once_with(True, None, None)
+    client.post("/api/automation", json={"job": "finale_dsd", "enabled": False})
     with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), \
          patch("app.main._finale_config", return_value={"enabled": True}), \
          patch("app.main._run_dsd_prefill") as dsd2:
         _run_finale_push_job()
     dsd2.assert_not_called()
     # a DSD failure is isolated, like the other passes
+    client.post("/api/automation", json={"job": "finale_dsd", "enabled": True})
     with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), \
-         patch("app.main._finale_config", return_value={"enabled": True, "dsd_prefill": True}), \
+         patch("app.main._finale_config", return_value={"enabled": True}), \
          patch("app.main._run_dsd_prefill", side_effect=RuntimeError("boom")), \
          patch("app.tracking.record_job_run") as job:
         _run_finale_push_job()
@@ -924,7 +938,7 @@ def test_run_dsd_prefill_applies_the_shared_guards_to_the_automated_pass(monkeyp
                            "fetch_asn_refs": lambda self, ids: [{"asn_id": i, "po_number": "1", "state": "Accepted",
                                                                  "pro": "3200", "rts": "6100", "pickup_date": ""} for i in ids]})()
     monkeypatch.setattr("app.main._get_client", lambda: crstl)
-    monkeypatch.setattr("app.main._finale_config", lambda: {"enabled": True, "dsd_prefill": True, "go_live_after": "2026-09-15", "max_per_run": 5})
+    monkeypatch.setattr("app.main._finale_config", lambda: {"enabled": True, "go_live_after": "2026-09-15", "max_per_run": 5})
     monkeypatch.setattr("app.main.load_refs", lambda: {"automation": {"created_within_days": 365}})
     with patch("app.finale.FinaleClient.configured", return_value=True), patch("app.finale.FinaleClient") as fc, \
          patch("app.main.push_dsd_prefill", return_value={"mode": "dry", "results": [], "summary": {"candidates": 1}}) as push:
