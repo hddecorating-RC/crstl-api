@@ -140,3 +140,38 @@ def test_carrier_index_reads_the_column_major_party_listing():
         c = FinaleClient()
     with patch.object(c, "_get", return_value=listing):
         assert c.carrier_index() == {"HDOC": "/h/api/partygroup/100021", "Purolator Canada": "/h/api/partygroup/100029"}
+
+
+def test_set_order_user_fields_merges_and_edits_only_when_locked():
+    """Finale REPLACES userFieldDataList: the write resends every existing entry with
+    ours merged in. LOCKED -> edit, write, lock; CREATED -> write; COMPLETED -> refused."""
+    from unittest.mock import MagicMock, patch
+    from app.finale import FinaleClient
+    with patch.dict("os.environ", {"FINALE_ACCOUNT_ID": "h", "FINALE_API_KEY": "k", "FINALE_API_SECRET": "s"}):
+        c = FinaleClient()
+    calls = []
+    def post(url, json=None, timeout=None):
+        calls.append((url.replace(c.HOST, ""), json))
+        r = MagicMock(); r.status_code = 200
+        if url.endswith("/edit"): r.json.return_value = {"orderUrl": "/h/api/order/1", "statusId": "ORDER_CREATED", "actionUrlLock": "/h/api/order/1/lock"}
+        elif url.endswith("/lock"): r.json.return_value = {"orderUrl": "/h/api/order/1", "statusId": "ORDER_LOCKED"}
+        else: r.json.return_value = {"orderUrl": "/h/api/order/1", "statusId": "ORDER_CREATED", "actionUrlLock": "/h/api/order/1/lock", "userFieldDataList": json["userFieldDataList"]}
+        return r
+    c.session.post = post
+    locked = {"orderId": "1", "orderUrl": "/h/api/order/1", "statusId": "ORDER_LOCKED", "actionUrlEdit": "/h/api/order/1/edit",
+              "userFieldDataList": [{"attrName": "integration_ssconnection_100000", "attrValue": "HASH"}, {"attrName": "user_10000", "attrValue": "old"}]}
+    out = c.set_order_user_fields(locked, {"user_10000": "6100994307", "user_10001": "S1"})
+    assert [u for u, _ in calls] == ["/h/api/order/1/edit", "/h/api/order/1", "/h/api/order/1/lock"]
+    assert calls[1][1] == {"orderUrl": "/h/api/order/1", "userFieldDataList": [
+        {"attrName": "integration_ssconnection_100000", "attrValue": "HASH"},        # kept
+        {"attrName": "user_10000", "attrValue": "6100994307"},                        # updated in place
+        {"attrName": "user_10001", "attrValue": "S1"}]}                               # added
+    assert out["statusId"] == "ORDER_LOCKED"
+    calls.clear()
+    created = {**locked, "statusId": "ORDER_CREATED"}
+    c.set_order_user_fields(created, {"user_10000": "x"})
+    assert [u for u, _ in calls] == ["/h/api/order/1"]                                # no edit/lock cycle
+    import pytest
+    with pytest.raises(ValueError):
+        c.set_order_user_fields({**locked, "statusId": "ORDER_COMPLETED"}, {"user_10000": "x"})
+    assert len(calls) == 1                                                            # nothing sent

@@ -354,6 +354,43 @@ class FinaleClient:
         resp.raise_for_status()
         return resp.json()
 
+    def set_order_user_fields(self, order: dict, fields: dict) -> dict:
+        """Write custom (user) fields on a sale order: {attrName: attrValue}. Finale
+        REPLACES userFieldDataList on write, so every existing entry (e.g. the
+        ShipStation connection's hash) is resent with ours merged in. The order is
+        only writable in its edit state: a LOCKED order is edited -> written ->
+        re-locked (proven 2026-09-16 on TEST_0005: the ShipStation connection and the
+        warehouse do this cycle on open DSD orders daily); a CREATED order is written
+        directly. A COMPLETED or CANCELLED order is refused here -- callers must not
+        reopen an order just for a custom field."""
+        status = str(order.get("statusId") or "")
+        if status not in ("ORDER_CREATED", "ORDER_LOCKED"):
+            raise ValueError(f"order {order.get('orderId')} is {status}: custom fields are not editable")
+        merged = [dict(e) for e in (order.get("userFieldDataList") or []) if isinstance(e, dict)]
+        for name, value in fields.items():
+            for e in merged:
+                if e.get("attrName") == name:
+                    e["attrValue"] = value
+                    break
+            else:
+                merged.append({"attrName": name, "attrValue": value})
+        current = order
+        if status == "ORDER_LOCKED":
+            resp = self.session.post(self.HOST + order["actionUrlEdit"], json={}, timeout=self.TIMEOUT)
+            resp.raise_for_status()
+            current = resp.json()
+        try:
+            resp = self.session.post(self.HOST + order["orderUrl"],
+                                     json={"orderUrl": order["orderUrl"], "userFieldDataList": merged}, timeout=self.TIMEOUT)
+            resp.raise_for_status()
+            current = resp.json()
+        finally:
+            if status == "ORDER_LOCKED" and current.get("actionUrlLock"):
+                lock = self.session.post(self.HOST + current["actionUrlLock"], json={}, timeout=self.TIMEOUT)
+                lock.raise_for_status()
+                current = lock.json()
+        return current
+
     # ------------------------------------------------------------ non-EDI reads
     def list_sale_orders(self) -> list[dict]:
         """Every sale order in one listing (orderId, statusId, saleSourceId, orderDate,

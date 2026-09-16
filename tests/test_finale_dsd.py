@@ -40,6 +40,9 @@ class FakeFinale:
             raise RuntimeError("finale 500")
         self.calls.append(("update", url, fields)); return {"shipmentUrl": url, **fields}
     def carrier_index(self): return {"HDOC": "/hddecorating/api/partygroup/100021", "Purolator Canada": "/hddecorating/api/partygroup/100029"}
+    def set_order_user_fields(self, order, fields):
+        if getattr(self, "fail_order", False): raise RuntimeError("order 403")
+        self.calls.append(("order_fields", order.get("orderId"), fields)); return {**order, "userFieldDataList": [{"attrName": k, "attrValue": v} for k, v in fields.items()]}
 
 
 def _run(client, live, asns=(ASN,), existing=None, **kw):
@@ -209,3 +212,57 @@ def test_live_dsd_pass_writes_the_carrier_with_pro_rts_only_when_enabled():
     bad = FakeFinale(shipments=[ship()])
     out3, _ = _run(bad, True, refs={"finale": {"carriers": {"enabled": True, "dsd": "HD Internal"}}})
     assert "carrierPartyUrl" not in bad.calls[-1][2] and "not on Finale's Carriers list" in out3["results"][0]["carrier"]["note"]
+
+
+RTS_ON = {"finale": {"dsd_order_fields": {"enabled": True, "rts": "user_10000"}}}
+
+
+def test_plan_order_and_rts_leaves_the_notes_when_mapped_to_the_order():
+    from app.finale_dsd import plan_order
+    locked = {"orderId": "40864264", "statusId": "ORDER_LOCKED",
+              "userFieldDataList": [{"attrName": "integration_ssconnection_100000", "attrValue": "HASH"}]}
+    assert plan_order(ASN, locked, {"rts": "user_10000"}) == {"fields": {"user_10000": "6100994307"}, "editable": True}
+    have = {**locked, "userFieldDataList": locked["userFieldDataList"] + [{"attrName": "user_10000", "attrValue": "6100994307"}]}
+    assert plan_order(ASN, have, {"rts": "user_10000"})["fields"] == {}
+    done = {**locked, "statusId": "ORDER_COMPLETED"}
+    assert plan_order(ASN, done, {"rts": "user_10000"}) == {"fields": {"user_10000": "6100994307"}, "editable": False}
+    assert plan_order({**ASN, "rts": ""}, locked, {"rts": "user_10000"})["fields"] == {}      # no RTS on the ASN: nothing
+    # the shipment plan drops the notes when the RTS lives on the order
+    p = plan_shipment(ASN, ship(), None, rts_on_order=True)
+    assert p["fields"] == {"trackingCode": "3200416047"}
+    assert plan_shipment(ASN, ship(tracking="3200416047"), None, rts_on_order=True)["action"] == "equal"
+
+
+def test_live_dsd_pass_writes_the_rts_onto_the_order_and_never_a_completed_one():
+    client = FakeFinale(shipments=[ship()])
+    client._order = {**client._order, "statusId": "ORDER_LOCKED",
+                     "userFieldDataList": [{"attrName": "integration_ssconnection_100000", "attrValue": "HASH"}]}
+    out, rec = _run(client, True, refs=RTS_ON)
+    r = out["results"][0]
+    assert r["status"] == "prefilled" and r["order_fields"] == {"fields": {"user_10000": "6100994307"}, "order_status": "ORDER_LOCKED", "note": None, "written": True}
+    assert ("update", URL, {"trackingCode": "3200416047"}) in client.calls               # PRO on the shipment, no notes
+    assert ("order_fields", "40864264", {"user_10000": "6100994307"}) in client.calls
+    rec.assert_called_once()
+    # shipment already has the PRO but the order lacks the RTS: still a write
+    client2 = FakeFinale(shipments=[ship(tracking="3200416047")])
+    client2._order = {**client2._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}
+    out2, _ = _run(client2, True, refs=RTS_ON)
+    assert out2["results"][0]["status"] == "prefilled" and [c[0] for c in client2.calls if c[0] != "get_order"] == ["order_fields"]
+    # completed order: the shipment write still happens, the order is left alone and the row says why
+    client3 = FakeFinale(shipments=[ship()])
+    client3._order = {**client3._order, "statusId": "ORDER_COMPLETED", "userFieldDataList": []}
+    out3, _ = _run(client3, True, refs=RTS_ON)
+    assert out3["results"][0]["status"] == "prefilled" and "order_fields" not in [c[0] for c in client3.calls]
+    assert "not editable" in out3["results"][0]["order_fields"]["note"]
+    # dry: reported, nothing written; off: RTS back in the notes
+    dry = FakeFinale(shipments=[ship()]); dry._order = {**dry._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}
+    out4, rec4 = _run(dry, False, refs=RTS_ON)
+    assert out4["results"][0]["status"] == "would_prefill" and out4["results"][0]["order_fields"]["fields"] == {"user_10000": "6100994307"}
+    assert [c[0] for c in dry.calls] == ["get_order"]; rec4.assert_not_called()
+    off = FakeFinale(shipments=[ship()]); off._order = {**off._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}
+    out5, _ = _run(off, True, refs={"finale": {"dsd_order_fields": {"enabled": False, "rts": "user_10000"}}})
+    assert off.calls[-1] == ("update", URL, {"trackingCode": "3200416047", "publicNotes": "RTS 6100994307"})
+    # an order write failing marks the ASN failed (retried next pass), the shipment write already stands
+    bad = FakeFinale(shipments=[ship()]); bad._order = {**bad._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}; bad.fail_order = True
+    out6, rec6 = _run(bad, True, refs=RTS_ON)
+    assert out6["results"][0]["status"] == "failed" and "order 403" in out6["results"][0]["error"]; rec6.assert_not_called()

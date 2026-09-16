@@ -39,11 +39,12 @@ def rts_note(rts: str) -> str:
     return f"{RTS_PREFIX}{rts}" if rts else ""
 
 
-def plan_shipment(asn: dict, shipment: dict, carrier_url: str | None = None) -> dict:
+def plan_shipment(asn: dict, shipment: dict, carrier_url: str | None = None, rts_on_order: bool = False) -> dict:
     """What to do with ONE Finale shipment for this ASN: {action, fields, reason}.
     action: write | equal | shipped | cancelled. Pure -- no I/O. `carrier_url` is the
     DSD carrier default (HDOC), written alongside PRO/RTS when the shipment's carrier
-    differs, so the warehouse never picks it by hand."""
+    differs, so the warehouse never picks it by hand. `rts_on_order`: the RTS lives in
+    the order's custom field (see plan_order) and is NOT put in the shipment notes."""
     status = str(shipment.get("statusId") or "")
     pro, rts = str(asn.get("pro") or ""), str(asn.get("rts") or "")
     have_pro, have_note = str(shipment.get("trackingCode") or ""), str(shipment.get("publicNotes") or "")
@@ -52,7 +53,7 @@ def plan_shipment(asn: dict, shipment: dict, carrier_url: str | None = None) -> 
         fields["trackingCode"] = pro
     # The warehouse writes the bare number ("6100994307"); we write "RTS 6100994307".
     # Either counts as present -- the number is what matters.
-    if rts and rts not in have_note:
+    if rts and not rts_on_order and rts not in have_note:
         fields["publicNotes"] = rts_note(rts)
     if carrier_url and str(shipment.get("carrierPartyUrl") or "") != carrier_url:
         fields["carrierPartyUrl"] = carrier_url
@@ -67,6 +68,22 @@ def plan_shipment(asn: dict, shipment: dict, carrier_url: str | None = None) -> 
                 "reason": f"already {status.replace('SHIPMENT_', '').lower()} with "
                           f"tracking {have_pro or '-'} (ASN PRO {pro})"}
     return {"action": "write", "fields": fields, "reason": ""}
+
+
+ORDER_EDITABLE = ("ORDER_CREATED", "ORDER_LOCKED")
+
+
+def plan_order(asn: dict, order: dict, mapping: dict) -> dict:
+    """The sales-order custom fields this ASN should set: {attrName: value} for every
+    mapped value (today: rts -> user_10000) that is missing or different on the order,
+    plus `editable` (CREATED/LOCKED -- a completed order is never touched). Pure."""
+    have = {e.get("attrName"): str(e.get("attrValue") or "") for e in (order.get("userFieldDataList") or []) if isinstance(e, dict)}
+    fields = {}
+    for key, attr in (mapping or {}).items():
+        val = str(asn.get(key) or "").strip()
+        if attr and val and have.get(attr, "") != val:
+            fields[attr] = val
+    return {"fields": fields, "editable": str(order.get("statusId") or "") in ORDER_EDITABLE}
 
 
 def select_dsd_asns(states: dict[str, dict], done_ids, *, created_after: str | None,
@@ -127,10 +144,15 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
             carrier = {**carrier, "url": None, "reason": f"could not read Finale's carriers: {exc}"}
         carrier_note = carrier["reason"] or None
     carrier_url = carrier["url"] if carrier["enabled"] else None
+    # Order custom fields (config finale.dsd_order_fields, OFF by default): the RTS
+    # goes on the sales order so the bill of lading can print it. Off = the RTS
+    # stays in the shipment notes as before.
+    of_cfg = fin.get("dsd_order_fields") or {}
+    order_mapping = {k: v for k, v in of_cfg.items() if k in ("rts", "pro") and v} if of_cfg.get("enabled") else {}
 
     existing = tracking.get_finale_shipments([str(a.get("asn_id")) for a in asns])
     results: list[dict] = []
-    writers: list[tuple] = []          # (row, [(shipment, plan)], shipment id) -- the set the cap counts
+    writers: list[tuple] = []          # (row, [(shipment, plan)], shipment id, order, order fields) -- the set the cap counts
     counts = {k: 0 for k in ("prefilled", "would_prefill", "skipped_equal", "skipped_shipped", "skipped_no_order",
                              "skipped_no_shipment", "skipped_not_dsd", "skipped_not_accepted", "skipped_done", "failed")}
 
@@ -164,14 +186,19 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
             shipments = [s for s in client.order_shipments(order) if s.get("statusId") != CANCELLED]
             if not shipments:
                 finish(row, "skipped_no_shipment", error="no shipment on the Finale order yet -- will retry"); continue
-            plans = [(s, plan_shipment(asn, s, carrier_url)) for s in shipments]
+            plans = [(s, plan_shipment(asn, s, carrier_url, rts_on_order=bool(order_mapping.get("rts")))) for s in shipments]
             row["shipments"] = [{"shipment_id_user": s.get("shipmentIdUser") or s.get("shipmentId"),
                                  "status": s.get("statusId"), "action": p["action"], "fields": p["fields"],
                                  "reason": p["reason"]} for s, p in plans]
             writes = [(s, p) for s, p in plans if p["action"] == "write"]
+            op = plan_order(asn, order, order_mapping) if order_mapping else {"fields": {}, "editable": True}
+            order_fields = op["fields"] if op["editable"] else {}
+            row["order_fields"] = {"fields": op["fields"], "order_status": order.get("statusId"),
+                                   "note": None if (op["editable"] or not op["fields"]) else
+                                   f"order is {order.get('statusId')}: custom fields not editable"}
             first = shipments[0]
             sid = str(first.get("shipmentIdUser") or first.get("shipmentId") or "")
-            if not writes:
+            if not writes and not order_fields:
                 # Terminal either way; the receipt (live only) stops the pass re-reading
                 # this ASN every 15 minutes. A dry run leaves no trace.
                 if all(p["action"] == "equal" for _, p in plans):
@@ -183,18 +210,21 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
                 finish(row, status, error=why); continue
             row["shipment_id_user"] = sid
             finish(row, "would_prefill")
-            writers.append((row, writes, sid))
+            writers.append((row, writes, sid, order, order_fields))
         except Exception as exc:   # one bad ASN must not stop the batch
             finish(row, "failed", error=str(exc))
 
     blocked = None
     if max_per_run is not None and len(writers) > max_per_run:
         blocked = f"{len(writers)} shipments to write exceeds max_per_run {max_per_run} -- nothing written"
-    for row, writes, sid in (writers if (live and not blocked) else []):
+    for row, writes, sid, order, order_fields in (writers if (live and not blocked) else []):
         counts["would_prefill"] -= 1
         try:
             for s, p in writes:
                 client.update_shipment(str(s.get("shipmentUrl")), p["fields"])
+            if order_fields:
+                client.set_order_user_fields(order, order_fields)
+                row["order_fields"]["written"] = True
             tracking.record_finale_shipment(row["asn_id"], row["po_number"], sid, row["pro"], row["rts"], "prefilled")
             row["status"] = "prefilled"; counts["prefilled"] += 1
         except Exception as exc:   # one bad ASN must not stop the batch
