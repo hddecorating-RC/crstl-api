@@ -39,9 +39,11 @@ def rts_note(rts: str) -> str:
     return f"{RTS_PREFIX}{rts}" if rts else ""
 
 
-def plan_shipment(asn: dict, shipment: dict) -> dict:
+def plan_shipment(asn: dict, shipment: dict, carrier_url: str | None = None) -> dict:
     """What to do with ONE Finale shipment for this ASN: {action, fields, reason}.
-    action: write | equal | shipped | cancelled. Pure -- no I/O."""
+    action: write | equal | shipped | cancelled. Pure -- no I/O. `carrier_url` is the
+    DSD carrier default (HDOC), written alongside PRO/RTS when the shipment's carrier
+    differs, so the warehouse never picks it by hand."""
     status = str(shipment.get("statusId") or "")
     pro, rts = str(asn.get("pro") or ""), str(asn.get("rts") or "")
     have_pro, have_note = str(shipment.get("trackingCode") or ""), str(shipment.get("publicNotes") or "")
@@ -52,10 +54,12 @@ def plan_shipment(asn: dict, shipment: dict) -> dict:
     # Either counts as present -- the number is what matters.
     if rts and rts not in have_note:
         fields["publicNotes"] = rts_note(rts)
+    if carrier_url and str(shipment.get("carrierPartyUrl") or "") != carrier_url:
+        fields["carrierPartyUrl"] = carrier_url
     if status == CANCELLED:
         return {"action": "cancelled", "fields": {}, "reason": "shipment cancelled"}
     if not fields:
-        return {"action": "equal", "fields": {}, "reason": "PRO/RTS already on the shipment"}
+        return {"action": "equal", "fields": {}, "reason": "PRO/RTS" + ("/carrier" if carrier_url else "") + " already on the shipment"}
     if status not in OPEN:
         # Shipped (or delivered) before the pass got to it: the warehouse's own entry
         # stands; an edit on a shipped shipment is unproven and not worth the risk.
@@ -82,7 +86,8 @@ def select_dsd_asns(states: dict[str, dict], done_ids, *, created_after: str | N
 
 
 def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | None = None,
-                     limit: int | None = None, client=None, max_per_run: int | None = None) -> dict:
+                     limit: int | None = None, client=None, max_per_run: int | None = None,
+                     refs: dict | None = None) -> dict:
     """Write PRO/RTS onto the open Finale shipments of these Accepted DSD ASNs (live)
     or report what would be written (dry). One row per ASN:
       status: prefilled | would_prefill | skipped_equal | skipped_shipped |
@@ -108,6 +113,21 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
         elif live:
             raise FinaleUnavailable("FINALE_* credentials not set")
 
+    # The DSD carrier default (config finale.carriers, OFF by default). Resolved once;
+    # an unknown name is reported on every row and nothing carrier-related is written.
+    from app.finale import wanted_carrier
+    from app.netsuite_payload import load_refs
+    fin = (refs or load_refs()).get("finale") or {}
+    carrier = wanted_carrier(fin, "dsd", {})
+    carrier_note = None
+    if carrier["enabled"] and carrier["name"] and client is not None and asns:
+        try:
+            carrier = wanted_carrier(fin, "dsd", client.carrier_index())
+        except Exception as exc:  # noqa: BLE001 -- PRO/RTS still go on; the carrier just does not
+            carrier = {**carrier, "url": None, "reason": f"could not read Finale's carriers: {exc}"}
+        carrier_note = carrier["reason"] or None
+    carrier_url = carrier["url"] if carrier["enabled"] else None
+
     existing = tracking.get_finale_shipments([str(a.get("asn_id")) for a in asns])
     results: list[dict] = []
     writers: list[tuple] = []          # (row, [(shipment, plan)], shipment id) -- the set the cap counts
@@ -122,7 +142,8 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
     for asn in asns:
         aid = str(asn.get("asn_id") or "?")
         row = {"asn_id": aid, "po_number": asn.get("po_number"), "pro": asn.get("pro"), "rts": asn.get("rts"),
-               "pickup_date": asn.get("pickup_date"), "shipments": [], "error": None}
+               "pickup_date": asn.get("pickup_date"), "shipments": [], "error": None,
+               "carrier": {"wanted": carrier["name"], "enabled": carrier["enabled"], "note": carrier_note}}
         prior = existing.get(aid)
         if prior:
             finish(row, "skipped_done", error=f"already handled ({prior.get('status')}, shipment {prior.get('shipment_id') or '-'})"); continue
@@ -143,7 +164,7 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
             shipments = [s for s in client.order_shipments(order) if s.get("statusId") != CANCELLED]
             if not shipments:
                 finish(row, "skipped_no_shipment", error="no shipment on the Finale order yet -- will retry"); continue
-            plans = [(s, plan_shipment(asn, s)) for s in shipments]
+            plans = [(s, plan_shipment(asn, s, carrier_url)) for s in shipments]
             row["shipments"] = [{"shipment_id_user": s.get("shipmentIdUser") or s.get("shipmentId"),
                                  "status": s.get("statusId"), "action": p["action"], "fields": p["fields"],
                                  "reason": p["reason"]} for s, p in plans]
@@ -154,7 +175,7 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
                 # Terminal either way; the receipt (live only) stops the pass re-reading
                 # this ASN every 15 minutes. A dry run leaves no trace.
                 if all(p["action"] == "equal" for _, p in plans):
-                    status, why = "skipped_equal", "PRO/RTS already on the shipment"
+                    status, why = "skipped_equal", plans[0][1]["reason"]
                 else:
                     status, why = "skipped_shipped", "; ".join(p["reason"] for _, p in plans if p["action"] == "shipped")
                 if live:

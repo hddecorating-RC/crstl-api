@@ -33,7 +33,7 @@ from __future__ import annotations
 from app.netsuite import _load_config, resolve_customer
 from app.netsuite_payload import load_refs
 from app.netsuite_push import _select, eligible_for_push
-from app.finale import API_LOGIN, adoptable_draft, approved_by, created_by, invoice_total
+from app.finale import API_LOGIN, MOVED, adoptable_draft, approved_by, carrier_fix, created_by, invoice_total, wanted_carrier
 
 INVOICE_TYPE = "SALES_INVOICE"
 CANCELLED = "INVOICE_CANCELLED"
@@ -280,6 +280,27 @@ def push_finale_invoices(
     mode = "live" if live else "dry"
     posted = draft = failed = 0
 
+    # Carrier defaults per EDI channel (config finale.carriers, OFF by default): set on
+    # the shipped shipment(s) inside the reopen the engine already does -- dropship's
+    # ShipStation connection ships with no carrier; DSD's is a fallback for a pickup
+    # the DSD pass did not reach. Non-EDI channels never get one (wanted_carrier).
+    fin_cfg = refs.get("finale") or {}
+    carrier_cfg = fin_cfg.get("carriers") or {}
+    carrier_index: dict | None = None
+
+    def carrier_for(channel: str) -> dict:
+        nonlocal carrier_index
+        if not carrier_cfg.get(channel) or client is None:
+            return wanted_carrier(fin_cfg, channel, {})
+        if carrier_index is None:
+            try:
+                carrier_index = client.carrier_index()
+            except Exception as exc:  # noqa: BLE001 -- invoicing goes on; the carrier does not
+                carrier_index = {}
+                return {**wanted_carrier(fin_cfg, channel, {}), "url": None,
+                        "reason": f"could not read Finale's carriers: {exc}"}
+        return wanted_carrier(fin_cfg, channel, carrier_index)
+
     def preflight(client, row, body, prior):
         """The read-only checks that decide whether a row may be written, identical
         for a dry run and a live run: our own receipt, the order's existence, an
@@ -361,6 +382,13 @@ def push_finale_invoices(
             return None
         if mism:
             row["qty_flag"] = "shipped qty != 810: " + "; ".join(mism)
+        want = carrier_for(str(row.get("channel") or ""))
+        if want["name"]:
+            fix = carrier_fix(client.order_shipments(order), want["url"], MOVED) if want["url"] else []
+            row["carrier"] = {"wanted": want["name"], "enabled": want["enabled"],
+                              "shipments": [str(s.get("shipmentIdUser") or s.get("shipmentId")) for s in fix],
+                              "note": want["reason"] or None}
+            row["_carrier_fix"] = [(str(s.get("shipmentUrl")), want["url"]) for s in fix] if want["enabled"] else []
         return order
 
     from app import tracking
@@ -405,6 +433,15 @@ def push_finale_invoices(
         for row, body, order, clean in (writers if (live and not blocked) else []):
             tid = row["transaction_id"]
             row.pop("would", None)
+            # The carrier goes on first, while the order is open (reopened above if
+            # it was completed). A failure here is reported on the row and never
+            # stops the invoice.
+            for surl, curl in row.pop("_carrier_fix", []):
+                try:
+                    client.update_shipment(surl, {"carrierPartyUrl": curl})
+                    row.setdefault("carrier_set", []).append(surl.rsplit("/", 1)[-1])
+                except Exception as exc:  # noqa: BLE001
+                    row["carrier_error"] = str(exc)
             try:
                 adopt = row.pop("adopt", None)
                 adopt_rec = adopt.get("record") if adopt else None
@@ -443,6 +480,8 @@ def push_finale_invoices(
             except Exception as exc:  # noqa: BLE001
                 print(f"WARNING: finale invoices created but tracking failed: {exc}")
 
+    for r in results:
+        r.pop("_carrier_fix", None)
     built = sum(1 for r in results if r.get("status") == "built")
     out = {"mode": mode, "unresolved": unresolved, "results": results,
            "summary": {"built": built, "posted": posted, "draft": draft, "failed": failed, **counts}}

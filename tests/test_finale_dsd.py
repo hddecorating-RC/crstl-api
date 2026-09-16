@@ -39,6 +39,7 @@ class FakeFinale:
         if self.fail_update:
             raise RuntimeError("finale 500")
         self.calls.append(("update", url, fields)); return {"shipmentUrl": url, **fields}
+    def carrier_index(self): return {"HDOC": "/hddecorating/api/partygroup/100021", "Purolator Canada": "/hddecorating/api/partygroup/100029"}
 
 
 def _run(client, live, asns=(ASN,), existing=None, **kw):
@@ -176,3 +177,32 @@ def test_one_failure_does_not_stop_the_batch_and_only_limit_filter():
     assert [r["asn_id"] for r in out["results"]] == ["a1"]
     with pytest.raises(ValueError):
         push_dsd_prefill([ASN], live=False, client=FakeFinale(), limit=0)
+
+
+HDOC = "/hddecorating/api/partygroup/100021"
+CARRIERS_ON = {"finale": {"carriers": {"enabled": True, "dsd": "HDOC", "dropship": "Purolator Canada"}}}
+
+
+def test_plan_adds_the_dsd_carrier_when_it_differs():
+    p = plan_shipment(ASN, ship(), HDOC)
+    assert p["action"] == "write" and p["fields"]["carrierPartyUrl"] == HDOC
+    done = {**ship(tracking="3200416047", notes="RTS 6100994307"), "carrierPartyUrl": HDOC}
+    assert plan_shipment(ASN, done, HDOC)["action"] == "equal"
+    only_carrier = plan_shipment(ASN, {**ship(tracking="3200416047", notes="RTS 6100994307")}, HDOC)
+    assert only_carrier["fields"] == {"carrierPartyUrl": HDOC}
+    assert "carrierPartyUrl" not in plan_shipment(ASN, ship(), None)["fields"]       # defaults off: untouched
+
+
+def test_live_dsd_pass_writes_the_carrier_with_pro_rts_only_when_enabled():
+    client = FakeFinale(shipments=[ship()])
+    out, rec = _run(client, True, refs=CARRIERS_ON)
+    assert out["results"][0]["status"] == "prefilled"
+    assert client.calls[-1] == ("update", URL, {"trackingCode": "3200416047", "publicNotes": "RTS 6100994307", "carrierPartyUrl": HDOC})
+    assert out["results"][0]["carrier"] == {"wanted": "HDOC", "enabled": True, "note": None}
+    off = FakeFinale(shipments=[ship()])
+    out2, _ = _run(off, True, refs={"finale": {"carriers": {"enabled": False, "dsd": "HDOC"}}})
+    assert "carrierPartyUrl" not in off.calls[-1][2] and out2["results"][0]["carrier"]["enabled"] is False
+    # unknown name: PRO/RTS still written, carrier reported, nothing guessed
+    bad = FakeFinale(shipments=[ship()])
+    out3, _ = _run(bad, True, refs={"finale": {"carriers": {"enabled": True, "dsd": "HD Internal"}}})
+    assert "carrierPartyUrl" not in bad.calls[-1][2] and "not on Finale's Carriers list" in out3["results"][0]["carrier"]["note"]

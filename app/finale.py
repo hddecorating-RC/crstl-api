@@ -78,6 +78,39 @@ def invoice_total(invoice: dict) -> float:
     return round(total, 2)
 
 
+EDI_CHANNELS = ("dsd", "dropship")
+
+
+def wanted_carrier(fin_cfg: dict, channel: str, index: dict) -> dict:
+    """The carrier default for this EDI channel: {name, url, enabled, reason}.
+    name is None when the feature has no default for the channel (non-EDI channels
+    never have one); url is None when the name is not on Finale's Carriers list --
+    reported, never guessed. `index` is carrier_index() ({groupName: partyUrl})."""
+    cfg = (fin_cfg or {}).get("carriers") or {}
+    enabled = bool(cfg.get("enabled"))
+    name = str(cfg.get(channel) or "").strip() if channel in EDI_CHANNELS else ""
+    if not name:
+        return {"name": None, "url": None, "enabled": enabled, "reason": f"no carrier default for channel {channel!r}"}
+    url = (index or {}).get(name)
+    return {"name": name, "url": url, "enabled": enabled,
+            "reason": "" if url else f"carrier {name!r} is not on Finale's Carriers list"}
+
+
+def carrier_fix(shipments: list[dict], url: str | None, statuses=None) -> list[dict]:
+    """The shipments (of `statuses`, default any non-cancelled) whose carrier is not
+    `url` -- what a write would touch. Pure."""
+    if not url:
+        return []
+    out = []
+    for s in shipments or []:
+        st = str(s.get("statusId") or "")
+        if st == "SHIPMENT_CANCELLED" or (statuses and st not in statuses):
+            continue
+        if str(s.get("carrierPartyUrl") or "") != url:
+            out.append(s)
+    return out
+
+
 def adoptable_draft(invoices: list[dict]) -> dict | None:
     """The ONE un-posted draft an order carries, if that is all it carries -- an
     invoice a previous run created and then lost track of (the create landed, the
@@ -265,6 +298,17 @@ class FinaleClient:
                 except (TypeError, ValueError):
                     pass
         return qty if seen else None
+
+    def carrier_index(self) -> dict:
+        """{groupName: partyUrl} over every party group -- the Carriers list (Settings >
+        Carriers) is a subset of it, keyed by the exact name shown there. One listing."""
+        rows = to_rows(self._get(f"{self.base_url}/partygroup/"))
+        out: dict = {}
+        for r in rows:
+            name = str(r.get("groupName") or "").strip()
+            if name and r.get("partyUrl") and name not in out:
+                out[name] = r["partyUrl"]
+        return out
 
     def order_shipments(self, order: dict) -> list[dict]:
         """Every shipment on this order (followed via shipmentUrlList), full records."""

@@ -107,3 +107,36 @@ def test_invoice_total_and_approved_by_read_a_finale_invoice():
     assert created_by(inv) == "edward.schiavon" and approved_by(inv) == "api_key_u_blinds"
     assert invoice_total({"invoiceItemList": [{"invoiceItemTypeId": "INV_PROD_ITEM", "unitPrice": "x"}]}) == 0.0
     assert approved_by({"statusId": "INVOICE_IN_PROCESS", "statusIdHistoryList": [{"statusId": None}]}) == ""
+
+
+def test_wanted_carrier_and_carrier_fix():
+    """Carrier defaults resolve by exact Finale name, only for the two EDI channels;
+    an unknown name is reported, never guessed; carrier_fix lists the shipments a
+    write would touch."""
+    from app.finale import carrier_fix, wanted_carrier
+    cfg = {"carriers": {"enabled": True, "dsd": "HDOC", "dropship": "Purolator Canada"}}
+    idx = {"HDOC": "/h/api/partygroup/100021", "Purolator Canada": "/h/api/partygroup/100029"}
+    assert wanted_carrier(cfg, "dropship", idx) == {"name": "Purolator Canada", "url": "/h/api/partygroup/100029", "enabled": True, "reason": ""}
+    assert wanted_carrier(cfg, "dsd", idx)["url"] == "/h/api/partygroup/100021"
+    assert wanted_carrier(cfg, "nonedi", idx)["name"] is None                 # never for a non-EDI channel
+    miss = wanted_carrier(cfg, "dropship", {"HDOC": "/x"})
+    assert miss["url"] is None and "not on Finale's Carriers list" in miss["reason"]
+    assert wanted_carrier({"carriers": {"dsd": "HDOC"}}, "dsd", idx)["enabled"] is False
+    ships = [{"shipmentUrl": "/s/1", "statusId": "SHIPMENT_SHIPPED", "carrierPartyUrl": None},
+             {"shipmentUrl": "/s/2", "statusId": "SHIPMENT_SHIPPED", "carrierPartyUrl": "/h/api/partygroup/100029"},
+             {"shipmentUrl": "/s/3", "statusId": "SHIPMENT_PACKED", "carrierPartyUrl": None},
+             {"shipmentUrl": "/s/4", "statusId": "SHIPMENT_CANCELLED", "carrierPartyUrl": None}]
+    assert [x["shipmentUrl"] for x in carrier_fix(ships, "/h/api/partygroup/100029")] == ["/s/1", "/s/3"]
+    assert [x["shipmentUrl"] for x in carrier_fix(ships, "/h/api/partygroup/100029", ("SHIPMENT_SHIPPED",))] == ["/s/1"]
+    assert carrier_fix(ships, None) == []
+
+
+def test_carrier_index_reads_the_column_major_party_listing():
+    from unittest.mock import patch
+    from app.finale import FinaleClient
+    listing = {"partyId": ["100021", "100029", "100043"], "partyUrl": ["/h/api/partygroup/100021", "/h/api/partygroup/100029", "/h/api/partygroup/100043"],
+               "groupName": ["HDOC", "Purolator Canada", ""]}
+    with patch.dict("os.environ", {"FINALE_ACCOUNT_ID": "h", "FINALE_API_KEY": "k", "FINALE_API_SECRET": "s"}):
+        c = FinaleClient()
+    with patch.object(c, "_get", return_value=listing):
+        assert c.carrier_index() == {"HDOC": "/h/api/partygroup/100021", "Purolator Canada": "/h/api/partygroup/100029"}

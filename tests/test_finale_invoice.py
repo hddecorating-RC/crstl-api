@@ -68,6 +68,13 @@ class FakeFinale:
     def reopen_order(self, order):
         self.calls.append(("reopen", order.get("orderId")))
         self._order = {**order, "statusId": "ORDER_LOCKED"}; return self._order
+    _ships: list = []
+    def order_shipments(self, order): return list(self._ships)
+    def update_shipment(self, url, fields):
+        self.calls.append(("update_shipment", url, fields)); return {"shipmentUrl": url, **fields}
+    def carrier_index(self):
+        self.calls.append(("carrier_index",))
+        return {"HDOC": "/hddecorating/api/partygroup/100021", "Purolator Canada": "/hddecorating/api/partygroup/100029"}
 
 
 @pytest.fixture(autouse=True)
@@ -457,3 +464,59 @@ def test_two_live_invoices_on_one_order_are_summed_and_named():
     ext = out["results"][0]["external"]
     assert ext["invoice_id_user"] == "PO1-1, PO1-2" and ext["finale_total"] == 22.47 and ext["delta"] == 1.05
     assert rec_inv.call_args.args[5] == "external" and rec_inv.call_args.kwargs["finale_total"] == 22.47
+
+
+PUROLATOR = "/hddecorating/api/partygroup/100029"
+CARRIERS_ON = {"finale": {**REFS["finale"], "auto_reopen": True,
+                          "carriers": {"enabled": True, "dsd": "HDOC", "dropship": "Purolator Canada"}}}
+SHIPPED_NO_CARRIER = {"shipmentUrl": "/hddecorating/api/shipment/100603", "shipmentIdUser": "PO1-1",
+                      "statusId": "SHIPMENT_SHIPPED", "carrierPartyUrl": None}
+
+
+def test_dropship_carrier_is_set_inside_the_reopen_before_invoicing():
+    """A dropship order the ShipStation connection shipped (no carrier) and completed:
+    reopen -> carrier on the shipped shipment -> invoice -> post -> re-complete. One
+    extra write in a window the engine already opens."""
+    client = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    client._order = {**client._order, "statusId": "ORDER_COMPLETED"}
+    client._ships = [SHIPPED_NO_CARRIER]
+    out, rec_inv, _ = _live(client, refs=CARRIERS_ON)
+    r = out["results"][0]
+    assert r["status"] == "posted" and r["carrier_set"] == ["100603"]
+    assert r["carrier"] == {"wanted": "Purolator Canada", "enabled": True, "shipments": ["PO1-1"], "note": None}
+    assert [c[0] for c in client.calls] == ["get_order", "reopen", "carrier_index", "update_shipment", "create", "complete", "complete_order"]
+    assert client.calls[3] == ("update_shipment", "/hddecorating/api/shipment/100603", {"carrierPartyUrl": PUROLATOR})
+    # already right: no write
+    ok = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    ok._ships = [{**SHIPPED_NO_CARRIER, "carrierPartyUrl": PUROLATOR}]
+    out2, _, _ = _live(ok, refs=CARRIERS_ON)
+    assert "update_shipment" not in [c[0] for c in ok.calls] and out2["results"][0]["carrier"]["shipments"] == []
+
+
+def test_carrier_defaults_dry_run_reports_and_off_or_unknown_never_writes():
+    dry = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0}); dry._ships = [SHIPPED_NO_CARRIER]
+    with patch("app.tracking.get_finale_invoices", return_value={}), patch("app.tracking.record_finale_invoice") as rec:
+        out = push_finale_invoices([INV], PO_MAP, live=False, refs=CARRIERS_ON, client=dry)
+    r = out["results"][0]
+    assert r["would"] == "posted" and r["carrier"]["shipments"] == ["PO1-1"] and "_carrier_fix" not in r
+    assert "update_shipment" not in [c[0] for c in dry.calls]; rec.assert_not_called()
+    off = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0}); off._ships = [SHIPPED_NO_CARRIER]
+    out2, _, _ = _live(off, refs={"finale": {**REFS["finale"], "carriers": {"enabled": False, "dropship": "Purolator Canada"}}})
+    assert out2["results"][0]["status"] == "posted" and "update_shipment" not in [c[0] for c in off.calls]
+    assert out2["results"][0]["carrier"]["enabled"] is False and out2["results"][0]["carrier"]["shipments"] == ["PO1-1"]
+    unknown = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0}); unknown._ships = [SHIPPED_NO_CARRIER]
+    out3, _, _ = _live(unknown, refs={"finale": {**REFS["finale"], "carriers": {"enabled": True, "dropship": "Purolator"}}})
+    assert out3["results"][0]["status"] == "posted" and "update_shipment" not in [c[0] for c in unknown.calls]
+    assert "not on Finale's Carriers list" in out3["results"][0]["carrier"]["note"]
+    none = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0}); none._ships = [SHIPPED_NO_CARRIER]
+    out4, _, _ = _live(none, refs=REFS)                                             # no carriers block at all
+    assert "carrier" not in out4["results"][0] and "carrier_index" not in [c[0] for c in none.calls]
+
+
+def test_carrier_write_failure_is_reported_and_the_invoice_still_posts():
+    client = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0}); client._ships = [SHIPPED_NO_CARRIER]
+    def boom(url, fields): raise RuntimeError("403 can only edit shipments for open orders")
+    client.update_shipment = boom
+    out, _, _ = _live(client, refs=CARRIERS_ON)
+    r = out["results"][0]
+    assert r["status"] == "posted" and "403" in r["carrier_error"] and "carrier_set" not in r
