@@ -57,6 +57,9 @@ class ShipStationClient:
 
     def mark_as_shipped(self, order_id: int, fields: dict) -> dict:
         """POST /orders/markasshipped -- no label, no notifications. The only write."""
+        if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("PYTEST_RUNNING"):
+            # Belt and braces after 2026-09-16: a test must never mark a real order.
+            raise RuntimeError("refusing to write to ShipStation from inside a test run")
         body = {"orderId": order_id, "notifyCustomer": False, "notifySalesChannel": False, **fields}
         r = self.session.post(self.BASE + "/orders/markasshipped", json=body, timeout=self.TIMEOUT)
         r.raise_for_status()

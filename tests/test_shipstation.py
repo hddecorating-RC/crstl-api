@@ -107,7 +107,10 @@ def test_client_mark_as_shipped_payload_and_paging():
         r.json.return_value = {"orders": [{"orderId": 1, "orderStatus": params["orderStatus"]}], "pages": 2 if params["page"] == 1 else 2}
         return r
     c.session.post, c.session.get = post, get
-    c.mark_as_shipped(323160921, {"carrierCode": "other", "trackingNumber": "6100994307", "shipDate": "2026-09-16"})
+    with pytest.raises(RuntimeError):                                              # the in-test guard, always on under pytest
+        c.mark_as_shipped(323160921, {"carrierCode": "other"})
+    with patch.dict("os.environ", {"PYTEST_CURRENT_TEST": "", "PYTEST_RUNNING": ""}):  # lifted only to exercise the payload
+        c.mark_as_shipped(323160921, {"carrierCode": "other", "trackingNumber": "6100994307", "shipDate": "2026-09-16"})
     assert posts == [("https://ssapi.shipstation.com/orders/markasshipped",
                       {"orderId": 323160921, "notifyCustomer": False, "notifySalesChannel": False,
                        "carrierCode": "other", "trackingNumber": "6100994307", "shipDate": "2026-09-16"})]
