@@ -994,6 +994,40 @@ def test_digest_reads_a_hand_made_invoice_before_the_poll_receipts_it(client, mo
     assert heads[-2:] == ["Finale invoice", "Finale vs 810"]
 
 
+def test_digest_backfills_a_receipt_from_before_the_reconciliation_columns(client, monkeypatch):
+    """A 'posted' receipt written before who/total/delta existed is completed once
+    from the live invoice, so the Finale sheet never shows a blank app-made row."""
+    from app.main import _cache, _send_daily_digest
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    monkeypatch.setenv("NETSUITE_ACCOUNT_ID", "734463")
+    invs = _so_ready_invoices()[:1]
+    tracking.record_events(["so-1"], "netsuite")
+    tracking.record_finale_invoice("so-1", "PO1", "100407", "/i/100407", "PO1-1", "posted")      # old shape: no totals
+    class FakeFinale:
+        reads = 0
+        def get_invoice(self, url):
+            FakeFinale.reads += 1
+            return {"statusId": "INVOICE_APPROVED",
+                    "invoiceItemList": [{"invoiceItemTypeId": "INV_PROD_ITEM", "unitPrice": 100.0, "quantity": 1},
+                                        {"invoiceItemTypeId": "INV_PROMOTION_ADJ", "amount": -5.19},
+                                        {"invoiceItemTypeId": "INV_SALES_TAX", "amount": 12.33}],
+                    "statusIdHistoryList": [{"statusId": None, "userLoginUrl": "/x/api/userlogin/API_KEY_U_BLINDS"}]}
+    for _ in range(2):
+        with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail, \
+             patch("app.main._finale_enabled", return_value=True), \
+             patch("app.main._finale_floor", return_value="2026-09-15"), \
+             patch("app.finale.FinaleClient") as FC:
+            FC.configured.return_value = True; FC.return_value = FakeFinale()
+            _send_daily_digest()
+    row = next(r for r in _finale_sheet(mail) if r[0] == "INV-SO-1")
+    assert row[2:8] == ["PO1-1", "API_KEY_U_BLINDS", "posted", 107.14, 107.14, "tied"]
+    rec = tracking.get_finale_invoices(["so-1"])["so-1"]
+    assert rec["finale_total"] == 107.14 and rec["delta"] == 0.0 and rec["created_by"] == "API_KEY_U_BLINDS"
+    assert FakeFinale.reads == 1                                   # filled once; a complete receipt is not re-read
+
+
 def test_digest_drops_a_held_draft_once_someone_posts_it(client, monkeypatch):
     from app.main import _cache, _send_daily_digest
     from app import tracking

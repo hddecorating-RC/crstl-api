@@ -1109,7 +1109,7 @@ def _finale_reconciliation(invoices: list[dict], stale_days) -> dict:
       drafts  -- invoices we hold un-posted (re-read first: one posted by hand since
                  is receipted as posted and drops off).
       by_tx   -- the Finale view per transaction (receipt or dry-run external)."""
-    from app.finale import FinaleClient, approved_by
+    from app.finale import API_LOGIN, FinaleClient, approved_by, created_by, invoice_total
     floor = _finale_floor()
     if not floor:
         return dict(_EMPTY_RECON)
@@ -1120,20 +1120,34 @@ def _finale_reconciliation(invoices: list[dict], stale_days) -> dict:
     ids = [str(i["transaction_id"]) for i in scoped]
     receipts = tracking.get_finale_invoices(ids)
     configured = FinaleClient.configured()
+    hd_total = {str(i["transaction_id"]): i.get("total_amount") for i in scoped}
     if configured:
         client = FinaleClient()
+        # Re-read (bounded) the receipts that need it: a draft we hold, to see if it
+        # was posted by hand since; and a receipt from before the reconciliation
+        # columns existed (no total), to fill in who / total / delta once.
         for tx, rec in list(receipts.items())[:50]:
-            if rec.get("status") != "draft" or not rec.get("invoice_url"):
+            draft = rec.get("status") == "draft"
+            if not rec.get("invoice_url") or not (draft or rec.get("finale_total") is None):
                 continue
             try:
                 live = client.get_invoice(rec["invoice_url"])
             except Exception:  # noqa: BLE001 -- a read failure leaves the receipt as it was
                 continue
-            if live.get("statusId") == "INVOICE_APPROVED":
+            new = dict(rec)
+            if draft and live.get("statusId") == "INVOICE_APPROVED":
+                new["status"] = "posted"
+                new["created_by"] = approved_by(live) or rec.get("created_by")
+            if rec.get("finale_total") is None:
+                new["finale_total"] = invoice_total(live)
+                ht = hd_total.get(tx)
+                new["delta"] = None if ht is None else round(new["finale_total"] - float(ht), 2)
+                new["created_by"] = new.get("created_by") or created_by(live) or API_LOGIN
+            if new != rec:
                 tracking.record_finale_invoice(tx, rec.get("po_number"), rec.get("invoice_id"), rec.get("invoice_url"),
-                                               rec.get("invoice_id_user"), "posted", created_by=approved_by(live) or rec.get("created_by"),
-                                               finale_total=rec.get("finale_total"), delta=rec.get("delta"))
-                receipts[tx] = {**rec, "status": "posted", "created_by": approved_by(live) or rec.get("created_by")}
+                                               rec.get("invoice_id_user"), new["status"], created_by=new.get("created_by"),
+                                               finale_total=new.get("finale_total"), delta=new.get("delta"))
+                receipts[tx] = new
     missing_ids = [tx for tx in ids if tx not in receipts]
     reasons: dict[str, dict] = {}
     err = None if configured else "Finale not configured"
