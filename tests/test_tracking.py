@@ -217,3 +217,36 @@ def test_finale_shipment_receipts_round_trip_and_unprefilled(db_path):
     assert set(rows) == {"a1"} and rows["a1"]["status"] == "skipped_equal" and rows["a1"]["pro"] == "3200416047"
     assert tracking.get_unprefilled_asn_ids(["a1", "a2"]) == ["a2"]
     assert tracking.get_unprefilled_asn_ids([]) == [] and tracking.get_finale_shipments([]) == {}
+
+
+def test_finale_receipt_carries_creator_total_and_delta(db_path):
+    """A receipt records WHO made the Finale invoice, its total and the delta vs the
+    810 -- for hand-made ('external') invoices as much as ours -- and older rows
+    (no such columns) still read back."""
+    tracking.record_finale_invoice("T1", "PO1", "100405", "/i/100405", "PO1-1", "external",
+                                   created_by="edward.schiavon", finale_total=82.49, delta=-0.5)
+    tracking.record_finale_invoice("T2", "PO2", "100406", "/i/100406", "PO2-1", "posted")
+    got = tracking.get_finale_invoices(["T1", "T2"])
+    assert got["T1"]["status"] == "external" and got["T1"]["created_by"] == "edward.schiavon"
+    assert got["T1"]["finale_total"] == 82.49 and got["T1"]["delta"] == -0.5
+    assert got["T2"]["created_by"] is None and got["T2"]["delta"] is None
+    recent = {r["key"]: r for r in tracking.recent_finale_invoices("2000-01-01")}
+    assert recent["T1"]["delta"] == -0.5 and recent["T2"]["status"] == "posted"
+    # an upsert keeps the receipt keyed on the transaction and refreshes the fields
+    tracking.record_finale_invoice("T1", "PO1", "100405", "/i/100405", "PO1-1", "posted", created_by="x")
+    assert tracking.get_finale_invoices(["T1"])["T1"]["status"] == "posted"
+
+
+def test_finale_receipts_table_migrates_from_the_old_shape(tmp_path, monkeypatch):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    monkeypatch.setenv("TRACKING_DB", path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE finale_invoices (transaction_id TEXT PRIMARY KEY, po_number TEXT, invoice_id TEXT, "
+                     "invoice_url TEXT, invoice_id_user TEXT, status TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        conn.execute("INSERT INTO finale_invoices VALUES ('T0','PO0','1','/i/1','PO0-1','posted','2026-09-15T00:00:00')")
+    init_db()
+    assert tracking.get_finale_invoices(["T0"])["T0"] == {"po_number": "PO0", "invoice_id": "1", "invoice_url": "/i/1",
+                                                          "invoice_id_user": "PO0-1", "status": "posted",
+                                                          "updated_at": "2026-09-15T00:00:00", "created_by": None,
+                                                          "finale_total": None, "delta": None}

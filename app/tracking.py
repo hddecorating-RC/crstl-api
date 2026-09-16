@@ -63,7 +63,10 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
             invoice_url     TEXT,
             invoice_id_user TEXT,
             status          TEXT NOT NULL,
-            updated_at      TEXT NOT NULL
+            updated_at      TEXT NOT NULL,
+            created_by      TEXT,
+            finale_total    REAL,
+            delta           REAL
         );
         CREATE TABLE IF NOT EXISTS finale_shipments (
             asn_id          TEXT PRIMARY KEY,
@@ -75,6 +78,13 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
             updated_at      TEXT NOT NULL
         );
     """)
+    # Reconciliation columns added 2026-09-16 (who made the Finale invoice, its total,
+    # the delta vs the 810): a DB from before then has the table without them.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(finale_invoices)")}
+    for col, typ in (("created_by", "TEXT"), ("finale_total", "REAL"), ("delta", "REAL")):
+        if col not in have:
+            conn.execute(f"ALTER TABLE finale_invoices ADD COLUMN {col} {typ}")
+    conn.commit()
 
     if row is None:
         conn.executescript("""
@@ -345,11 +355,15 @@ def get_netsuite_ids(external_ids: list[str]) -> dict[str, str]:
 
 
 def record_finale_invoice(transaction_id: str, po_number: str | None, invoice_id: str | None,
-                          invoice_url: str | None, invoice_id_user: str | None, status: str) -> None:
-    """Remember the Finale invoice we created for this Crstl transaction: its id/url
-    and whether it was posted ('posted') or left as a draft for review ('draft').
-    Keyed on transaction_id so a re-run sees it and never creates a second invoice
-    (Finale's collection POST always creates -- proven 2026-09-15). Best-effort."""
+                          invoice_url: str | None, invoice_id_user: str | None, status: str,
+                          created_by: str | None = None, finale_total: float | None = None,
+                          delta: float | None = None) -> None:
+    """Remember the Finale invoice for this Crstl transaction: its id/url and status --
+    'posted' / 'draft' when we created it, 'external' when someone else had already
+    invoiced the order (by hand, or another integration) -- plus who created it, its
+    total and the delta vs the 810 total, so the digest can reconcile all three
+    systems. Keyed on transaction_id so a re-run sees it and never creates a second
+    invoice (Finale's collection POST always creates -- proven 2026-09-15). Best-effort."""
     if not transaction_id:
         return
     now = datetime.now(timezone.utc).isoformat()
@@ -358,12 +372,15 @@ def record_finale_invoice(transaction_id: str, po_number: str | None, invoice_id
             with conn:
                 conn.execute(
                     "INSERT INTO finale_invoices (transaction_id, po_number, invoice_id, invoice_url, "
-                    "invoice_id_user, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "invoice_id_user, status, updated_at, created_by, finale_total, delta) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(transaction_id) DO UPDATE SET po_number = excluded.po_number, "
                     "invoice_id = excluded.invoice_id, invoice_url = excluded.invoice_url, "
                     "invoice_id_user = excluded.invoice_id_user, status = excluded.status, "
-                    "updated_at = excluded.updated_at",
-                    (transaction_id, po_number, invoice_id, invoice_url, invoice_id_user, status, now))
+                    "updated_at = excluded.updated_at, created_by = excluded.created_by, "
+                    "finale_total = excluded.finale_total, delta = excluded.delta",
+                    (transaction_id, po_number, invoice_id, invoice_url, invoice_id_user, status, now,
+                     created_by, finale_total, delta))
     except Exception as exc:
         print(f"ERROR: finale_invoices write failed for {transaction_id!r}: {exc}")
 
@@ -417,6 +434,15 @@ def get_unprefilled_asn_ids(candidate_ids: list[str]) -> list[str]:
     return [aid for aid in candidate_ids if aid not in done]
 
 
+_FINALE_COLS = ("transaction_id, po_number, invoice_id, invoice_url, invoice_id_user, status, updated_at, "
+                "created_by, finale_total, delta")
+
+
+def _finale_row(r) -> dict:
+    return {"po_number": r[1], "invoice_id": r[2], "invoice_url": r[3], "invoice_id_user": r[4],
+            "status": r[5], "updated_at": r[6], "created_by": r[7], "finale_total": r[8], "delta": r[9]}
+
+
 def get_finale_invoices(transaction_ids: list[str]) -> dict[str, dict]:
     """{transaction_id: {invoice_id, invoice_url, invoice_id_user, status, updated_at}}
     for the transactions we have created a Finale invoice for. Drives idempotency
@@ -428,10 +454,8 @@ def get_finale_invoices(transaction_ids: list[str]) -> dict[str, dict]:
         with contextlib.closing(_connect()) as conn:
             placeholders = ",".join("?" * len(ids))
             rows = conn.execute(
-                f"SELECT transaction_id, po_number, invoice_id, invoice_url, invoice_id_user, status, updated_at "
-                f"FROM finale_invoices WHERE transaction_id IN ({placeholders})", ids).fetchall()
-        return {r[0]: {"po_number": r[1], "invoice_id": r[2], "invoice_url": r[3],
-                       "invoice_id_user": r[4], "status": r[5], "updated_at": r[6]} for r in rows}
+                f"SELECT {_FINALE_COLS} FROM finale_invoices WHERE transaction_id IN ({placeholders})", ids).fetchall()
+        return {r[0]: _finale_row(r) for r in rows}
     except Exception as exc:
         print(f"WARNING: finale_invoices batch read failed: {exc}")
         return {}
@@ -463,10 +487,9 @@ def recent_finale_invoices(since_iso: str) -> list[dict]:
     try:
         with contextlib.closing(_connect()) as conn:
             rows = conn.execute(
-                "SELECT transaction_id, po_number, invoice_id, invoice_url, invoice_id_user, status, updated_at "
-                "FROM finale_invoices WHERE updated_at >= ? ORDER BY updated_at DESC", (since_iso,)).fetchall()
-        return [{"key": r[0], "po_number": r[1], "invoice_id": r[2], "invoice_url": r[3],
-                 "invoice_id_user": r[4], "status": r[5], "updated_at": r[6]} for r in rows]
+                f"SELECT {_FINALE_COLS} FROM finale_invoices WHERE updated_at >= ? ORDER BY updated_at DESC",
+                (since_iso,)).fetchall()
+        return [{"key": r[0], **_finale_row(r)} for r in rows]
     except Exception as exc:
         print(f"WARNING: finale_invoices recent read failed: {exc}")
         return []

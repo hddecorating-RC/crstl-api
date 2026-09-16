@@ -33,7 +33,7 @@ from __future__ import annotations
 from app.netsuite import _load_config, resolve_customer
 from app.netsuite_payload import load_refs
 from app.netsuite_push import _select, eligible_for_push
-from app.finale import API_LOGIN, adoptable_draft, created_by
+from app.finale import API_LOGIN, adoptable_draft, approved_by, created_by, invoice_total
 
 INVOICE_TYPE = "SALES_INVOICE"
 CANCELLED = "INVOICE_CANCELLED"
@@ -161,6 +161,25 @@ def build_finale_invoice(invoice: dict, po_entry: dict | None, product_index: di
     }
 
 
+def external_view(live_invoices: list[dict], hd_total) -> dict:
+    """What is already on the order, whoever keyed it: ids, creator (of the first),
+    posted-or-draft, the summed total of every live invoice and its delta vs the
+    810 total. The digest's 'does Finale tie to the 810' answer for invoices we
+    did not create."""
+    first = live_invoices[0]
+    total = round(sum(invoice_total(i) for i in live_invoices), 2)
+    posted = all(i.get("statusId") == "INVOICE_APPROVED" for i in live_invoices)
+    return {
+        "invoice_id": first.get("invoiceId"),
+        "invoice_url": first.get("invoiceUrl"),
+        "invoice_id_user": ", ".join(str(i.get("invoiceIdUser") or i.get("invoiceId")) for i in live_invoices),
+        "created_by": created_by(first) or approved_by(first),
+        "finale_status": "posted" if posted else "draft",
+        "finale_total": total,
+        "delta": None if hd_total is None else round(total - float(hd_total), 2),
+    }
+
+
 def qty_check(prod_lines: list[dict], shipped: dict | None) -> tuple[list[str], bool]:
     """(mismatch messages, verified). Unverified (no moved shipment) is reported
     separately from a mismatch so the caller can hold the invoice without calling
@@ -268,7 +287,7 @@ def push_finale_invoices(
         status and returns None when the row must not be written; otherwise sets
         qty_flag and returns the order."""
         tid = row["transaction_id"]
-        if prior and prior.get("status") in ("draft", "posted"):
+        if prior and prior.get("status") in ("draft", "posted", "external"):
             row["status"] = "skipped_exists"
             row["invoice_id"], row["invoice_url"], row["invoice_id_user"] = prior.get("invoice_id"), prior.get("invoice_url"), prior.get("invoice_id_user")
             row["error"] = f"already invoiced in Finale ({prior.get('invoice_id_user') or prior.get('invoice_id')}, {prior.get('status')})"
@@ -307,16 +326,29 @@ def push_finale_invoices(
         if live_invoices:
             orphan = adoptable_draft(live_invoices)
             if orphan is None:
+                # Someone else already invoiced this order (by hand, or another
+                # integration). Not an error and not a gap: read what is there -- who,
+                # how much, and the delta vs the 810 -- so the digest can reconcile it.
+                # A live run receipts it as 'external' (+ the finale event) so the poll
+                # stops re-reading it every 15 minutes; a dry run only reports.
                 row["status"] = "skipped_exists"
                 row["error"] = ("order already carries invoice "
                                 + ", ".join(str(i.get("invoiceIdUser") or i.get("invoiceId")) for i in live_invoices))
                 counts["skipped_exists"] += 1
+                row["external"] = external_view(live_invoices, row.get("hd_total"))
+                if live:
+                    ext = row["external"]
+                    tracking.record_finale_invoice(tid, str(row["po_number"]), ext["invoice_id"], ext["invoice_url"],
+                                                   ext["invoice_id_user"], "external", created_by=ext["created_by"],
+                                                   finale_total=ext["finale_total"], delta=ext["delta"])
+                    external_ids.append(tid)
                 return None
             # A lone un-posted draft with no receipt: ours from a half-failed run, or
             # keyed by hand. Adopt it instead of creating a second one -- posted below
             # when it is ours and the build is clean, else receipted as a draft to review.
             row["adopt"] = {"invoice_id": orphan.get("invoiceId"), "invoice_url": orphan.get("invoiceUrl"),
-                            "invoice_id_user": orphan.get("invoiceIdUser"), "ours": created_by(orphan) == API_LOGIN}
+                            "invoice_id_user": orphan.get("invoiceIdUser"), "ours": created_by(orphan) == API_LOGIN,
+                            "record": orphan}
             row["adopted"] = orphan.get("invoiceIdUser") or orphan.get("invoiceId")
         mism, verified = qty_check([l for l in body["invoiceItemList"] if l["invoiceItemTypeId"] == "INV_PROD_ITEM"],
                                    client.shipment_qty_for_order(order))
@@ -350,6 +382,7 @@ def push_finale_invoices(
         # "prove the first run" preview must not overstate.
         existing = tracking.get_finale_invoices([r["transaction_id"] for r, _ in prepared])
         created_ids: list[str] = []
+        external_ids: list[str] = []
         writers: list[tuple[dict, dict, dict, bool]] = []
         for row, body in prepared:
             tid = row["transaction_id"]
@@ -374,6 +407,7 @@ def push_finale_invoices(
             row.pop("would", None)
             try:
                 adopt = row.pop("adopt", None)
+                adopt_rec = adopt.get("record") if adopt else None
                 if adopt:
                     row["invoice_id"], row["invoice_url"], row["invoice_id_user"] = adopt["invoice_id"], adopt["invoice_url"], adopt["invoice_id_user"]
                 else:
@@ -395,15 +429,17 @@ def push_finale_invoices(
                 else:
                     row["status"] = "draft"; draft += 1
                 tracking.record_finale_invoice(tid, str(row["po_number"]), row["invoice_id"], row["invoice_url"],
-                                               row["invoice_id_user"], row["status"])
+                                               row["invoice_id_user"], row["status"],
+                                               created_by=(created_by(adopt_rec) if adopt_rec is not None else API_LOGIN),
+                                               finale_total=row.get("total"), delta=row.get("delta"))
                 created_ids.append(tid)
             except Exception as exc:   # one bad invoice must not stop the batch
                 row["status"] = "failed"
                 row["error"] = str(exc)
                 failed += 1
-        if live and created_ids:
+        if live and (created_ids or external_ids):
             try:
-                tracking.record_events(created_ids, "finale")
+                tracking.record_events(created_ids + external_ids, "finale")
             except Exception as exc:  # noqa: BLE001
                 print(f"WARNING: finale invoices created but tracking failed: {exc}")
 

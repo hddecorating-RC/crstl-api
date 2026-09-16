@@ -88,3 +88,22 @@ def test_configured_reports_whether_the_report_can_ask_finale(monkeypatch):
     for k in ("FINALE_ACCOUNT_ID", "FINALE_API_KEY", "FINALE_API_SECRET"):
         monkeypatch.setenv(k, "x")
     assert FinaleClient.configured() is True
+
+
+def test_invoice_total_and_approved_by_read_a_finale_invoice():
+    """The money on an existing Finale invoice (any creator): product lines are
+    unitPrice x quantity, tax/promo lines carry an amount. approved_by is the login
+    on the INVOICE_APPROVED history entry; created_by the first entry."""
+    from app.finale import approved_by, created_by, invoice_total
+    inv = {"statusId": "INVOICE_APPROVED",
+           "invoiceItemList": [
+               {"invoiceItemTypeId": "INV_PROD_ITEM", "unitPrice": 38.5, "quantity": 2},
+               {"invoiceItemTypeId": "INV_SALES_TAX", "amount": 9.49},
+               {"invoiceItemTypeId": "INV_PROMOTION_ADJ", "amount": -4}],
+           "statusIdHistoryList": [
+               {"statusId": None, "txStamp": 1, "userLoginUrl": "/hddecorating/api/userlogin/edward.schiavon"},
+               {"statusId": "INVOICE_APPROVED", "txStamp": 2, "userLoginUrl": "/hddecorating/api/userlogin/api_key_u_blinds"}]}
+    assert invoice_total(inv) == 82.49
+    assert created_by(inv) == "edward.schiavon" and approved_by(inv) == "api_key_u_blinds"
+    assert invoice_total({"invoiceItemList": [{"invoiceItemTypeId": "INV_PROD_ITEM", "unitPrice": "x"}]}) == 0.0
+    assert approved_by({"statusId": "INVOICE_IN_PROCESS", "statusIdHistoryList": [{"statusId": None}]}) == ""

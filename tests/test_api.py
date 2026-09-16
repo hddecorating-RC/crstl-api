@@ -406,8 +406,10 @@ def test_explicit_id_selection_is_honoured_even_for_a_draft(client):
 
 def _so_ready_invoices():
     """Two Accepted, on/after-cutoff, mappable dropship invoices for the SO digest."""
+    from datetime import datetime, timezone
     base = {"status": "Accepted", "due_date": "", "store": None, "province": "ON",
-            "product": "Drape Panel", "invoice_date": "2026-09-12"}
+            "product": "Drape Panel", "invoice_date": "2026-09-12",
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}   # inside the Finale floor
     return [
         {**base, "transaction_id": "so-1", "source_document_id": "sd1", "invoice_number": "INV-SO-1",
          "po_number": "PO1", "subtotal": 100.0, "allowance_amount": 5.19, "discount_amount": 0.0,
@@ -686,6 +688,8 @@ def test_so_digest_reports_finale_line_and_holds(client, monkeypatch):
     body = mail.call_args.kwargs["body_html"]
     assert "Finale:" in body and "0 invoice(s) posted" in body and "1 held as draft" in body
     assert "PO-1-1" in body                                   # the draft is named under Issues
+    assert "INV-SO-2" in body.split("not invoiced in Finale")[-1]   # the other SO has no Finale invoice at all
+    assert "2 issue(s)" in mail.call_args.kwargs["subject"]
 
 
 def test_so_digest_workbook_adds_finale_column(monkeypatch):
@@ -697,12 +701,19 @@ def test_so_digest_workbook_adds_finale_column(monkeypatch):
     buf = io.BytesIO(); wb.save(buf)
     monkeypatch.setattr("app.main._workbook_for", lambda invs: buf.getvalue())
     out = _so_digest_workbook([{"invoice_number": "INV-SO-1"}], {"INV-SO-1": ("2026-09-15", "")},
-                              {"INV-SO-1": ("PO-1-1", "posted")})
+                              {"INV-SO-1": ("PO-1-1", "posted", "API_KEY_U_BLINDS", 0.0)})
     ws2 = load_workbook(io.BytesIO(out))["Invoices"]
     headers = [c.value for c in ws2[1]]
-    assert headers[-2:] == ["Netsuite SO created", "Finale invoice"]
-    assert ws2.cell(row=2, column=len(headers)).value == "PO-1-1 (posted)"
+    assert headers[-3:] == ["Netsuite SO created", "Finale invoice", "Finale vs 810"]
+    assert ws2.cell(row=2, column=len(headers) - 1).value == "PO-1-1 (posted)"
+    assert ws2.cell(row=2, column=len(headers)).value == "tied"
     assert ws2.auto_filter.ref.endswith(f"{get_column_letter(len(headers))}2")
+    # keyed by hand: says so, names who, and shows the delta
+    out2 = _so_digest_workbook([{"invoice_number": "INV-SO-1"}], {"INV-SO-1": ("2026-09-15", "")},
+                               {"INV-SO-1": ("PO-1-1", "external", "edward.schiavon", 0.05)})
+    ws3 = load_workbook(io.BytesIO(out2))["Invoices"]
+    assert ws3.cell(row=2, column=len(headers) - 1).value == "PO-1-1 (by hand, edward.schiavon)"
+    assert ws3.cell(row=2, column=len(headers)).value == "+0.05"
 
 
 
@@ -825,9 +836,18 @@ def test_nonedi_endpoint_and_runner_classify_by_exclusion(client, monkeypatch):
     assert out["summary"]["candidates"] == 1
 
 
-def test_digest_lists_stale_pickups_and_nonedi_line(client, monkeypatch):
-    """An Accepted 810 older than stale_pickup_days with no Finale invoice and no
-    shipment in Finale is called out under Issues; recent non-EDI receipts get a line."""
+def _not_shipped(invoices, po_map, **kw):
+    return {"mode": "dry", "results": [{"transaction_id": t, "status": "skipped_not_shipped",
+                                        "error": "not shipped in Finale yet -- will retry"} for t in kw.get("only") or []],
+            "summary": {}, "unresolved": []}
+
+
+def test_digest_reconciles_finale_rolling_within_the_floor(client, monkeypatch):
+    """The Finale part of the digest is a RECONCILIATION: every SO since Finale's
+    go-live floor that has no Finale invoice is listed (with the live reason, and the
+    age in bold once over stale_pickup_days), every Finale invoice that does not tie
+    to the 810 is listed with who keyed it and the delta -- and anything created
+    before the floor never appears. Recent non-EDI receipts get their own line."""
     from app.main import _cache, _send_daily_digest
     from app import tracking
     from datetime import datetime, timezone, timedelta
@@ -837,33 +857,102 @@ def test_digest_lists_stale_pickups_and_nonedi_line(client, monkeypatch):
     invs = _so_ready_invoices()
     old = (datetime.now(timezone.utc) - timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
     for i in invs: i["created_at"] = old
-    tracking.record_events([i["transaction_id"] for i in invs], "netsuite")      # SOs exist, no Finale receipts
+    # a pre-floor SO with no Finale invoice: known not to tie, must never be listed
+    pre = {**invs[0], "transaction_id": "so-0", "source_document_id": "sd0", "invoice_number": "INV-SO-0",
+           "po_number": "PO0", "created_at": "2026-09-01T10:00:00Z"}
+    # an SO not (yet) in NetSuite: not part of the three-way check
+    nons = {**invs[0], "transaction_id": "so-9", "source_document_id": "sd9", "invoice_number": "INV-SO-9", "po_number": "PO9"}
+    tracking.record_events([i["transaction_id"] for i in invs] + ["so-0"], "netsuite")
     tracking.record_finale_invoice("order:507872-00", "507872-00", "100420", "/i/100420", "507872-00-1", "posted")
+    floor = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%d")      # the 6-day-old SOs are inside it
     class FakeFinale:
-        def get_order(self, po): return {"orderId": po, "shipmentUrlList": []}
-        def shipment_qty_for_order(self, o): return None                          # nothing shipped
-    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail, \
+        def get_invoice(self, url): return {"statusId": "INVOICE_IN_PROCESS"}
+    with patch.dict(_cache, {"invoices": invs + [pre, nons]}), patch("app.main.send_mail") as mail, \
          patch("app.main._finale_enabled", return_value=True), \
          patch("app.main._finale_config", return_value={"enabled": True, "stale_pickup_days": 4, "max_per_run": 75}), \
+         patch("app.main._finale_floor", return_value=floor), \
+         patch("app.main.push_finale_invoices", side_effect=_not_shipped), \
          patch("app.finale.FinaleClient") as FC:
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         _send_daily_digest()
     body = mail.call_args.kwargs["body_html"]
-    assert "not shipped in Finale" in body and "6 days" in body and "over 4 days ago" in body
+    tail = body.split("not invoiced in Finale")[-1]
+    assert "2 SO(s) in NetSuite but not invoiced in Finale" in body and f"orders since {floor}" in body
+    assert "not shipped in Finale" in tail and "<strong>6 days ago</strong>" in tail and "over 4 days ago" in body
+    assert "INV-SO-0" not in tail and "INV-SO-9" not in tail          # pre-floor / not in NetSuite: not Finale's problem
     assert "Finale (non-EDI orders, since" in body and "1 invoice(s) posted" in body and "507872-00" in body
-    # the configured threshold is what the text says, and a Finale RECEIPT counts as invoiced
-    # even when the batch event write was lost
-    tracking.record_finale_invoice(invs[0]["transaction_id"], invs[0]["po_number"], "1", "/i/1", "x-1", "posted")
-    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail2, \
+    # a receipt -- ours or someone's -- takes the SO off the missing list; a delta puts it
+    # on the 'does not tie' list, naming who keyed it
+    tracking.record_finale_invoice(invs[0]["transaction_id"], invs[0]["po_number"], "1", "/i/1", "x-1", "external",
+                                   created_by="edward.schiavon", finale_total=107.19, delta=0.05)
+    with patch.dict(_cache, {"invoices": invs + [pre, nons]}), patch("app.main.send_mail") as mail2, \
          patch("app.main._finale_enabled", return_value=True), \
          patch("app.main._finale_config", return_value={"enabled": True, "stale_pickup_days": 6, "max_per_run": 75}), \
+         patch("app.main._finale_floor", return_value=floor), \
+         patch("app.main.push_finale_invoices", side_effect=_not_shipped), \
          patch("app.finale.FinaleClient") as FC:
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         _send_daily_digest()
     body2 = mail2.call_args.kwargs["body_html"]
     assert "over 6 days ago" in body2 and "over 4 days ago" not in body2
-    assert str(invs[0]["invoice_number"]) not in body2.split("not shipped in Finale")[-1]   # receipted: not stale
-    assert str(invs[1]["invoice_number"]) in body2.split("not shipped in Finale")[-1]       # un-receipted: still stale
+    miss2 = body2.split("not invoiced in Finale")[-1].split("do not tie")[0]
+    assert "INV-SO-1" not in miss2 and "INV-SO-2" in miss2
+    assert "1 Finale invoice(s) do not tie to the 810" in body2
+    assert "INV-SO-1 — Finale x-1 by edward.schiavon — Finale $107.19 vs 810 $107.14 (<strong>off by +0.05</strong>)" in body2
+
+
+def test_digest_reads_a_hand_made_invoice_before_the_poll_receipts_it(client, monkeypatch):
+    """The dry run finds an invoice someone keyed on the order: the digest shows it as
+    invoiced by hand (headline + Excel), lists its delta, and does NOT call it missing."""
+    from app.main import _cache, _send_daily_digest
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    monkeypatch.setenv("NETSUITE_ACCOUNT_ID", "734463")
+    invs = _so_ready_invoices()[:1]
+    tracking.record_events(["so-1"], "netsuite")
+    def dry(invoices, po_map, **kw):
+        return {"mode": "dry", "results": [{"transaction_id": "so-1", "status": "skipped_exists",
+                 "external": {"invoice_id": "100405", "invoice_url": "/i/100405", "invoice_id_user": "PO1-1",
+                              "created_by": "edward.schiavon", "finale_status": "posted", "finale_total": 107.64, "delta": 0.5}}],
+                "summary": {}, "unresolved": []}
+    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail, \
+         patch("app.main._finale_enabled", return_value=True), \
+         patch("app.main._finale_floor", return_value="2026-09-15"), \
+         patch("app.main.push_finale_invoices", side_effect=dry), \
+         patch("app.finale.FinaleClient") as FC:
+        FC.configured.return_value = True
+        _send_daily_digest()
+    body = mail.call_args.kwargs["body_html"]
+    assert "1 already invoiced by hand" in body and "not invoiced in Finale" not in body
+    assert "PO1-1 by edward.schiavon" in body and "off by +0.50" in body
+
+
+def test_digest_drops_a_held_draft_once_someone_posts_it(client, monkeypatch):
+    from app.main import _cache, _send_daily_digest
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    monkeypatch.setenv("NETSUITE_ACCOUNT_ID", "734463")
+    invs = _so_ready_invoices()[:1]
+    tracking.record_events(["so-1"], "netsuite")
+    tracking.record_finale_invoice("so-1", "PO1", "100407", "/i/100407", "PO1-1", "draft", created_by="API_KEY_U_BLINDS",
+                                   finale_total=107.14, delta=0.0)
+    class FakeFinale:
+        def get_invoice(self, url):
+            return {"statusId": "INVOICE_APPROVED", "statusIdHistoryList": [
+                {"statusId": None, "userLoginUrl": "/x/api/userlogin/API_KEY_U_BLINDS"},
+                {"statusId": "INVOICE_APPROVED", "userLoginUrl": "/x/api/userlogin/edward.schiavon"}]}
+    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail, \
+         patch("app.main._finale_enabled", return_value=True), \
+         patch("app.main._finale_floor", return_value="2026-09-15"), \
+         patch("app.finale.FinaleClient") as FC:
+        FC.configured.return_value = True; FC.return_value = FakeFinale()
+        _send_daily_digest()
+    body = mail.call_args.kwargs["body_html"]
+    assert "held as draft" not in body and "1 invoice(s) posted" in body
+    assert tracking.get_finale_invoices(["so-1"])["so-1"]["status"] == "posted"
+    assert tracking.get_finale_invoices(["so-1"])["so-1"]["created_by"] == "edward.schiavon"
 
 
 def test_digest_nonedi_window_starts_at_the_last_sent_digest(client):

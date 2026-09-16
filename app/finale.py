@@ -50,6 +50,34 @@ def created_by(record: dict) -> str:
     return str(first.get("userLoginUrl") or "").rstrip("/").rsplit("/", 1)[-1]
 
 
+def approved_by(record: dict) -> str:
+    """The login that POSTED this Finale invoice (the INVOICE_APPROVED history entry),
+    or "" while it is still a draft."""
+    for e in reversed(record.get("statusIdHistoryList") or []):
+        if isinstance(e, dict) and e.get("statusId") == "INVOICE_APPROVED":
+            return str(e.get("userLoginUrl") or "").rstrip("/").rsplit("/", 1)[-1]
+    return ""
+
+
+def invoice_total(invoice: dict) -> float:
+    """What a Finale invoice comes to, whoever keyed it: product lines are
+    unitPrice x quantity, every other line (tax, promotion) carries an amount.
+    Unreadable numbers count as 0 rather than raising -- the caller compares this
+    to the 810 and a bad line shows up as a delta, not a crash."""
+    total = 0.0
+    for it in invoice.get("invoiceItemList") or []:
+        if not isinstance(it, dict):
+            continue
+        try:
+            if it.get("invoiceItemTypeId") == "INV_PROD_ITEM":
+                total += float(it.get("unitPrice") or 0) * float(it.get("quantity") or 0)
+            else:
+                total += float(it.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+    return round(total, 2)
+
+
 def adoptable_draft(invoices: list[dict]) -> dict | None:
     """The ONE un-posted draft an order carries, if that is all it carries -- an
     invoice a previous run created and then lost track of (the create landed, the
@@ -203,6 +231,11 @@ class FinaleClient:
             return None
         resp.raise_for_status()
         return resp.json()
+
+    def get_invoice(self, invoice_url: str) -> dict:
+        """One invoice by its API url (re-read a draft we hold, to see if someone
+        posted it by hand since)."""
+        return self._get(invoice_url)
 
     def order_invoices(self, order: dict) -> list[dict]:
         """Every invoice already on this order (followed via invoiceUrlList)."""

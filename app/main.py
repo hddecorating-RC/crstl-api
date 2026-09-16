@@ -498,18 +498,25 @@ def _so_digest_data() -> dict:
         so_map[str(i.get("invoice_number"))] = (created, _so_link(ns_ids.get(eids.get(tx))))
     # Finale invoices created for these SOs (receipts), for the headline line, the
     # Excel column and the issues list. Empty when Finale invoicing is off.
-    finale = tracking.get_finale_invoices([str(i["transaction_id"]) for i in new_sos])
     fin_cfg = _finale_config()
     # Non-EDI receipts since the last digest that was actually SENT (a digest fires
     # after each push as well as at 7:15), so a figure is never re-reported as new.
     since = _last_digest_sent_at() or (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     nonedi = [r for r in tracking.recent_finale_invoices(since) if str(r.get("key", "")).startswith("order:")]
-    stale = _stale_pickups(scoped, events, fin_cfg.get("stale_pickup_days")) if _finale_enabled() else []
+    # The reconciliation runs FIRST: it may refresh a draft receipt that has since
+    # been posted by hand, and the headline must show that state.
+    recon = _finale_reconciliation(invoices, fin_cfg.get("stale_pickup_days")) if _finale_enabled() else _EMPTY_RECON
+    finale = tracking.get_finale_invoices([str(i["transaction_id"]) for i in new_sos])
+    # A new SO whose Finale invoice someone keyed by hand has no receipt until the
+    # next poll runs; the reconciliation already read it -- show it now.
+    for i in new_sos:
+        tx = str(i["transaction_id"])
+        if tx not in finale and tx in recon["by_tx"]:
+            finale[tx] = recon["by_tx"][tx]
     return {"cutoff": cutoff, "new_sos": new_sos, "gaps": gaps,
             "row_by_tx": row_by_tx, "eids": eids, "ns_ids": ns_ids, "so_map": so_map,
             "finale": finale, "finale_enabled": _finale_enabled(),
-            "nonedi": nonedi, "nonedi_since": since,
-            "stale_pickups": stale, "stale_days": fin_cfg.get("stale_pickup_days")}
+            "nonedi": nonedi, "nonedi_since": since, "recon": recon}
 
 
 def _last_digest_sent_at() -> str | None:
@@ -539,6 +546,8 @@ def _so_digest_rows(data: dict) -> list[dict]:
             "so_link": _so_link(ns_id),
             "finale_status": (data.get("finale") or {}).get(tx, {}).get("status"),
             "finale_id": (data.get("finale") or {}).get(tx, {}).get("invoice_id_user"),
+            "finale_by": (data.get("finale") or {}).get(tx, {}).get("created_by"),
+            "finale_delta": (data.get("finale") or {}).get(tx, {}).get("delta"),
         })
     return rows
 
@@ -569,11 +578,13 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
     # Finale: ONE line, only when the feature is on or something was invoiced.
     f_posted = [r for r in rows if r.get("finale_status") == "posted"]
     f_draft = [r for r in rows if r.get("finale_status") == "draft"]
-    f_missing = [r for r in rows if not r.get("finale_status")] if data.get("finale_enabled") else []
-    if data.get("finale_enabled") or f_posted or f_draft:
+    f_hand = [r for r in rows if r.get("finale_status") == "external"]
+    if data.get("finale_enabled") or f_posted or f_draft or f_hand:
         line = f"<strong>Finale:</strong> {len(f_posted)} invoice(s) posted"
         if f_draft:
             line += f", <strong>{len(f_draft)} held as draft</strong>"
+        if f_hand:
+            line += f", {len(f_hand)} already invoiced by hand"
         h += f"<p>{line}.</p>"
     nonedi = data.get("nonedi") or []
     n_posted = [r for r in nonedi if r.get("status") == "posted"]
@@ -587,8 +598,9 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
 
     gaps = data["gaps"]
     mism = [r for r in rows if r["reconcile_flag"]]
-    stale = data.get("stale_pickups") or []
-    if gaps or mism or f_draft or f_missing or n_draft or stale:
+    recon = data.get("recon") or _EMPTY_RECON
+    f_missing, f_delta, f_held = recon["missing"], recon["deltas"], recon["drafts"]
+    if gaps or mism or f_missing or f_delta or f_held or n_draft:
         h += '<h3 style="color:#b32020;margin-top:16px">Issues</h3>'
         if gaps:
             gl = "".join(
@@ -602,23 +614,36 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
             ml = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))}: "
                          f"{html.escape(str(r['reconcile_flag']))}</li>" for r in mism)
             h += f"<p><strong>{len(mism)} SO(s) do not tie to the 810:</strong></p><ul>{ml}</ul>"
-        if f_draft:
-            dl = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))} — Finale {html.escape(str(r['finale_id'] or ''))}</li>"
-                         for r in f_draft)
-            h += (f"<p><strong>{len(f_draft)} Finale invoice(s) held as draft</strong> "
-                  f"(did not tie to the 810 or shipped qty differs — review in Finale):</p><ul>{dl}</ul>")
+        since = html.escape(str(recon.get("floor") or ""))
         if f_missing:
-            ml2 = "".join(f"<li>{html.escape(str(r['invoice_number'] or ''))}</li>" for r in f_missing)
-            h += f"<p><strong>{len(f_missing)} SO(s) with no Finale invoice yet</strong> (usually not shipped in Finale yet — the poll retries; otherwise the create failed):</p><ul>{ml2}</ul>"
+            days = recon.get("stale_days")
+            ml2 = "".join(
+                f"<li>{html.escape(str(r.get('invoice_number') or ''))} — PO {html.escape(str(r.get('po_number') or ''))} — "
+                f"{html.escape(str(r.get('province') or '—'))} — {html.escape(str(r.get('reason') or ''))}"
+                + (f" — accepted <strong>{r['days']} days ago</strong>" if r.get("stale") else
+                   (f" — accepted {r['days']} day(s) ago" if r.get("days") is not None else ""))
+                + "</li>" for r in f_missing[:100])
+            h += (f"<p><strong>{len(f_missing)} SO(s) in NetSuite but not invoiced in Finale</strong> "
+                  f"(orders since {since}; rechecked every 15 min"
+                  + (f"; <strong>bold</strong> = 810 accepted over {days} days ago, still no shipment" if days else "")
+                  + f"):</p><ul>{ml2}</ul>")
+        if f_delta:
+            dl = "".join(
+                f"<li>{html.escape(str(r.get('invoice_number') or ''))} — Finale {html.escape(str(r.get('finale_id') or ''))}"
+                f"{(' by ' + html.escape(str(r['created_by']))) if r.get('created_by') else ''} — "
+                f"Finale ${(r.get('finale_total') or 0):,.2f} vs 810 ${(r.get('hd_total') or 0):,.2f} "
+                f"(<strong>off by {r['delta']:+.2f}</strong>)</li>" for r in f_delta[:100])
+            h += (f"<p><strong>{len(f_delta)} Finale invoice(s) do not tie to the 810</strong> "
+                  f"(orders since {since}):</p><ul>{dl}</ul>")
+        if f_held:
+            hl = "".join(
+                f"<li>{html.escape(str(r.get('invoice_number') or ''))} — Finale {html.escape(str(r.get('finale_id') or ''))}"
+                f"{(' by ' + html.escape(str(r['created_by']))) if r.get('created_by') else ''}</li>" for r in f_held[:100])
+            h += (f"<p><strong>{len(f_held)} Finale invoice(s) held as draft</strong> "
+                  f"(did not tie to the 810 or shipped qty differs — review in Finale; orders since {since}):</p><ul>{hl}</ul>")
         if n_draft:
             nl = "".join(f"<li>{html.escape(str(r.get('po_number') or ''))} — Finale {html.escape(str(r.get('invoice_id_user') or ''))}</li>" for r in n_draft)
             h += f"<p><strong>{len(n_draft)} non-EDI Finale invoice(s) held as draft</strong> (a shipped product the order does not price — review in Finale):</p><ul>{nl}</ul>"
-        if stale:
-            sl = "".join(f"<li>{html.escape(str(s.get('invoice_number') or ''))} — PO {html.escape(str(s.get('po_number') or ''))} — "
-                         f"{html.escape(str(s.get('province') or '—'))} — accepted <strong>{s['days']} days</strong> ago"
-                         f"{' — no Finale order' if s.get('order_missing') else ''}</li>" for s in stale)
-            h += (f"<p><strong>{len(stale)} pickup(s) not shipped in Finale</strong> "
-                  f"(810 accepted over {data.get('stale_days')} days ago, still no shipment):</p><ul>{sl}</ul>")
     return h
 
 
@@ -662,9 +687,23 @@ def _so_digest_workbook(new_sos: list[dict], so_map: dict, finale_map: dict | No
             inv = ws.cell(row=r, column=1).value
             if not inv or inv == "Total":
                 continue
-            fid, fstatus = finale_map.get(str(inv), ("", ""))
-            ws.cell(row=r, column=col, value=(f"{fid} ({fstatus})" if fid else "—"))
-        ws.column_dimensions[get_column_letter(col)].width = 22
+            fid, fstatus, fby, fdelta = (tuple(finale_map.get(str(inv), ())) + ("", "", None, None))[:4]
+            label = f"{fid} ({'by hand' if fstatus == 'external' else fstatus}" + (f", {fby}" if fby and fstatus == "external" else "") + ")"
+            ws.cell(row=r, column=col, value=(label if fid else "—"))
+        ws.column_dimensions[get_column_letter(col)].width = 30
+        col += 1
+        hdr = ws.cell(row=1, column=col, value="Finale vs 810")
+        hdr.fill = PatternFill("solid", fgColor="1F3864")
+        hdr.font = Font(bold=True, color="FFFFFF", size=10)
+        hdr.alignment = Alignment(horizontal="center", vertical="center")
+        for r in range(2, ws.max_row + 1):
+            inv = ws.cell(row=r, column=1).value
+            if not inv or inv == "Total":
+                continue
+            fid, fstatus, fby, fdelta = (tuple(finale_map.get(str(inv), ())) + ("", "", None, None))[:4]
+            ws.cell(row=r, column=col, value=("—" if not fid or fdelta is None else
+                                              ("tied" if abs(fdelta) <= 0.01 else f"{fdelta:+.2f}")))
+        ws.column_dimensions[get_column_letter(col)].width = 14
     m = re.match(r"A1:([A-Z]+)(\d+)", ws.auto_filter.ref or "")
     if m:  # extend the filter to cover the new column(s)
         ws.auto_filter.ref = f"A1:{get_column_letter(col)}{m.group(2)}"
@@ -692,13 +731,16 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
     today = date.today().isoformat()
     n = len(rows)
     subject = f"HD Sales Orders for invoicing — {today} — {n} SO(s)"
-    if data["gaps"]:
-        subject += f" · {len(data['gaps'])} issue(s)"
+    recon = data.get("recon") or _EMPTY_RECON
+    n_issues = len(data["gaps"]) + len(recon["missing"]) + len(recon["deltas"]) + len(recon["drafts"])
+    if n_issues:
+        subject += f" · {n_issues} issue(s)"
     body_html = _so_digest_html(data, rows)
 
     attachments = None
     if data["new_sos"]:
-        finale_by_inv = {str(i.get("invoice_number")): (f.get("invoice_id_user") or f.get("invoice_id") or "", f.get("status") or "")
+        finale_by_inv = {str(i.get("invoice_number")): (f.get("invoice_id_user") or f.get("invoice_id") or "", f.get("status") or "",
+                                                        f.get("created_by"), f.get("delta"))
                          for i in data["new_sos"]
                          for f in [data["finale"].get(str(i["transaction_id"]))] if f}
         attachments = [(f"hd_sales_orders_{today}.xlsx",
@@ -1021,41 +1063,106 @@ def _run_nonedi_push(live: bool, ids: Optional[list[str]], limit: Optional[int])
     return result
 
 
-def _stale_pickups(scoped: list[dict], events: dict, days: int) -> list[dict]:
-    """Accepted 810s with no Finale invoice, accepted more than `days` ago, and STILL
-    not shipped in Finale -- surfaced in the digest (DSD pickups ship within 7 days;
-    over 4 is trouble). Read-only Finale lookups, bounded to the recency window."""
-    from app.finale import FinaleClient
-    if days is None or not FinaleClient.configured():
-        return []
+_EMPTY_RECON: dict = {"floor": None, "stale_days": None, "missing": [], "deltas": [], "drafts": [], "by_tx": {}}
+
+
+def _finale_reconciliation(invoices: list[dict], stale_days) -> dict:
+    """Does Finale match CRSTL and NetSuite? Rolling -- an SO stays listed every day
+    until it clears -- but FLOORED at Finale's go-live date (on the 810's created_at,
+    the same guard as the poll): orders from before it were invoiced another way and
+    are known not to tie, so they never appear. Scope = eligible 810s on/after the
+    floor that have a NetSuite SO. For each: the Finale receipt (ours, or 'external'
+    for one someone else keyed), else a read-only dry run for WHY there is none.
+      missing -- no invoice in Finale, with the live reason (not shipped / no order /
+                 create failed / shipped and about to be invoiced); `stale` when the
+                 810 was accepted over `stale_days` ago and still nothing shipped.
+      deltas  -- an invoice whose total is off the 810 (whoever created it).
+      drafts  -- invoices we hold un-posted (re-read first: one posted by hand since
+                 is receipted as posted and drops off).
+      by_tx   -- the Finale view per transaction (receipt or dry-run external)."""
+    from app.finale import FinaleClient, approved_by
+    floor = _finale_floor()
+    if not floor:
+        return dict(_EMPTY_RECON)
+    scoped = [i for i in eligible_for_push(invoices) if str(i.get("created_at") or "")[:10] >= floor]
+    ids = [str(i["transaction_id"]) for i in scoped]
+    events = tracking.get_latest_events(ids)
+    scoped = [i for i in scoped if events.get(str(i["transaction_id"]), {}).get("netsuite_at")]
+    ids = [str(i["transaction_id"]) for i in scoped]
+    receipts = tracking.get_finale_invoices(ids)
+    configured = FinaleClient.configured()
+    if configured:
+        client = FinaleClient()
+        for tx, rec in list(receipts.items())[:50]:
+            if rec.get("status") != "draft" or not rec.get("invoice_url"):
+                continue
+            try:
+                live = client.get_invoice(rec["invoice_url"])
+            except Exception:  # noqa: BLE001 -- a read failure leaves the receipt as it was
+                continue
+            if live.get("statusId") == "INVOICE_APPROVED":
+                tracking.record_finale_invoice(tx, rec.get("po_number"), rec.get("invoice_id"), rec.get("invoice_url"),
+                                               rec.get("invoice_id_user"), "posted", created_by=approved_by(live) or rec.get("created_by"),
+                                               finale_total=rec.get("finale_total"), delta=rec.get("delta"))
+                receipts[tx] = {**rec, "status": "posted"}
+    missing_ids = [tx for tx in ids if tx not in receipts]
+    reasons: dict[str, dict] = {}
+    err = None if configured else "Finale not configured"
+    if missing_ids and configured:
+        try:
+            with _cache_lock:
+                po_map = dict(_cache["po_provinces"])
+            dry = push_finale_invoices(invoices, po_map, live=False, only=missing_ids, client=client)
+            reasons = {str(r.get("transaction_id")): r for r in dry.get("results") or []}
+        except Exception as exc:  # noqa: BLE001 -- the digest still goes out
+            err = f"Finale check failed: {str(exc)[:120]}"
     now = datetime.now(timezone.utc)
-    receipts = tracking.get_finale_invoices([str(i["transaction_id"]) for i in scoped])
-    old = []
+    out = {"floor": floor, "stale_days": stale_days, "missing": [], "deltas": [], "drafts": [], "by_tx": {}}
     for i in scoped:
         tx = str(i["transaction_id"])
-        if events.get(tx, {}).get("finale_at") or tx in receipts:
+        rec = receipts.get(tx)
+        if rec is None and reasons.get(tx, {}).get("external"):
+            ext = reasons[tx]["external"]
+            rec = {**ext, "status": "external"}
+        if rec is None:
+            try:
+                created = datetime.fromisoformat(str(i.get("created_at") or "").replace("Z", "+00:00"))
+                days = (now - created).days
+            except ValueError:
+                days = None
+            r = reasons.get(tx)
+            out["missing"].append({"invoice_number": i.get("invoice_number"), "po_number": i.get("po_number"),
+                                   "province": i.get("province"), "days": days,
+                                   "stale": bool(stale_days is not None and days is not None and days >= stale_days
+                                                 and (r or {}).get("status") in (None, "skipped_not_shipped")),
+                                   "reason": _missing_reason(r, err)})
             continue
-        try:
-            created = datetime.fromisoformat(str(i.get("created_at") or "").replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        age = (now - created).days
-        if age >= days:
-            old.append((i, age))
-    if not old:
-        return []
-    client = FinaleClient()
-    out = []
-    for i, age in old[:25]:
-        try:
-            order = client.get_order(str(i.get("po_number")))
-            shipped = client.shipment_qty_for_order(order) if order else None
-        except Exception:  # noqa: BLE001 -- a lookup failure is not a stale pickup
-            continue
-        if shipped is None:
-            out.append({"invoice_number": i.get("invoice_number"), "po_number": i.get("po_number"),
-                        "province": i.get("province"), "days": age, "order_missing": order is None})
+        out["by_tx"][tx] = rec
+        base = {"invoice_number": i.get("invoice_number"), "po_number": i.get("po_number"),
+                "finale_id": rec.get("invoice_id_user") or rec.get("invoice_id"), "created_by": rec.get("created_by")}
+        if rec.get("status") == "draft":
+            out["drafts"].append(base)
+        d = rec.get("delta")
+        if d is not None and abs(d) > 0.01:
+            out["deltas"].append({**base, "delta": d, "finale_total": rec.get("finale_total"),
+                                  "hd_total": i.get("total_amount")})
     return out
+
+
+def _missing_reason(r: dict | None, err: str | None) -> str:
+    """One plain phrase for why an SO has no Finale invoice, from the dry-run row."""
+    if r is None:
+        return err or "not checked"
+    st = str(r.get("status") or "")
+    if st == "skipped_not_shipped":
+        return "not shipped in Finale"
+    if st == "skipped_no_order":
+        return "no Finale order"
+    if st == "built":
+        return "shipped in Finale — the next poll invoices it" + (" (as a draft)" if r.get("would") == "draft" else "")
+    if st == "failed":
+        return f"create failed: {r.get('error') or ''}".strip()
+    return str(r.get("error") or st)
 
 
 def _auto_digest_enabled() -> bool:

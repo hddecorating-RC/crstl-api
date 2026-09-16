@@ -187,7 +187,8 @@ def test_live_clean_invoice_is_created_and_posted_with_receipts():
     assert [c[0] for c in client.calls] == ["get_order", "create", "complete", "complete_order"]
     assert r["order_completed"] is True                                   # posted -> order completed
     assert client.calls[1][1]["invoiceItemList"][1]["amount"] == -1.04     # exact cents sent
-    rec_inv.assert_called_once_with("T1", "PO1", "100407", "/hddecorating/api/invoice/100407", "PO1-1", "posted")
+    rec_inv.assert_called_once_with("T1", "PO1", "100407", "/hddecorating/api/invoice/100407", "PO1-1", "posted",
+                                    created_by="API_KEY_U_BLINDS", finale_total=21.42, delta=0.0)
     rec_ev.assert_called_once_with(["T1"], "finale")
     assert out["summary"]["posted"] == 1 and out["summary"]["draft"] == 0
 
@@ -406,3 +407,53 @@ def test_lone_unreceipted_draft_is_adopted_not_duplicated():
     with patch("app.tracking.get_finale_invoices", return_value={}):
         out3 = push_finale_invoices([INV], PO_MAP, live=False, refs=REFS, client=dry)
     assert out3["results"][0]["would"] == "posted" and out3["results"][0]["adopted"] == "PO1-1" and dry.calls == [("get_order", "PO1")]
+
+
+HAND_INV = {"invoiceId": "100405", "invoiceUrl": "/hddecorating/api/invoice/100405", "invoiceIdUser": "PO1-1",
+            "statusId": "INVOICE_APPROVED",
+            "invoiceItemList": [{"invoiceItemTypeId": "INV_PROD_ITEM", "unitPrice": 20.0, "quantity": 1},
+                                {"invoiceItemTypeId": "INV_PROMOTION_ADJ", "amount": -1.00},
+                                {"invoiceItemTypeId": "INV_SALES_TAX", "amount": 2.47}],   # 21.47 vs 810 21.42
+            "statusIdHistoryList": [{"statusId": None, "userLoginUrl": "/hddecorating/api/userlogin/edward.schiavon"},
+                                    {"statusId": "INVOICE_APPROVED", "userLoginUrl": "/hddecorating/api/userlogin/edward.schiavon"}]}
+
+
+def test_existing_hand_made_invoice_is_reconciled_and_receipted_as_external():
+    """An order already invoiced by someone else is not an error and not 'missing':
+    the engine reads that invoice -- who made it, its total, the delta vs the 810 --
+    receipts it as 'external' (with the finale event, so the poll stops re-reading
+    it) and never creates a second one. A dry run reports the same, writes nothing."""
+    client = FakeFinale(invoices=[HAND_INV], shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    out, rec_inv, rec_ev = _live(client)
+    r = out["results"][0]
+    assert r["status"] == "skipped_exists" and "create" not in [c[0] for c in client.calls]
+    assert r["external"] == {"invoice_id": "100405", "invoice_url": "/hddecorating/api/invoice/100405",
+                             "invoice_id_user": "PO1-1", "created_by": "edward.schiavon", "finale_status": "posted",
+                             "finale_total": 21.47, "delta": 0.05}
+    rec_inv.assert_called_once_with("T1", "PO1", "100405", "/hddecorating/api/invoice/100405", "PO1-1", "external",
+                                    created_by="edward.schiavon", finale_total=21.47, delta=0.05)
+    rec_ev.assert_called_once_with(["T1"], "finale")
+    dry = FakeFinale(invoices=[HAND_INV], shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    with patch("app.tracking.get_finale_invoices", return_value={}), \
+         patch("app.tracking.record_finale_invoice") as rec2, patch("app.tracking.record_events") as ev2:
+        out2 = push_finale_invoices([INV], PO_MAP, live=False, refs=REFS, client=dry)
+    assert out2["results"][0]["external"]["delta"] == 0.05 and out2["results"][0]["status"] == "skipped_exists"
+    rec2.assert_not_called(); ev2.assert_not_called()
+    # an 'external' receipt short-circuits like ours: nothing is re-read
+    client3 = FakeFinale(invoices=[HAND_INV])
+    with patch("app.tracking.get_finale_invoices",
+               return_value={"T1": {"invoice_id": "100405", "invoice_url": "/i", "invoice_id_user": "PO1-1", "status": "external"}}), \
+         patch("app.tracking.record_finale_invoice") as rec3, patch("app.tracking.record_events") as ev3:
+        out3 = push_finale_invoices([INV], PO_MAP, live=True, refs=REFS, client=client3)
+    assert out3["results"][0]["status"] == "skipped_exists" and client3.calls == []
+    rec3.assert_not_called(); ev3.assert_not_called()
+
+
+def test_two_live_invoices_on_one_order_are_summed_and_named():
+    other = {**HAND_INV, "invoiceId": "100406", "invoiceUrl": "/hddecorating/api/invoice/100406", "invoiceIdUser": "PO1-2",
+             "invoiceItemList": [{"invoiceItemTypeId": "INV_PROD_ITEM", "unitPrice": 1.0, "quantity": 1}]}
+    client = FakeFinale(invoices=[HAND_INV, other], shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    out, rec_inv, _ = _live(client)
+    ext = out["results"][0]["external"]
+    assert ext["invoice_id_user"] == "PO1-1, PO1-2" and ext["finale_total"] == 22.47 and ext["delta"] == 1.05
+    assert rec_inv.call_args.args[5] == "external" and rec_inv.call_args.kwargs["finale_total"] == 22.47
