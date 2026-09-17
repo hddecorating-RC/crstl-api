@@ -446,14 +446,21 @@ def test_existing_hand_made_invoice_is_reconciled_and_receipted_as_external():
         out2 = push_finale_invoices([INV], PO_MAP, live=False, refs=REFS, client=dry)
     assert out2["results"][0]["external"]["delta"] == 0.05 and out2["results"][0]["status"] == "skipped_exists"
     rec2.assert_not_called(); ev2.assert_not_called()
-    # an 'external' receipt short-circuits like ours: nothing is re-read
-    client3 = FakeFinale(invoices=[HAND_INV])
-    with patch("app.tracking.get_finale_invoices",
-               return_value={"T1": {"invoice_id": "100405", "invoice_url": "/i", "invoice_id_user": "PO1-1", "status": "external"}}), \
-         patch("app.tracking.record_finale_invoice") as rec3, patch("app.tracking.record_events") as ev3:
+    # an 'external' receipt is NOT a permanent block: the order is re-read; while the
+    # hand-made invoice is still there it is skipped again...
+    client3 = FakeFinale(invoices=[HAND_INV], shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    ext = {"T1": {"invoice_id": "100405", "invoice_url": "/i", "invoice_id_user": "PO1-1", "status": "external"}}
+    with patch("app.tracking.get_finale_invoices", return_value=ext), \
+         patch("app.tracking.record_finale_invoice"), patch("app.tracking.record_events"):
         out3 = push_finale_invoices([INV], PO_MAP, live=True, refs=REFS, client=client3)
-    assert out3["results"][0]["status"] == "skipped_exists" and client3.calls == []
-    rec3.assert_not_called(); ev3.assert_not_called()
+    assert out3["results"][0]["status"] == "skipped_exists" and [c[0] for c in client3.calls] == ["get_order"]
+    # ...and once accounting cancels it, the next run invoices the order properly
+    client4 = FakeFinale(invoices=[{**HAND_INV, "statusId": "INVOICE_CANCELLED"}], shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    with patch("app.tracking.get_finale_invoices", return_value=ext), \
+         patch("app.tracking.record_finale_invoice") as rec4, patch("app.tracking.record_events"):
+        out4 = push_finale_invoices([INV], PO_MAP, live=True, refs=REFS, client=client4)
+    assert out4["results"][0]["status"] == "posted" and "create" in [c[0] for c in client4.calls]
+    assert rec4.call_args.args[5] == "posted"
 
 
 def test_two_live_invoices_on_one_order_are_summed_and_named():

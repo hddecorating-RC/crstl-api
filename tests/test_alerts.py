@@ -84,3 +84,21 @@ def test_only_sent_asns_silence_or_resolve_the_alert():
     ships = [lab("3", 3, "2026-09-16T12:00:00"), lab("4", 4, "2026-09-16T12:00:00"), lab("1", 1, "2026-09-16T12:00:00")]
     assert [r["po_number"] for r in find_asn_missing(ships, sent_asn_pos(states), {}, after_minutes=60, now=NOW)] == ["3", "4"]
     assert resolved_asn_missing([{"issue": "asn_missing", "po_number": "3", "key": "k"}], sent_asn_pos(states)) == []
+
+
+def test_a_voided_label_resolves_its_alert_and_a_replacement_is_alerted_afresh(tmp_path, monkeypatch):
+    from app import tracking
+    monkeypatch.setenv("TRACKING_DB", str(tmp_path / "t.db")); tracking.init_db()
+    send = MagicMock()
+    first = [lab("538871711", 1, "2026-09-16T12:45:20")]
+    run_alerts(first, set(), IDS, config=CFG, live=True, recipients=["g@x"], send=send, now=NOW)
+    assert send.call_count == 1
+    # label voided (order cancelled): resolved, gone from 'still open', no email
+    voided = [lab("538871711", 1, "2026-09-16T12:45:20", voided=True)]
+    r = run_alerts(voided, set(), IDS, config=CFG, live=True, recipients=["g@x"], send=send, now=NOW)
+    assert r["resolved"] == ["asn_missing:1"] and r["still_open"] == [] and send.call_count == 1
+    assert tracking.open_alert_receipts() == []
+    # a new label on the same PO is a new shipment id: alerted on its own
+    relabel = voided + [lab("538871711", 2, "2026-09-16T12:50:00")]
+    r2 = run_alerts(relabel, set(), IDS, config=CFG, live=True, recipients=["g@x"], send=send, now=NOW)
+    assert [x["key"] for x in r2["new"]] == ["asn_missing:2"] and send.call_count == 2

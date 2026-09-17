@@ -74,9 +74,12 @@ def find_asn_missing(shipments: list[dict], asn_pos: set, po_ids: dict, *, after
     return out
 
 
-def resolved_asn_missing(open_receipts: list[dict], asn_pos: set) -> list[dict]:
-    """Earlier 'asn_missing' receipts whose PO now has an 856 -- to mark resolved."""
-    return [r for r in open_receipts if r.get("issue") == "asn_missing" and str(r.get("po_number")) in asn_pos]
+def resolved_asn_missing(open_receipts: list[dict], asn_pos: set, voided_keys: set = frozenset()) -> list[dict]:
+    """Earlier 'asn_missing' receipts that have cleared: the PO now has a sent 856, or
+    the label itself was voided (order cancelled / re-labelled -- no ASN will ever
+    come for that label; a replacement label is a new shipment id, alerted afresh)."""
+    return [r for r in open_receipts if r.get("issue") == "asn_missing"
+            and (str(r.get("po_number")) in asn_pos or r.get("key") in voided_keys)]
 
 
 def alert_email(new_rows: list[dict], still_open: list[dict], config: dict) -> tuple[str, str]:
@@ -117,7 +120,8 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
     receipts = tracking.get_alert_receipts([r["key"] for r in found])
     new = [r for r in found if r["key"] not in receipts]
     open_all = tracking.open_alert_receipts()
-    resolved = resolved_asn_missing(open_all, asn_pos)
+    voided_keys = {f"asn_missing:{s.get('shipmentId')}" for s in shipments if s.get("voided")}
+    resolved = resolved_asn_missing(open_all, asn_pos, voided_keys)
     still_open = [{**r, "url": crstl_po_url(po_ids.get(str(r.get("po_number")))),
                    "sent_et": (datetime.fromisoformat(r["sent_at"]).astimezone(ET).strftime("%m-%d %H:%M ET") if r.get("sent_at") else "")}
                   for r in open_all if r not in resolved and r["key"] not in {n["key"] for n in new}]

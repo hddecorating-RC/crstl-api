@@ -533,12 +533,17 @@ def _so_digest_data() -> dict:
 
 
 def _last_netsuite_push_at() -> str | None:
-    """When the scheduled NetSuite push last actually RAN (ok, partial, blocked or
-    error -- anything but skipped/disabled), UTC ISO, or None if it never has."""
-    for run in tracking.recent_job_runs(limit=50, job="netsuite_push"):
-        if run.get("status") != "skipped":
-            return run.get("ran_at")
-    return None
+    """When the NetSuite push last had its chance, UTC ISO, or None if it never has.
+    The LATER of: the last scheduled job run of ANY status (a run that skipped
+    because auto-push is off still means every 810 accepted before it is a real
+    gap, not a waiting one), and the start of the last live push in this process
+    (set before the post-push digest fires, so the 810s that push just failed on
+    are not mistaken for 'accepted after the push')."""
+    runs = tracking.recent_job_runs(limit=1, job="netsuite_push")
+    logged = runs[0].get("ran_at") if runs else None
+    with _netsuite_push_lock:
+        live = _netsuite_push_state.get("last_run") if _netsuite_push_state.get("mode") == "live" else None
+    return max(x for x in (logged, live) if x) if (logged or live) else None
 
 
 def _parse_iso(iso) -> datetime | None:

@@ -308,7 +308,10 @@ def push_finale_invoices(
         status and returns None when the row must not be written; otherwise sets
         qty_flag and returns the order."""
         tid = row["transaction_id"]
-        if prior and prior.get("status") in ("draft", "posted", "external"):
+        # Our own receipt short-circuits. An 'external' receipt (someone else's
+        # invoice) does NOT: the live invoices are re-read below, so a hand-made
+        # invoice that was since cancelled lets the order be invoiced properly.
+        if prior and prior.get("status") in ("draft", "posted"):
             row["status"] = "skipped_exists"
             row["invoice_id"], row["invoice_url"], row["invoice_id_user"] = prior.get("invoice_id"), prior.get("invoice_url"), prior.get("invoice_id_user")
             row["error"] = f"already invoiced in Finale ({prior.get('invoice_id_user') or prior.get('invoice_id')}, {prior.get('status')})"

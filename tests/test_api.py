@@ -1193,3 +1193,20 @@ def test_poll_runs_alerts_only_when_enabled_and_endpoint_previews(client):
     with patch("app.main._run_alerts", return_value={"mode": "dry", "summary": {"found": 0}, "sent": False}) as run3:
         r = client.post("/api/alerts/check", json={"dry_run": True})
     assert r.status_code == 200 and run3.call_args.args == (False,)
+
+
+
+def test_push_gate_counts_skipped_runs_and_the_live_push_in_progress(client, monkeypatch):
+    """A skipped scheduled run (auto-push off) still means 'the push had its chance',
+    and the post-push digest -- fired before the job run is logged -- sees the live
+    push that just happened rather than yesterday's run."""
+    from app import main, tracking
+    tracking.init_db()
+    assert main._last_netsuite_push_at() is None
+    tracking.record_job_run("netsuite_push", "skipped", "disabled")
+    skipped_at = main._last_netsuite_push_at()
+    assert skipped_at is not None                                              # skipped counts
+    with patch.dict(main._netsuite_push_state, {"last_run": "2099-01-01T00:00:00+00:00", "mode": "live"}):
+        assert main._last_netsuite_push_at() == "2099-01-01T00:00:00+00:00"   # in-flight live push wins
+    with patch.dict(main._netsuite_push_state, {"last_run": "2099-01-01T00:00:00+00:00", "mode": "dry"}):
+        assert main._last_netsuite_push_at() == skipped_at                     # a dry run is not a chance
