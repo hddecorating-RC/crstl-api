@@ -11,12 +11,13 @@ pack or ship -- 403). What this module removes is the SECOND keying: retyping th
 PRO into the shipment's tracking field at ship time. When an ASN is Accepted, the
 shipment is still open (INPUT or PACKED), so the pass writes
 
-    trackingCode = PRO  (carrier_reference_number, 6100...)   -- printed as SCAC/PRO
-    publicNotes  = "Routing: <RTS>" (bill_of_lading_number, 3200...)
-    order field  = RTS  (user_10000, what the bill of lading prints)
+    trackingCode = RTS     (bill_of_lading_number, 3200...)   -- "RTS IS tracking"
+    publicNotes  = "Routing: <carrier_reference_number>" (6100...)
+    order field  = RTS     (user_10000, what the bill of lading prints)
 
-(Which number is which was settled by the warehouse, 2026-09-16: RTS = 3200...,
-PRO = 6100... These labels are for our Finale records only; the ASN is not touched.)
+(Settled by the warehouse: RTS = 3200..., the 6100... is the routing number
+(2026-09-16), and the RTS is what belongs in the tracking field (2026-09-17).
+These labels are for our Finale records only; the ASN is never touched.)
 
 exactly where the warehouse puts them by hand (40864264-1 is the reference), and
 nothing else -- in particular never shipDateEstimated, which the Ship dialog would
@@ -27,7 +28,7 @@ Not a digest concern: this is a warehouse convenience; alerts/monitoring come la
 """
 from app.netsuite_push import select_for_automation
 
-RTS_PREFIX = "Routing: "
+ROUTING_PREFIX = "Routing: "
 DSD_FLAVOR = "Direct Store Delivery (DSD)"   # Crstl's trading_partner_flavor on the 856 listing
 OPEN = ("SHIPMENT_INPUT", "SHIPMENT_PACKED")
 CANCELLED = "SHIPMENT_CANCELLED"
@@ -40,40 +41,47 @@ def is_dsd_asn(asn: dict) -> bool:
     return bool(str(asn.get("rts") or "").strip())
 
 
-def rts_note(rts: str) -> str:
-    return f"{RTS_PREFIX}{rts}" if rts else ""
+def routing_note(routing: str) -> str:
+    """The shipment's public-notes line: "Routing: 6100997239"."""
+    return f"{ROUTING_PREFIX}{routing}" if routing else ""
 
 
 def plan_shipment(asn: dict, shipment: dict, carrier_url: str | None = None, rts_on_order: bool = False) -> dict:
     """What to do with ONE Finale shipment for this ASN: {action, fields, reason}.
     action: write | equal | shipped | cancelled. Pure -- no I/O. `carrier_url` is the
-    DSD carrier default (HDOC), written alongside PRO/RTS when the shipment's carrier
-    differs, so the warehouse never picks it by hand. `rts_on_order` is accepted for
-    compatibility and ignored: the RTS is written to the shipment notes REGARDLESS, so
-    the shipment page shows it (Ritchie, 2026-09-16 -- "all shipping info on the same
-    page"); the order's custom field (plan_order) is what the bill of lading prints."""
+    DSD carrier default (HDOC), written alongside the numbers when the shipment's
+    carrier differs, so the warehouse never picks it by hand. `rts_on_order` is
+    accepted for compatibility and ignored: both numbers are written to the shipment
+    REGARDLESS, so the shipment page shows everything (Ritchie, 2026-09-16 -- "all
+    shipping info on the same page").
+
+    Which number goes where (Ritchie, 2026-09-17 -- "RTS IS tracking"):
+        trackingCode = RTS (bill_of_lading_number, 3200...)
+        publicNotes  = "Routing: <carrier_reference_number>" (6100...)
+    The order's RTS custom field (plan_order) keeps the RTS, unchanged, and is what
+    the bill of lading prints."""
     status = str(shipment.get("statusId") or "")
-    pro, rts = str(asn.get("pro") or ""), str(asn.get("rts") or "")
-    have_pro, have_note = str(shipment.get("trackingCode") or ""), str(shipment.get("publicNotes") or "")
+    routing, rts = str(asn.get("pro") or ""), str(asn.get("rts") or "")
+    have_tracking, have_note = str(shipment.get("trackingCode") or ""), str(shipment.get("publicNotes") or "")
     fields = {}
-    if pro and have_pro != pro:
-        fields["trackingCode"] = pro
-    # The warehouse may have written the bare number; we write "Routing: 3200416047".
+    if rts and have_tracking != rts:
+        fields["trackingCode"] = rts
+    # The warehouse may have written the bare number; we write "Routing: 6100997239".
     # Either counts as present -- the number is what matters.
-    if rts and rts not in have_note:
-        fields["publicNotes"] = rts_note(rts)
+    if routing and routing not in have_note:
+        fields["publicNotes"] = routing_note(routing)
     if carrier_url and str(shipment.get("carrierPartyUrl") or "") != carrier_url:
         fields["carrierPartyUrl"] = carrier_url
     if status == CANCELLED:
         return {"action": "cancelled", "fields": {}, "reason": "shipment cancelled"}
     if not fields:
-        return {"action": "equal", "fields": {}, "reason": "PRO/RTS" + ("/carrier" if carrier_url else "") + " already on the shipment"}
+        return {"action": "equal", "fields": {}, "reason": "RTS/routing" + ("/carrier" if carrier_url else "") + " already on the shipment"}
     if status not in OPEN:
         # Shipped (or delivered) before the pass got to it: the warehouse's own entry
         # stands; an edit on a shipped shipment is unproven and not worth the risk.
         return {"action": "shipped", "fields": {},
                 "reason": f"already {status.replace('SHIPMENT_', '').lower()} with "
-                          f"tracking {have_pro or '-'} (ASN PRO {pro})"}
+                          f"tracking {have_tracking or '-'} (ASN RTS {rts})"}
     return {"action": "write", "fields": fields, "reason": ""}
 
 
