@@ -527,3 +527,15 @@ def test_carrier_write_failure_is_reported_and_the_invoice_still_posts():
     out, _, _ = _live(client, refs=CARRIERS_ON)
     r = out["results"][0]
     assert r["status"] == "posted" and "403" in r["carrier_error"] and "carrier_set" not in r
+
+
+def test_carrier_listing_failure_is_reported_as_such_on_every_row():
+    inv2 = {**INV, "transaction_id": "T2", "source_document_id": "S2", "invoice_number": "INV2", "po_number": "PO1"}
+    client = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0}); client._ships = [SHIPPED_NO_CARRIER]
+    def boom(): raise RuntimeError("partygroup timeout")
+    client.carrier_index = boom
+    with patch("app.tracking.get_finale_invoices", return_value={}), patch("app.tracking.record_finale_invoice"), patch("app.tracking.record_events"):
+        out = push_finale_invoices([INV, inv2], PO_MAP, live=False, refs=CARRIERS_ON, client=client)
+    notes = [r["carrier"]["note"] for r in out["results"]]
+    assert len(notes) == 2 and all("could not read Finale's carriers: partygroup timeout" in n for n in notes)
+    assert not any("not on Finale's Carriers list" in n for n in notes)

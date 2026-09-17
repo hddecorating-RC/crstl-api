@@ -161,7 +161,8 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
     results: list[dict] = []
     writers: list[tuple] = []          # (row, [(shipment, plan)], shipment id, order, order fields) -- the set the cap counts
     counts = {k: 0 for k in ("prefilled", "would_prefill", "skipped_equal", "skipped_shipped", "skipped_no_order",
-                             "skipped_no_shipment", "skipped_not_dsd", "skipped_not_accepted", "skipped_done", "failed")}
+                             "skipped_no_shipment", "skipped_not_dsd", "skipped_not_accepted", "skipped_done", "failed",
+                             "order_field_failed")}
 
     def finish(row, status, **extra):
         row.update({"status": status, **extra})
@@ -229,13 +230,23 @@ def push_dsd_prefill(asns: list[dict], *, live: bool = False, only: list[str] | 
         try:
             for s, p in writes:
                 client.update_shipment(str(s.get("shipmentUrl")), p["fields"])
-            if order_fields:
+        except Exception as exc:   # one bad ASN must not stop the batch; no receipt -> retried next pass
+            row.update(status="failed", error=str(exc)); counts["failed"] += 1
+            continue
+        if order_fields:
+            try:
                 client.set_order_user_fields(order, order_fields)
                 row["order_fields"]["written"] = True
-            tracking.record_finale_shipment(row["asn_id"], row["po_number"], sid, row["pro"], row["rts"], "prefilled")
-            row["status"] = "prefilled"; counts["prefilled"] += 1
-        except Exception as exc:   # one bad ASN must not stop the batch
-            row.update(status="failed", error=str(exc)); counts["failed"] += 1
+            except Exception as exc:  # noqa: BLE001
+                # The shipment part is done and must not be redone every 15 minutes
+                # (each retry is an edit -> relock on the order). Receipt the ASN,
+                # report the order failure ONCE; the BOL's RTS line is blank until a
+                # person keys it on the order.
+                row["order_fields"]["error"] = str(exc)
+                row["error"] = f"PRO/RTS/carrier written; order custom field NOT written: {exc}"
+                counts["order_field_failed"] += 1
+        tracking.record_finale_shipment(row["asn_id"], row["po_number"], sid, row["pro"], row["rts"], "prefilled")
+        row["status"] = "prefilled"; counts["prefilled"] += 1
 
     out = {"mode": "live" if live else "dry", "results": results,
            "summary": {"candidates": len(asns), **counts}}

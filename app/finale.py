@@ -374,21 +374,40 @@ class FinaleClient:
                     break
             else:
                 merged.append({"attrName": name, "attrValue": value})
+        oid = order.get("orderId")
         current = order
         if status == "ORDER_LOCKED":
             resp = self.session.post(self.HOST + order["actionUrlEdit"], json={}, timeout=self.TIMEOUT)
             resp.raise_for_status()
             current = resp.json()
+        write_error: Exception | None = None
         try:
             resp = self.session.post(self.HOST + order["orderUrl"],
                                      json={"orderUrl": order["orderUrl"], "userFieldDataList": merged}, timeout=self.TIMEOUT)
             resp.raise_for_status()
             current = resp.json()
-        finally:
-            if status == "ORDER_LOCKED" and current.get("actionUrlLock"):
-                lock = self.session.post(self.HOST + current["actionUrlLock"], json={}, timeout=self.TIMEOUT)
-                lock.raise_for_status()
-                current = lock.json()
+        except Exception as exc:  # noqa: BLE001 -- re-lock first, then report THIS error
+            write_error = exc
+        if status == "ORDER_LOCKED":
+            # Never trust the write response for the lock: re-read the order the way
+            # reopen_order does, lock it, and verify it is LOCKED again.
+            try:
+                current = self._get(order["orderUrl"])
+                if current.get("statusId") == "ORDER_CREATED" and current.get("actionUrlLock"):
+                    lock = self.session.post(self.HOST + current["actionUrlLock"], json={}, timeout=self.TIMEOUT)
+                    lock.raise_for_status()
+                    current = lock.json()
+            except Exception as exc:  # noqa: BLE001
+                if write_error is None:
+                    raise RuntimeError(f"order {oid}: custom fields written but re-lock failed ({exc}) -- "
+                                       f"left {current.get('statusId')}, re-lock by hand") from exc
+                raise RuntimeError(f"order {oid}: custom-field write failed ({write_error}); re-lock also failed ({exc}) "
+                                   f"-- left {current.get('statusId')}, re-lock by hand") from write_error
+            if write_error is None and current.get("statusId") != "ORDER_LOCKED":
+                raise RuntimeError(f"order {oid}: custom fields written but the order is {current.get('statusId')}, "
+                                   f"not ORDER_LOCKED -- re-lock by hand")
+        if write_error is not None:
+            raise write_error
         return current
 
     # ------------------------------------------------------------ non-EDI reads

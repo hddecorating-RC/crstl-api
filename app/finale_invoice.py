@@ -287,18 +287,19 @@ def push_finale_invoices(
     fin_cfg = refs.get("finale") or {}
     carrier_cfg = fin_cfg.get("carriers") or {}
     carrier_index: dict | None = None
+    carrier_error: str | None = None     # one failed listing is reported as such on EVERY row -- never as "not on the list"
 
     def carrier_for(channel: str) -> dict:
-        nonlocal carrier_index
+        nonlocal carrier_index, carrier_error
         if not carrier_cfg.get(channel) or client is None:
             return wanted_carrier(fin_cfg, channel, {})
-        if carrier_index is None:
+        if carrier_index is None and carrier_error is None:
             try:
                 carrier_index = client.carrier_index()
             except Exception as exc:  # noqa: BLE001 -- invoicing goes on; the carrier does not
-                carrier_index = {}
-                return {**wanted_carrier(fin_cfg, channel, {}), "url": None,
-                        "reason": f"could not read Finale's carriers: {exc}"}
+                carrier_error = f"could not read Finale's carriers: {exc}"
+        if carrier_error:
+            return {**wanted_carrier(fin_cfg, channel, {}), "url": None, "reason": carrier_error}
         return wanted_carrier(fin_cfg, channel, carrier_index)
 
     def preflight(client, row, body, prior):

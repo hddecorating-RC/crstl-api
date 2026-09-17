@@ -1210,3 +1210,27 @@ def test_push_gate_counts_skipped_runs_and_the_live_push_in_progress(client, mon
         assert main._last_netsuite_push_at() == "2099-01-01T00:00:00+00:00"   # in-flight live push wins
     with patch.dict(main._netsuite_push_state, {"last_run": "2099-01-01T00:00:00+00:00", "mode": "dry"}):
         assert main._last_netsuite_push_at() == skipped_at                     # a dry run is not a chance
+
+
+
+def test_receipt_refresh_reads_the_ones_that_need_it_not_the_first_fifty(client, monkeypatch):
+    """60 receipts, only #55 is a held draft: it is re-read (the bound applies after
+    filtering to receipts that need a read)."""
+    from app.main import _finale_reconciliation
+    from app import tracking
+    tracking.init_db()
+    invs, receipts = [], {}
+    for i in range(60):
+        tx = f"t{i}"
+        invs.append({**_so_ready_invoices()[0], "transaction_id": tx, "source_document_id": f"s{i}", "invoice_number": f"I{i}", "po_number": f"P{i}"})
+        receipts[tx] = {"po_number": f"P{i}", "invoice_id": str(i), "invoice_url": f"/i/{i}", "invoice_id_user": f"P{i}-1",
+                        "status": "draft" if i == 55 else "posted", "updated_at": "x", "created_by": "API_KEY_U_BLINDS", "finale_total": 107.14, "delta": 0.0}
+    tracking.record_events([i["transaction_id"] for i in invs], "netsuite")
+    reads = []
+    class FakeFinale:
+        def get_invoice(self, url): reads.append(url); return {"statusId": "INVOICE_IN_PROCESS"}
+    with patch("app.main.tracking.get_finale_invoices", return_value=receipts), patch("app.main._finale_floor", return_value="2026-09-15"), \
+         patch("app.finale.FinaleClient") as FC:
+        FC.configured.return_value = True; FC.return_value = FakeFinale()
+        _finale_reconciliation(invs, 4)
+    assert reads == ["/i/55"]

@@ -150,18 +150,24 @@ def test_set_order_user_fields_merges_and_edits_only_when_locked():
     with patch.dict("os.environ", {"FINALE_ACCOUNT_ID": "h", "FINALE_API_KEY": "k", "FINALE_API_SECRET": "s"}):
         c = FinaleClient()
     calls = []
+    state = {"after_write": {"orderUrl": "/h/api/order/1", "statusId": "ORDER_CREATED", "actionUrlLock": "/h/api/order/1/lock"},
+             "after_lock": {"orderUrl": "/h/api/order/1", "statusId": "ORDER_LOCKED"}, "write_fails": False}
     def post(url, json=None, timeout=None):
         calls.append((url.replace(c.HOST, ""), json))
         r = MagicMock(); r.status_code = 200
         if url.endswith("/edit"): r.json.return_value = {"orderUrl": "/h/api/order/1", "statusId": "ORDER_CREATED", "actionUrlLock": "/h/api/order/1/lock"}
-        elif url.endswith("/lock"): r.json.return_value = {"orderUrl": "/h/api/order/1", "statusId": "ORDER_LOCKED"}
-        else: r.json.return_value = {"orderUrl": "/h/api/order/1", "statusId": "ORDER_CREATED", "actionUrlLock": "/h/api/order/1/lock", "userFieldDataList": json["userFieldDataList"]}
+        elif url.endswith("/lock"): r.json.return_value = state["after_lock"]
+        else:
+            if state["write_fails"]: raise RuntimeError("write 400")
+            r.json.return_value = {"orderUrl": "/h/api/order/1", "userFieldDataList": json["userFieldDataList"]}   # no actionUrlLock here
         return r
-    c.session.post = post
+    def get(url, params=None, timeout=None):
+        calls.append((url.replace(c.HOST, "") + " GET", None)); r = MagicMock(); r.status_code = 200; r.json.return_value = state["after_write"]; return r
+    c.session.post, c.session.get = post, get
     locked = {"orderId": "1", "orderUrl": "/h/api/order/1", "statusId": "ORDER_LOCKED", "actionUrlEdit": "/h/api/order/1/edit",
               "userFieldDataList": [{"attrName": "integration_ssconnection_100000", "attrValue": "HASH"}, {"attrName": "user_10000", "attrValue": "old"}]}
     out = c.set_order_user_fields(locked, {"user_10000": "6100994307", "user_10001": "S1"})
-    assert [u for u, _ in calls] == ["/h/api/order/1/edit", "/h/api/order/1", "/h/api/order/1/lock"]
+    assert [u for u, _ in calls] == ["/h/api/order/1/edit", "/h/api/order/1", "/h/api/order/1 GET", "/h/api/order/1/lock"]   # re-read, then lock
     assert calls[1][1] == {"orderUrl": "/h/api/order/1", "userFieldDataList": [
         {"attrName": "integration_ssconnection_100000", "attrValue": "HASH"},        # kept
         {"attrName": "user_10000", "attrValue": "6100994307"},                        # updated in place
@@ -175,3 +181,12 @@ def test_set_order_user_fields_merges_and_edits_only_when_locked():
     with pytest.raises(ValueError):
         c.set_order_user_fields({**locked, "statusId": "ORDER_COMPLETED"}, {"user_10000": "x"})
     assert len(calls) == 1                                                            # nothing sent
+    # the order is still CREATED after the lock: refused loudly, never receipted as done
+    calls.clear(); state["after_lock"] = {"orderUrl": "/h/api/order/1", "statusId": "ORDER_CREATED"}
+    with pytest.raises(RuntimeError, match="not ORDER_LOCKED"):
+        c.set_order_user_fields(locked, {"user_10000": "x"})
+    # the write fails: the order is still re-locked, and the WRITE error is what surfaces
+    calls.clear(); state["after_lock"] = {"orderUrl": "/h/api/order/1", "statusId": "ORDER_LOCKED"}; state["write_fails"] = True
+    with pytest.raises(RuntimeError, match="write 400"):
+        c.set_order_user_fields(locked, {"user_10000": "x"})
+    assert "/h/api/order/1/lock" in [u for u, _ in calls]

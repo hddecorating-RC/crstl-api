@@ -262,7 +262,13 @@ def test_live_dsd_pass_writes_the_rts_onto_the_order_and_never_a_completed_one()
     off = FakeFinale(shipments=[ship()]); off._order = {**off._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}
     out5, _ = _run(off, True, refs={"finale": {"dsd_order_fields": {"enabled": False, "rts": "user_10000"}}})
     assert off.calls[-1] == ("update", URL, {"trackingCode": "6100994307", "publicNotes": "Routing: 3200416047"})
-    # an order write failing marks the ASN failed (retried next pass), the shipment write already stands
+    # an order write failing AFTER the shipment writes: receipted (never redone every 15 min),
+    # reported once on the row and in the summary; a shipment write failing is still a retry
     bad = FakeFinale(shipments=[ship()]); bad._order = {**bad._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}; bad.fail_order = True
     out6, rec6 = _run(bad, True, refs=RTS_ON)
-    assert out6["results"][0]["status"] == "failed" and "order 403" in out6["results"][0]["error"]; rec6.assert_not_called()
+    r6 = out6["results"][0]
+    assert r6["status"] == "prefilled" and "order 403" in r6["error"] and r6["order_fields"]["error"] and "written" not in r6["order_fields"]
+    assert out6["summary"]["order_field_failed"] == 1 and out6["summary"]["failed"] == 0; rec6.assert_called_once()
+    worse = FakeFinale(shipments=[ship()], fail_update=True); worse._order = {**worse._order, "statusId": "ORDER_LOCKED", "userFieldDataList": []}
+    out7, rec7 = _run(worse, True, refs=RTS_ON)
+    assert out7["results"][0]["status"] == "failed" and rec7.assert_not_called() is None

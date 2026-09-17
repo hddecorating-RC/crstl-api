@@ -1087,7 +1087,8 @@ def _run_dsd_prefill(live: bool, ids: Optional[list[str]], limit: Optional[int])
                             (f"{blocked} -- refusing; run manually" if blocked else
                              f"{s['candidates']} ASNs: {s.get('prefilled', 0)} prefilled, {s.get('would_prefill', 0)} would, "
                              f"{s.get('skipped_no_shipment', 0) + s.get('skipped_no_order', 0)} waiting, "
-                             f"{s.get('skipped_shipped', 0)} already shipped, {s.get('failed', 0)} failed")
+                             f"{s.get('skipped_shipped', 0)} already shipped, {s.get('failed', 0)} failed"
+                             + (f", {s['order_field_failed']} order field NOT written" if s.get("order_field_failed") else ""))
                             + f" [{'live' if live else 'dry'}]")
     return result
 
@@ -1223,10 +1224,10 @@ def _finale_reconciliation(invoices: list[dict], stale_days) -> dict:
         # Re-read (bounded) the receipts that need it: a draft we hold, to see if it
         # was posted by hand since; and a receipt from before the reconciliation
         # columns existed (no total), to fill in who / total / delta once.
-        for tx, rec in list(receipts.items())[:50]:
+        needs = [(tx, rec) for tx, rec in receipts.items()
+                 if rec.get("invoice_url") and (rec.get("status") == "draft" or rec.get("finale_total") is None)]
+        for tx, rec in needs[:50]:          # bounded reads per digest, of the ones that need it
             draft = rec.get("status") == "draft"
-            if not rec.get("invoice_url") or not (draft or rec.get("finale_total") is None):
-                continue
             try:
                 live = client.get_invoice(rec["invoice_url"])
             except Exception:  # noqa: BLE001 -- a read failure leaves the receipt as it was
