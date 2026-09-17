@@ -21,7 +21,7 @@ from app.netsuite_csv import build_netsuite_csv
 from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation
 from app.finale_invoice import push_finale_invoices
 from app.shipstation import ShipStationClient, push_shipstation_close
-from app.alerts import alert_recipients, run_alerts
+from app.alerts import alert_recipients, run_alerts, sent_asn_pos
 from app.finale_nonedi import push_nonedi_invoices
 from app.finale_dsd import push_dsd_prefill, select_dsd_asns
 from app.netsuite_payload import load_refs
@@ -1137,7 +1137,7 @@ def _run_alerts(live: bool) -> dict:
     since = (datetime.now(timezone.utc) - timedelta(days=int(cfg.get("lookback_days") or 7))).strftime("%Y-%m-%d")
     shipments = ShipStationClient().list_shipments(int(cfg.get("dropship_store_id") or 0), since)
     crstl = _get_client()
-    asn_pos = {v["po_number"] for v in crstl.list_transaction_states("856").values()}
+    asn_pos = sent_asn_pos(crstl.list_transaction_states("856"))       # Draft/Rejected do not count as sent
     po_ids = {str((tx.get("metadata") or tx).get("reference_id")): str((tx.get("metadata") or tx).get("id"))
               for tx in crstl._fetch_all_transactions("850")}
     result = run_alerts(shipments, asn_pos, po_ids, config=cfg, live=live, recipients=alert_recipients(), send=send_mail)

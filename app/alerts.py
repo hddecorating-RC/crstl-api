@@ -29,6 +29,18 @@ ISSUES = {
 }
 
 
+# An 856 in one of these states was never sent to HD: a Draft is a warehouse
+# resubmission in progress, a Rejected one bounced. Neither counts as "ASN sent",
+# so neither may silence (or resolve) the alert. Anything else (Send_Success,
+# Accepted, or a state CRSTL adds later) counts as sent -- erring towards quiet.
+NOT_SENT_STATES = ("Draft", "Rejected")
+
+
+def sent_asn_pos(asn_states: dict) -> set:
+    """PO numbers with an 856 that actually went to HD, from list_transaction_states('856')."""
+    return {v["po_number"] for v in asn_states.values() if v.get("state") not in NOT_SENT_STATES}
+
+
 def crstl_po_url(po_transaction_id: str | None) -> str:
     return CRSTL_PO_URL.format(id=po_transaction_id) if po_transaction_id else ""
 

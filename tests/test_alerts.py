@@ -71,3 +71,16 @@ def test_run_alerts_sends_once_lists_still_open_and_resolves(tmp_path, monkeypat
     # no recipients configured: live refuses rather than sending nowhere
     with pytest.raises(RuntimeError):
         run_alerts(ships3 + [lab("538879999", 5, "2026-09-16T12:00:00")], {"538858722"}, IDS, config=CFG, live=True, recipients=[], send=send, now=NOW)
+
+
+def test_only_sent_asns_silence_or_resolve_the_alert():
+    """A Draft (warehouse resubmission in progress) or Rejected 856 is not an ASN HD
+    has: the PO stays an outlier, and an earlier alert for it is not resolved."""
+    from app.alerts import resolved_asn_missing, sent_asn_pos
+    states = {"a": {"po_number": "1", "state": "Accepted"}, "b": {"po_number": "2", "state": "Send_Success"},
+              "c": {"po_number": "3", "state": "Draft"}, "d": {"po_number": "4", "state": "Rejected"},
+              "e": {"po_number": "5", "state": "Draft"}, "f": {"po_number": "5", "state": "Accepted"}}   # resubmitted then accepted
+    assert sent_asn_pos(states) == {"1", "2", "5"}
+    ships = [lab("3", 3, "2026-09-16T12:00:00"), lab("4", 4, "2026-09-16T12:00:00"), lab("1", 1, "2026-09-16T12:00:00")]
+    assert [r["po_number"] for r in find_asn_missing(ships, sent_asn_pos(states), {}, after_minutes=60, now=NOW)] == ["3", "4"]
+    assert resolved_asn_missing([{"issue": "asn_missing", "po_number": "3", "key": "k"}], sent_asn_pos(states)) == []
