@@ -22,15 +22,14 @@ CRSTL_PO_URL = "https://omnicrstl.web.app/edi/purchase-order/view/{id}/{id}"
 
 ISSUES = {
     "asn_missing": {
-        "title": "ASN not sent to Home Depot",
-        "detail": "label created in ShipStation, no ASN in CRSTL after {minutes} min.",
-        "fix": "create the 856 and 810 in CRSTL.",
+        "title": "ASN not sent to HD",
+        "detail": "no ASN {minutes} min after the label",
+        "fix": "create the 856 and 810 in CRSTL",
     },
     "packed_unshipped": {
-        "title": "Packed but never shipped",
-        "detail": "packed in Finale over {packed_hours} hours ago and still not shipped. Until it is, "
-                  "the order does not invoice.",
-        "fix": "if the courier took it, select it and use Ship Selected Sales. If it has not gone, say so.",
+        "title": "Packed, not shipped",
+        "detail": "packed over {packed_hours}h ago",
+        "fix": "Ship Selected Sales if it went",
     },
 }
 
@@ -134,10 +133,10 @@ def find_packed_unshipped(shipments: list[dict], po_ids: dict, dropship_pos: set
         if packed_after and when.astimezone(ET).strftime("%Y-%m-%d") < packed_after:
             continue
         days = int(r["hours"] // 24)
-        age = f" ({days} days ago)" if days >= 2 else ""
+        age = f" ({days}d)" if days >= 2 else ""
         out.append({"issue": "packed_unshipped", "key": f"packed_unshipped:{r['shipment_id']}",
                     "po_number": r["po_number"], "url": crstl_po_url(po_ids.get(r["po_number"])),
-                    "note": f"{r['shipment_id_user']}, packed {when.astimezone(ET).strftime('%a %d %b %H:%M ET')}{age}"})
+                    "note": f"{r['shipment_id_user']}, packed {when.astimezone(ET).strftime('%d %b %H:%M ET')}{age}"})
     return out
 
 
@@ -173,13 +172,16 @@ def alert_email(new_rows: list[dict], still_open: list[dict], config: dict) -> t
     h = ""
     for issue, rows in by_issue.items():
         meta = ISSUES[issue]
-        h += (f'<p><strong>{html.escape(meta["title"])}</strong> — '
-              f'{html.escape(meta["detail"].format(minutes=config.get("asn_missing_after_minutes", 60), packed_hours=config.get("packed_unshipped_after_hours", 24)))}<br>'
-              f'Fix: {html.escape(meta["fix"])}</p><ul>'
+        detail = meta["detail"].format(minutes=config.get("asn_missing_after_minutes", 60),
+                                       packed_hours=config.get("packed_unshipped_after_hours", 24))
+        h += (f'<p style="margin:0 0 4px"><strong>{html.escape(meta["title"])}</strong> — '
+              f'{html.escape(detail)}. <em>{html.escape(meta["fix"])}.</em></p>'
+              f'<ul style="margin:0 0 14px">'
               + "".join(f"<li>{link(r)}{(' — ' + html.escape(r['note'])) if r.get('note') else ''}</li>" for r in rows)
               + "</ul>")
     if still_open:
-        h += ("<p>Still open: " + ", ".join(f"{link(r)} (alerted {html.escape(str(r.get('sent_et') or ''))})" for r in still_open) + "</p>")
+        h += ('<p style="margin:0">Still open: '
+              + ", ".join(f"{link(r)} ({html.escape(str(r.get('sent_et') or ''))})" for r in still_open) + "</p>")
     return subject, h
 
 
@@ -204,7 +206,7 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
     resolved = resolved_asn_missing(open_all, asn_pos, voided_keys)
     resolved += resolved_packed_unshipped(open_all, packed_keys)
     still_open = [{**r, "url": crstl_po_url(po_ids.get(str(r.get("po_number")))),
-                   "sent_et": (datetime.fromisoformat(r["sent_at"]).astimezone(ET).strftime("%m-%d %H:%M ET") if r.get("sent_at") else "")}
+                   "sent_et": (datetime.fromisoformat(r["sent_at"]).astimezone(ET).strftime("%d %b %H:%M ET") if r.get("sent_at") else "")}
                   for r in open_all if r not in resolved and r["key"] not in {n["key"] for n in new}]
     subject, body = alert_email(new, still_open, config) if new else ("", "")
     sent = False

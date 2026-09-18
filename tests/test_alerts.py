@@ -34,15 +34,15 @@ def test_email_shape_subject_orders_and_grouping():
     rows = [{"issue": "asn_missing", "key": "k1", "po_number": "538871711", "url": crstl_po_url("x1"), "note": "label 15:45 ET"},
             {"issue": "asn_missing", "key": "k2", "po_number": "538873990", "url": "", "note": "label 16:10 ET"}]
     subject, body = alert_email(rows, [], CFG)
-    assert subject == "Order alert: ASN not sent to Home Depot — 538871711, 538873990"
+    assert subject == "Order alert: ASN not sent to HD — 538871711, 538873990"
     assert '<a href="https://omnicrstl.web.app/edi/purchase-order/view/x1/x1">538871711</a>' in body
     assert "<li>538873990 — label 16:10 ET</li>" in body                      # no id -> plain text, still listed
-    assert "Fix: create the 856 and 810 in CRSTL." in body and "after 60 min" in body
+    assert "create the 856 and 810 in CRSTL" in body and "no ASN 60 min after the label" in body
     assert "Still open" not in body
     many = [{**rows[0], "po_number": str(i)} for i in range(5)]
     assert alert_email(many, [], CFG)[0].endswith("— 0, 1, 2 +2 more")
-    s2, b2 = alert_email(rows[:1], [{"po_number": "538858722", "url": crstl_po_url("def"), "sent_et": "09-16 11:40 ET"}], CFG)
-    assert "Still open: <a href=" in b2 and "538858722</a> (alerted 09-16 11:40 ET)" in b2
+    s2, b2 = alert_email(rows[:1], [{"po_number": "538858722", "url": crstl_po_url("def"), "sent_et": "16 Sep 11:40 ET"}], CFG)
+    assert "Still open: <a href=" in b2 and "538858722</a> (16 Sep 11:40 ET)" in b2
 
 
 def test_run_alerts_sends_once_lists_still_open_and_resolves(tmp_path, monkeypatch):
@@ -53,7 +53,7 @@ def test_run_alerts_sends_once_lists_still_open_and_resolves(tmp_path, monkeypat
     # dry: found but nothing sent, nothing receipted
     d = run_alerts(ships, set(), IDS, config=CFG, live=False, recipients=["order.alerts@x"], send=send, now=NOW)
     assert d["summary"] == {"found": 2, "new": 2, "still_open": 0, "resolved": 0} and not d["sent"] and send.call_count == 0
-    assert d["subject"] == "Order alert: ASN not sent to Home Depot — 538871711, 538858722"
+    assert d["subject"] == "Order alert: ASN not sent to HD — 538871711, 538858722"
     # live: ONE email for both, two receipts
     l1 = run_alerts(ships, set(), IDS, config=CFG, live=True, recipients=["order.alerts@x"], send=send, now=NOW)
     assert l1["sent"] and send.call_count == 1
@@ -136,10 +136,10 @@ def test_find_packed_unshipped_threshold_floor_and_wording():
     rows = find_packed_unshipped(ships, IDS, DROP, after_hours=24, now=LATER)
     assert len(rows) == 1 and rows[0]["issue"] == "packed_unshipped" and rows[0]["key"] == "packed_unshipped:100621"
     assert rows[0]["po_number"] == "538873472" and "538873472-1, packed" in rows[0]["note"]
-    assert "days ago" not in rows[0]["note"]                                            # only past 2 days
+    assert "d)" not in rows[0]["note"]                                                  # age only past 2 days
     old = find_packed_unshipped(ships, IDS, DROP, after_hours=24,
                                 now=datetime.fromtimestamp(PACKED_AT, tz=timezone.utc) + timedelta(days=3))
-    assert "(3 days ago)" in old[0]["note"]
+    assert "(3d)" in old[0]["note"]
     # the floor keeps history out when the check is switched on
     assert find_packed_unshipped(ships, IDS, DROP, after_hours=24, packed_after="2026-09-18", now=LATER) == []
 
@@ -152,9 +152,9 @@ def test_packed_alert_sends_once_and_resolves_when_it_ships(tmp_path, monkeypatc
     r1 = run_alerts([], set(), IDS, config=cfg, live=True, recipients=["g@x"], send=send,
                     finale_shipments=[fship()], dropship_pos=DROP, now=LATER)
     assert r1["sent"] and send.call_count == 1
-    assert send.call_args.kwargs["subject"] == "Order alert: Packed but never shipped — 538873472"
+    assert send.call_args.kwargs["subject"] == "Order alert: Packed, not shipped — 538873472"
     body = send.call_args.kwargs["body_html"]
-    assert "packed in Finale over 24 hours ago" in body and "Ship Selected Sales" in body
+    assert "packed over 24h ago" in body and "Ship Selected Sales if it went" in body
     # nothing new next run
     r2 = run_alerts([], set(), IDS, config=cfg, live=True, recipients=["g@x"], send=send,
                     finale_shipments=[fship()], dropship_pos=DROP, now=LATER)
@@ -172,5 +172,5 @@ def test_two_issues_share_one_email():
             {"issue": "packed_unshipped", "key": "b", "po_number": "538873472", "url": "", "note": "538873472-1, packed Wed 17 Sep 18:53 ET"}]
     subject, body = alert_email(rows, [], {**CFG, "packed_unshipped_after_hours": 24})
     assert subject == "Order alert: 2 issues — 538871711, 538873472"
-    assert body.index("ASN not sent to Home Depot") < body.index("Packed but never shipped")
-    assert "after 60 min" in body and "over 24 hours ago" in body
+    assert body.index("ASN not sent to HD") < body.index("Packed, not shipped")
+    assert "60 min after the label" in body and "packed over 24h ago" in body
