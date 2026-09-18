@@ -2,7 +2,7 @@
 is emailed ONCE to the order.alerts group, one email per run grouped by issue, order
 numbers in the subject and clickable in the body, still-open ones listed, resolved
 when the 856 appears."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -102,3 +102,75 @@ def test_a_voided_label_resolves_its_alert_and_a_replacement_is_alerted_afresh(t
     relabel = voided + [lab("538871711", 2, "2026-09-16T12:50:00")]
     r2 = run_alerts(relabel, set(), IDS, config=CFG, live=True, recipients=["g@x"], send=send, now=NOW)
     assert [x["key"] for x in r2["new"]] == ["asn_missing:2"] and send.call_count == 2
+
+
+# --- packed but never shipped -------------------------------------------------
+PACKED_AT = 1789700000          # 2026-09-17 ~18:53 ET
+def fship(po="538873472", sid=100621, status="SHIPMENT_PACKED", packed=PACKED_AT, typ="SALES_SHIPMENT"):
+    hist = [{"statusId": "SHIPMENT_PACKED", "txStamp": packed}] if packed else []
+    return {"shipmentId": sid, "shipmentIdUser": f"{po}-1", "statusId": status, "shipmentTypeId": typ,
+            "primaryOrderUrl": f"/hddecorating/api/order/{po}", "statusIdHistoryList": hist}
+
+DROP = {"538873472", "538879048"}
+LATER = datetime.fromtimestamp(PACKED_AT, tz=timezone.utc) + timedelta(hours=30)
+
+
+def test_packed_dropship_excludes_dsd_shipped_and_fixtures():
+    from app.alerts import packed_dropship
+    rows = packed_dropship([
+        fship(),                                             # dropship, packed -> in
+        fship(po="40865972", sid=2),                         # DSD: packed for a scheduled pickup -> out
+        fship(po="538879048", sid=3, status="SHIPMENT_SHIPPED"),   # already shipped -> out
+        fship(po="TEST_0007", sid=4),                        # fixture -> out
+        fship(po="538879048", sid=5, typ="PURCHASE_SHIPMENT"),     # not a sale -> out
+        fship(po="538879048", sid=6, packed=None),           # no pack stamp -> out
+    ], DROP, now=LATER)
+    assert [r["shipment_id"] for r in rows] == [100621]
+    assert round(rows[0]["hours"]) == 30
+
+
+def test_find_packed_unshipped_threshold_floor_and_wording():
+    from app.alerts import find_packed_unshipped
+    ships = [fship()]
+    assert find_packed_unshipped(ships, {}, DROP, after_hours=48, now=LATER) == []      # not late yet
+    rows = find_packed_unshipped(ships, IDS, DROP, after_hours=24, now=LATER)
+    assert len(rows) == 1 and rows[0]["issue"] == "packed_unshipped" and rows[0]["key"] == "packed_unshipped:100621"
+    assert rows[0]["po_number"] == "538873472" and "538873472-1, packed" in rows[0]["note"]
+    assert "days ago" not in rows[0]["note"]                                            # only past 2 days
+    old = find_packed_unshipped(ships, IDS, DROP, after_hours=24,
+                                now=datetime.fromtimestamp(PACKED_AT, tz=timezone.utc) + timedelta(days=3))
+    assert "(3 days ago)" in old[0]["note"]
+    # the floor keeps history out when the check is switched on
+    assert find_packed_unshipped(ships, IDS, DROP, after_hours=24, packed_after="2026-09-18", now=LATER) == []
+
+
+def test_packed_alert_sends_once_and_resolves_when_it_ships(tmp_path, monkeypatch):
+    from app import tracking
+    monkeypatch.setenv("TRACKING_DB", str(tmp_path / "t.db")); tracking.init_db()
+    send = MagicMock()
+    cfg = {**CFG, "packed_unshipped_after_hours": 24}
+    r1 = run_alerts([], set(), IDS, config=cfg, live=True, recipients=["g@x"], send=send,
+                    finale_shipments=[fship()], dropship_pos=DROP, now=LATER)
+    assert r1["sent"] and send.call_count == 1
+    assert send.call_args.kwargs["subject"] == "Order alert: Packed but never shipped — 538873472"
+    body = send.call_args.kwargs["body_html"]
+    assert "packed in Finale over 24 hours ago" in body and "Ship Selected Sales" in body
+    # nothing new next run
+    r2 = run_alerts([], set(), IDS, config=cfg, live=True, recipients=["g@x"], send=send,
+                    finale_shipments=[fship()], dropship_pos=DROP, now=LATER)
+    assert not r2["sent"] and [x["po_number"] for x in r2["still_open"]] == ["538873472"]
+    # the warehouse ships it: resolved, off the still-open line
+    r3 = run_alerts([], set(), IDS, config=cfg, live=True, recipients=["g@x"], send=send,
+                    finale_shipments=[fship(status="SHIPMENT_SHIPPED")], dropship_pos=DROP, now=LATER)
+    assert r3["resolved"] == ["packed_unshipped:100621"] and r3["still_open"] == []
+    assert tracking.open_alert_receipts() == []
+
+
+def test_two_issues_share_one_email():
+    from app.alerts import alert_email
+    rows = [{"issue": "asn_missing", "key": "a", "po_number": "538871711", "url": "", "note": "label 15:45 ET"},
+            {"issue": "packed_unshipped", "key": "b", "po_number": "538873472", "url": "", "note": "538873472-1, packed Wed 17 Sep 18:53 ET"}]
+    subject, body = alert_email(rows, [], {**CFG, "packed_unshipped_after_hours": 24})
+    assert subject == "Order alert: 2 issues — 538871711, 538873472"
+    assert body.index("ASN not sent to Home Depot") < body.index("Packed but never shipped")
+    assert "after 60 min" in body and "over 24 hours ago" in body

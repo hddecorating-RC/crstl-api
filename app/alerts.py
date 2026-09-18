@@ -26,7 +26,15 @@ ISSUES = {
         "detail": "label created in ShipStation, no ASN in CRSTL after {minutes} min.",
         "fix": "create the 856 and 810 in CRSTL.",
     },
+    "packed_unshipped": {
+        "title": "Packed but never shipped",
+        "detail": "packed in Finale over {packed_hours} hours ago and still not shipped. Until it is, "
+                  "the order does not invoice.",
+        "fix": "if the courier took it, select it and use Ship Selected Sales. If it has not gone, say so.",
+    },
 }
+
+PACKED = "SHIPMENT_PACKED"
 
 
 # An 856 in one of these states was never sent to HD: a Draft is a warehouse
@@ -74,6 +82,71 @@ def find_asn_missing(shipments: list[dict], asn_pos: set, po_ids: dict, *, after
     return out
 
 
+def packed_at(shipment: dict) -> datetime | None:
+    """When a Finale shipment was packed, from the SHIPMENT_PACKED entry in its status
+    history. The shipment LISTING carries that history but no packDate, so this needs
+    no extra request."""
+    for e in shipment.get("statusIdHistoryList") or []:
+        if isinstance(e, dict) and e.get("statusId") == PACKED and e.get("txStamp"):
+            try:
+                return datetime.fromtimestamp(int(e["txStamp"]), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                return None
+    return None
+
+
+def packed_dropship(shipments: list[dict], dropship_pos: set, *, now: datetime | None = None) -> list[dict]:
+    """Every Finale sale shipment still PACKED on a DROPSHIP order, with how long it has
+    been packed. The raw material for the alert AND for choosing its threshold. Pure.
+
+    DSD is deliberately excluded (Ritchie, 2026-09-17): a DSD shipment is packed days
+    before the pickup its ASN scheduled, so it sits packed by design and any flat
+    threshold would report it as late. `dropship_pos` comes from the 850s' own
+    trading_partner_flavor, so the split is CRSTL's, not a guess from the PO format.
+    """
+    now = now or datetime.now(timezone.utc)
+    out = []
+    for s in shipments:
+        if str(s.get("statusId") or "") != PACKED or s.get("shipmentTypeId") != "SALES_SHIPMENT":
+            continue
+        po = str(s.get("primaryOrderUrl") or "").rstrip("/").rsplit("/", 1)[-1]
+        if not po or po.upper().startswith("TEST_") or po not in dropship_pos:
+            continue
+        when = packed_at(s)
+        if when is None:
+            continue
+        out.append({"po_number": po, "shipment_id": s.get("shipmentId"),
+                    "shipment_id_user": s.get("shipmentIdUser") or s.get("shipmentId"),
+                    "packed_at": when, "hours": (now - when).total_seconds() / 3600})
+    return sorted(out, key=lambda r: r["hours"], reverse=True)
+
+
+def find_packed_unshipped(shipments: list[dict], po_ids: dict, dropship_pos: set, *, after_hours: int,
+                          packed_after: str | None = None, now: datetime | None = None) -> list[dict]:
+    """Rows for issue 'packed_unshipped': dropship shipments packed more than
+    `after_hours` ago and still not shipped. `packed_after` is a positive floor on the
+    pack date, so switching this on never alerts the whole history at once."""
+    out = []
+    for r in packed_dropship(shipments, dropship_pos, now=now):
+        if r["hours"] < after_hours:
+            continue
+        when = r["packed_at"]
+        if packed_after and when.astimezone(ET).strftime("%Y-%m-%d") < packed_after:
+            continue
+        days = int(r["hours"] // 24)
+        age = f" ({days} days ago)" if days >= 2 else ""
+        out.append({"issue": "packed_unshipped", "key": f"packed_unshipped:{r['shipment_id']}",
+                    "po_number": r["po_number"], "url": crstl_po_url(po_ids.get(r["po_number"])),
+                    "note": f"{r['shipment_id_user']}, packed {when.astimezone(ET).strftime('%a %d %b %H:%M ET')}{age}"})
+    return out
+
+
+def resolved_packed_unshipped(open_receipts: list[dict], packed_keys: set) -> list[dict]:
+    """Earlier 'packed_unshipped' receipts whose shipment is no longer packed -- it was
+    shipped, or cancelled. Either way the warehouse has dealt with it."""
+    return [r for r in open_receipts if r.get("issue") == "packed_unshipped" and r.get("key") not in packed_keys]
+
+
 def resolved_asn_missing(open_receipts: list[dict], asn_pos: set, voided_keys: set = frozenset()) -> list[dict]:
     """Earlier 'asn_missing' receipts that have cleared: the PO now has a sent 856, or
     the label itself was voided (order cancelled / re-labelled -- no ASN will ever
@@ -101,7 +174,7 @@ def alert_email(new_rows: list[dict], still_open: list[dict], config: dict) -> t
     for issue, rows in by_issue.items():
         meta = ISSUES[issue]
         h += (f'<p><strong>{html.escape(meta["title"])}</strong> — '
-              f'{html.escape(meta["detail"].format(minutes=config.get("asn_missing_after_minutes", 60)))}<br>'
+              f'{html.escape(meta["detail"].format(minutes=config.get("asn_missing_after_minutes", 60), packed_hours=config.get("packed_unshipped_after_hours", 24)))}<br>'
               f'Fix: {html.escape(meta["fix"])}</p><ul>'
               + "".join(f"<li>{link(r)}{(' — ' + html.escape(r['note'])) if r.get('note') else ''}</li>" for r in rows)
               + "</ul>")
@@ -111,17 +184,25 @@ def alert_email(new_rows: list[dict], still_open: list[dict], config: dict) -> t
 
 
 def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dict, live: bool,
-               recipients: list[str], send, now: datetime | None = None) -> dict:
+               recipients: list[str], send, finale_shipments: list[dict] | None = None,
+               dropship_pos: set | None = None, now: datetime | None = None) -> dict:
     """Find outliers, diff against receipts, send ONE email for the new ones (live),
     resolve receipts whose issue has cleared. Returns what it found/sent."""
     from app import tracking
     now = now or datetime.now(timezone.utc)
+    finale_shipments = finale_shipments or []
     found = find_asn_missing(shipments, asn_pos, po_ids, after_minutes=int(config.get("asn_missing_after_minutes") or 60), now=now)
+    found += find_packed_unshipped(finale_shipments, po_ids, dropship_pos or set(),
+                                   after_hours=int(config.get("packed_unshipped_after_hours") or 24),
+                                   packed_after=(str(config.get("packed_go_live_after") or "") or None), now=now)
     receipts = tracking.get_alert_receipts([r["key"] for r in found])
     new = [r for r in found if r["key"] not in receipts]
     open_all = tracking.open_alert_receipts()
     voided_keys = {f"asn_missing:{s.get('shipmentId')}" for s in shipments if s.get("voided")}
+    packed_keys = {f"packed_unshipped:{r['shipment_id']}"
+                   for r in packed_dropship(finale_shipments, dropship_pos or set(), now=now)}
     resolved = resolved_asn_missing(open_all, asn_pos, voided_keys)
+    resolved += resolved_packed_unshipped(open_all, packed_keys)
     still_open = [{**r, "url": crstl_po_url(po_ids.get(str(r.get("po_number")))),
                    "sent_et": (datetime.fromisoformat(r["sent_at"]).astimezone(ET).strftime("%m-%d %H:%M ET") if r.get("sent_at") else "")}
                   for r in open_all if r not in resolved and r["key"] not in {n["key"] for n in new}]

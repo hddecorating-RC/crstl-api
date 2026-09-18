@@ -1188,9 +1188,15 @@ def _run_alerts(live: bool) -> dict:
     shipments = ShipStationClient().list_shipments(int(cfg.get("dropship_store_id") or 0), since)
     crstl = _get_client()
     asn_pos = sent_asn_pos(crstl.list_transaction_states("856"))       # Draft/Rejected do not count as sent
-    po_ids = {str((tx.get("metadata") or tx).get("reference_id")): str((tx.get("metadata") or tx).get("id"))
-              for tx in crstl._fetch_all_transactions("850")}
-    result = run_alerts(shipments, asn_pos, po_ids, config=cfg, live=live, recipients=alert_recipients(), send=send_mail)
+    orders_850 = [(tx.get("metadata") or tx) for tx in crstl._fetch_all_transactions("850")]
+    po_ids = {str(m.get("reference_id")): str(m.get("id")) for m in orders_850}
+    # The dropship/DSD split comes from CRSTL's own flavour on the 850, not the PO format.
+    dropship_pos = {str(m.get("reference_id")) for m in orders_850
+                    if "dropship" in str(m.get("trading_partner_flavor") or "").lower()}
+    from app.finale import FinaleClient
+    finale_shipments = FinaleClient().list_shipments() if FinaleClient.configured() else []
+    result = run_alerts(shipments, asn_pos, po_ids, config=cfg, live=live, recipients=alert_recipients(),
+                        send=send_mail, finale_shipments=finale_shipments, dropship_pos=dropship_pos)
     with _finale_push_lock:
         _finale_push_state["alerts"] = {"last_run": datetime.now(timezone.utc).isoformat(),
                                         **{k: v for k, v in result.items() if k != "body_html"}}
