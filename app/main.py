@@ -22,6 +22,7 @@ from app.netsuite_push import push_invoices, eligible_for_push, select_for_autom
 from app.finale_invoice import push_finale_invoices
 from app.shipstation import ShipStationClient, push_shipstation_close
 from app.alerts import alert_recipients, run_alerts, sent_asn_pos
+from app.dropship import push_dropship_prefill
 from app.finale_nonedi import push_nonedi_invoices
 from app.finale_dsd import push_dsd_prefill, select_dsd_asns
 from app.netsuite_payload import load_refs
@@ -1044,6 +1045,12 @@ def _finale_poll_passes() -> None:
         except Exception as exc:
             print(f"WARNING: ShipStation close poll failed: {exc}")
             tracking.record_job_run("shipstation_close", "error", str(exc)[:200])
+    if _dropship_config().get("enabled"):
+        try:
+            _run_dropship_prefill(True, None, None)
+        except Exception as exc:
+            print(f"WARNING: dropship pre-fill poll failed: {exc}")
+            tracking.record_job_run("dropship_prefill", "error", str(exc)[:200])
     if _alerts_config().get("enabled"):
         try:
             _run_alerts(True)
@@ -1125,6 +1132,43 @@ def _run_shipstation_close(live: bool, ids: Optional[list[str]], limit: Optional
                              f"{c['candidates']} open: {c.get('close_done', 0)} closed, {c.get('would_close', 0)} would, "
                              f"{c.get('skipped_not_shipped', 0) + c.get('skipped_no_finale', 0)} waiting, "
                              f"{c.get('skipped_floor', 0)} pre-floor, {c.get('skipped_cancelled', 0)} cancelled in Finale, "
+                             f"{c.get('failed', 0)} failed") + f" [{'live' if live else 'dry'}]")
+    return result
+
+
+def _dropship_config() -> dict:
+    return load_refs().get("dropship_prefill") or {}
+
+
+def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[int]) -> dict:
+    """Write carrier + tracking onto the packed Finale shipment of each dropship label
+    (live) or preview it (dry). `ids` names PO numbers; the automated pass (ids=None)
+    applies the label-date floor and the cap. Two listings, no per-order reads."""
+    from app.finale import FinaleClient, FinaleUnavailable, wanted_carrier
+    if not ShipStationClient.configured():
+        raise FinaleUnavailable("SHIPSTATION_V1_KEY / SHIPSTATION_V1_SECRET not set")
+    if not FinaleClient.configured():
+        raise FinaleUnavailable("FINALE_* credentials not set")
+    cfg, automated = _dropship_config(), ids is None
+    client = FinaleClient()
+    since = (datetime.now(timezone.utc) - timedelta(days=int(cfg.get("lookback_days") or 3))).strftime("%Y-%m-%d")
+    labels = ShipStationClient().list_shipments(int(cfg.get("store_id") or 0), since)
+    carrier = wanted_carrier(_finale_config(), "dropship", client.carrier_index())
+    with _finale_run("dropship"):
+        result = push_dropship_prefill(client.list_shipments(), labels, live=live, only=ids, limit=limit,
+                                       client=client, carrier_url=carrier["url"] if carrier["enabled"] else None,
+                                       created_after=(str(cfg.get("go_live_after") or "") or None) if automated else None,
+                                       max_per_run=cfg.get("max_per_run") if automated else None)
+    result["carrier"] = {"wanted": carrier["name"], "enabled": carrier["enabled"], "note": carrier["reason"] or None}
+    blocked = result.get("blocked")
+    with _finale_push_lock:
+        _finale_push_state["dropship"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
+    c = result["summary"]
+    tracking.record_job_run("dropship_prefill", "blocked" if blocked else ("ok" if not c.get("failed") else "partial"),
+                            (f"{blocked} -- refusing; run manually" if blocked else
+                             f"{c['candidates']} label(s): {c.get('prefilled', 0)} prefilled, {c.get('would_prefill', 0)} would, "
+                             f"{c.get('skipped_equal', 0)} already set, {c.get('skipped_no_shipment', 0)} waiting, "
+                             f"{c.get('skipped_shipped', 0)} shipped, {c.get('skipped_ambiguous', 0)} ambiguous, "
                              f"{c.get('failed', 0)} failed") + f" [{'live' if live else 'dry'}]")
     return result
 
@@ -1797,6 +1841,19 @@ async def shipstation_close(body: FinalePushRequest = FinalePushRequest()) -> JS
         return JSONResponse(status_code=400, content={"message": "live run requires ids (ShipStation order numbers)"})
     try:
         result = _run_shipstation_close(not body.dry_run, body.ids, body.limit)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=503, content={"message": str(exc)[:200]})
+    return JSONResponse(content=result)
+
+
+@app.post("/api/dropship/prefill")
+async def dropship_prefill(body: FinalePushRequest = FinalePushRequest()) -> JSONResponse:
+    """Write carrier + tracking onto packed dropship shipments. Dry by default; a
+    live run must name PO numbers, like every other writer."""
+    if not body.dry_run and not body.ids:
+        return JSONResponse(status_code=400, content={"message": "live run requires ids (PO numbers)"})
+    try:
+        result = _run_dropship_prefill(not body.dry_run, body.ids, body.limit)
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=503, content={"message": str(exc)[:200]})
     return JSONResponse(content=result)

@@ -310,6 +310,21 @@ class FinaleClient:
                 out[name] = r["partyUrl"]
         return out
 
+    def get_shipment(self, shipment_url: str) -> dict:
+        """One shipment by its API url. The shipment LISTING omits trackingCode and
+        carrierPartyUrl, so a caller deciding whether to write them needs this."""
+        return self._get(shipment_url)
+
+    def list_shipments(self) -> list[dict]:
+        """Every shipment in one request (statusId, primaryOrderUrl, shipmentUrl --
+        but NOT trackingCode or carrierPartyUrl). Same no-paging caveat as
+        fetch_ship_dates: `offset` does not work on this endpoint."""
+        rows = to_rows(self._get(f"{self.base_url}/shipment", limit=self.PAGE_LIMIT))
+        if len(rows) >= self.PAGE_LIMIT:
+            print(f"WARNING: Finale returned {len(rows)} shipments, the maximum asked for "
+                  f"-- the shipment list may be incomplete. Raise FinaleClient.PAGE_LIMIT.")
+        return rows
+
     def order_shipments(self, order: dict) -> list[dict]:
         """Every shipment on this order (followed via shipmentUrlList), full records."""
         return [self._get(u) for u in (order.get("shipmentUrlList") or [])]

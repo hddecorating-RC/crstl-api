@@ -1234,3 +1234,20 @@ def test_receipt_refresh_reads_the_ones_that_need_it_not_the_first_fifty(client,
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         _finale_reconciliation(invs, 4)
     assert reads == ["/i/55"]
+
+
+def test_poll_runs_it_only_when_enabled(client):
+    from app.main import _finale_poll_passes
+    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
+         patch("app.main._dropship_config", return_value={"enabled": False}), patch("app.main._run_dropship_prefill") as run:
+        _finale_poll_passes()
+    run.assert_not_called()
+    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
+         patch("app.main._dropship_config", return_value={"enabled": True}), patch("app.main._run_dropship_prefill") as run2:
+        _finale_poll_passes()
+    run2.assert_called_once_with(True, None, None)
+
+
+def test_endpoint_requires_ids_for_live(client):
+    r = client.post("/api/dropship/prefill", json={"dry_run": False})
+    assert r.status_code == 400 and "ids" in r.json()["message"]
