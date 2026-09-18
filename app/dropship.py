@@ -12,6 +12,16 @@ shipped -- and with it, stops it writing the tracking number. This pass writes t
 tracking and the carrier onto the still-PACKED shipment so the warehouse never types
 them, and deliberately does NOT ship anything.
 
+It also REOPENS the order when the connection has closed it. Verified 2026-09-17 on
+TEST_0007: the connection still completes the Finale order on the ship event (within
+seconds to a few minutes) even though it no longer ships the shipment, and a closed
+order makes the shipment "not editable or actionable" -- so the warehouse could not
+click Ship at end of day, and we could not write to the shipment either. A reopen
+sticks: the connection did not re-close one across ten minutes and two poll cycles.
+The invoice pass would also reopen it, but only for an order it happens to be
+processing and only if it runs first, so this pass does it itself rather than relying
+on that ordering.
+
 Strict by design (Ritchie: start strict and see what it reports): it writes only when
 the PO has exactly ONE live Finale shipment and exactly ONE non-voided ShipStation
 label. Split shipments and re-labels are reported, never guessed at.
@@ -62,11 +72,14 @@ def plan_prefill(shipment: dict, tracking: str, carrier_url: str | None) -> dict
 def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live: bool = False,
                           only: list[str] | None = None, limit: int | None = None, client=None,
                           carrier_url: str | None = None, created_after: str | None = None,
-                          max_per_run: int | None = None) -> dict:
+                          max_per_run: int | None = None, reopen: bool = True) -> dict:
     """Write carrier + tracking onto the packed Finale shipment of each dropship
     label (live), or report what would be written (dry). One row per PO:
       status: prefilled | would_prefill | skipped_equal | skipped_shipped |
               skipped_no_shipment | skipped_ambiguous | skipped_floor | failed
+    A row also carries `reopened` when the closed order had to be reopened first --
+    which is also what makes the shipment actionable for the warehouse's end-of-day
+    Ship click, so it happens even when there is nothing to write.
 
     `shipment_rows` is a Finale shipment LISTING (one request, no per-order reads);
     `labels` are ShipStation v1 shipment records for the dropship store. `max_per_run`
@@ -128,11 +141,19 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
             # The listing carries no trackingCode/carrierPartyUrl, so the decision to
             # write needs the full record. Only ever for a packed dropship shipment.
             full = client.get_shipment(str(listed.get("shipmentUrl")))
+            # A closed order makes the shipment unwritable AND unshippable by the
+            # warehouse, so reopen it whether or not we have anything to write.
+            order = client.get_order(po)
+            if reopen and order is not None and str(order.get("statusId") or "") == "ORDER_COMPLETED":
+                if live:
+                    client.reopen_order(order)
+                row["reopened"] = True
         except Exception as exc:  # noqa: BLE001 -- one bad read must not stop the batch
             finish(row, "failed", error=f"Finale read failed: {exc}"); continue
         p = plan_prefill(full, row["tracking"] or "", carrier_url)
         row["fields"], row["error"] = p["fields"], (p["reason"] or None)
         if p["action"] == "equal":
+            # Nothing to write, but the reopen above may still have been the point.
             finish(row, "skipped_equal"); continue
         if p["action"] == "shipped":
             finish(row, "skipped_shipped"); continue

@@ -21,11 +21,16 @@ def label(po="538873472", trk="520756038656", created="2026-09-17T12:45:20", voi
 
 
 class FakeFinale:
-    def __init__(self, full=None, fail_update=False):
+    def __init__(self, full=None, fail_update=False, order_status="ORDER_LOCKED"):
         self.calls = []
         self._full = full or {"shipmentUrl": SURL, "statusId": "SHIPMENT_PACKED", "trackingCode": None, "carrierPartyUrl": None}
         self.fail_update = fail_update
+        self._order_status = order_status
     def get_shipment(self, url): self.calls.append(("get", url)); return self._full
+    def get_order(self, po): return {"orderId": po, "statusId": self._order_status}
+    def reopen_order(self, order):
+        self.calls.append(("reopen", order.get("orderId")))
+        self._order_status = "ORDER_LOCKED"; return {**order, "statusId": "ORDER_LOCKED"}
     def update_shipment(self, url, fields):
         if self.fail_update: raise RuntimeError("finale 500")
         self.calls.append(("update", url, fields)); return {"shipmentUrl": url, **fields}
@@ -97,3 +102,30 @@ def test_cap_refuses_the_whole_run_and_only_narrows():
     assert [r["po_number"] for r in out2["results"]] == ["538879048"]
     with pytest.raises(ValueError):
         push_dropship_prefill(rows, labels, live=False, limit=0)
+
+
+def test_a_closed_order_is_reopened_so_the_warehouse_can_ship_it():
+    """The connection still completes the order on the ship event (verified on
+    TEST_0007, 2026-09-17), and a closed order is neither writable by us nor
+    shippable by the warehouse. Reopen first, and do it even when the shipment
+    already has everything -- the reopen is the point."""
+    f = FakeFinale(order_status="ORDER_COMPLETED")
+    out = push_dropship_prefill([fship()], [label()], live=True, client=f, carrier_url=PUROLATOR)
+    r = out["results"][0]
+    assert r["status"] == "prefilled" and r["reopened"] is True
+    assert [c[0] for c in f.calls] == ["get", "reopen", "update"]          # reopen BEFORE the write
+    # already open: no reopen
+    open_ = FakeFinale(order_status="ORDER_LOCKED")
+    out2 = push_dropship_prefill([fship()], [label()], live=True, client=open_, carrier_url=PUROLATOR)
+    assert "reopened" not in out2["results"][0] and "reopen" not in [c[0] for c in open_.calls]
+    # nothing to write, but the order is closed: still reopened, so the warehouse can ship
+    done = FakeFinale(full={"shipmentUrl": SURL, "statusId": "SHIPMENT_PACKED",
+                            "trackingCode": "520756038656", "carrierPartyUrl": PUROLATOR},
+                      order_status="ORDER_COMPLETED")
+    out3 = push_dropship_prefill([fship()], [label()], live=True, client=done, carrier_url=PUROLATOR)
+    assert out3["results"][0]["status"] == "skipped_equal" and out3["results"][0]["reopened"] is True
+    assert ("reopen", "538873472") in done.calls
+    # dry run reports the reopen and performs none
+    dry = FakeFinale(order_status="ORDER_COMPLETED")
+    out4 = push_dropship_prefill([fship()], [label()], live=False, client=dry, carrier_url=PUROLATOR)
+    assert out4["results"][0]["reopened"] is True and "reopen" not in [c[0] for c in dry.calls]
