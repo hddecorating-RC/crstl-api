@@ -32,7 +32,16 @@ ISSUES = {
         "detail": "packed over {packed_hours}h ago",
         "fix": "Ship Selected Sales if it went",
     },
+    # Not an order: an early warning (Ritchie, 2026-09-21). Invoicing reads Finale's
+    # whole product catalogue in one list, which stops at 10,000 rows; blind lines
+    # are onboarded with every cut size (138VB + 020FW added ~5,000 in Aug-Sep).
+    "catalogue_near_limit": {
+        "title": "Finale product list near its limit",
+        "detail": "invoicing reads the whole catalogue in one list, which stops at 10,000 products",
+        "fix": "make the saved-catalogue change before onboarding the next product line",
+    },
 }
+CATALOGUE = "Finale catalogue"          # stands in for the order number on the catalogue row
 
 PACKED = "SHIPMENT_PACKED"
 
@@ -161,6 +170,23 @@ def find_packed_unshipped(shipments: list[dict], po_ids: dict, dropship_pos: set
     return out
 
 
+def find_catalogue_near_limit(product_count: int | None, *, warn_at: int, limit: int) -> list[dict]:
+    """The catalogue row, once the Finale product count reaches `warn_at`. Pure."""
+    if product_count is None or product_count < warn_at:
+        return []
+    note = (f"{limit:,} or more -- invoicing has stopped until it is fixed" if product_count >= limit
+            else f"{product_count:,} of {limit:,} products")
+    return [{"issue": "catalogue_near_limit", "key": "catalogue_near_limit", "po_number": CATALOGUE,
+             "url": "", "note": note}]
+
+
+def resolved_catalogue(open_receipts: list[dict], product_count: int | None, warn_at: int) -> list[dict]:
+    """An open catalogue warning clears when the count is known and back under `warn_at`."""
+    if product_count is None or product_count >= warn_at:
+        return []
+    return [r for r in open_receipts if r.get("issue") == "catalogue_near_limit"]
+
+
 def resolved_packed_unshipped(open_receipts: list[dict], packed_keys: set) -> list[dict]:
     """Earlier 'packed_unshipped' receipts whose shipment is no longer packed -- it was
     shipped, or cancelled. Either way the warehouse has dealt with it."""
@@ -208,9 +234,11 @@ def alert_email(new_rows: list[dict], still_open: list[dict], config: dict) -> t
 
 def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dict, live: bool,
                recipients: list[str], send, finale_shipments: list[dict] | None = None,
-               dropship_pos: set | None = None, now: datetime | None = None) -> dict:
+               dropship_pos: set | None = None, now: datetime | None = None,
+               product_count: int | None = None, product_limit: int = 10000) -> dict:
     """Find outliers, diff against receipts, send ONE email for the new ones (live),
-    resolve receipts whose issue has cleared. Returns what it found/sent."""
+    resolve receipts whose issue has cleared. Returns what it found/sent.
+    `product_count` (None = not known this run) drives the catalogue warning."""
     from app import tracking
     now = now or datetime.now(timezone.utc)
     finale_shipments = finale_shipments or []
@@ -218,6 +246,8 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
     found += find_packed_unshipped(finale_shipments, po_ids, dropship_pos or set(),
                                    after_hours=int(config.get("packed_unshipped_after_hours") or 24),
                                    packed_after=(str(config.get("packed_go_live_after") or "") or None), now=now)
+    warn_at = int(config.get("product_warn_at") or 8000)
+    found += find_catalogue_near_limit(product_count, warn_at=warn_at, limit=product_limit)
     receipts = tracking.get_alert_receipts([r["key"] for r in found])
     new = [r for r in found if r["key"] not in receipts]
     open_all = tracking.open_alert_receipts()
@@ -226,6 +256,7 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
                    for r in packed_dropship(finale_shipments, dropship_pos or set(), now=now)}
     resolved = resolved_asn_missing(open_all, asn_pos, voided_keys)
     resolved += resolved_packed_unshipped(open_all, packed_keys)
+    resolved += resolved_catalogue(open_all, product_count, warn_at)
     still_open = [{**r, "url": crstl_po_url(po_ids.get(str(r.get("po_number")))),
                    "sent_et": (datetime.fromisoformat(r["sent_at"]).astimezone(ET).strftime("%d %b %H:%M ET") if r.get("sent_at") else "")}
                   for r in open_all if r not in resolved and r["key"] not in {n["key"] for n in new}]

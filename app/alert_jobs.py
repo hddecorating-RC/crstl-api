@@ -79,6 +79,26 @@ def _fill_older_pos(crstl, cfg: dict, shipments: list[dict], finale_shipments: l
             asn_pos.update(sent_asn_pos(crstl.list_transaction_states("856", source_document_ids=po_ids[po])))
 
 
+def _product_count() -> int | None:
+    """Finale's product count, read at most once a day (one list request) and kept in
+    the settings table -- the catalogue only grows when a product line is onboarded.
+    A list that comes back full counts as the limit. None if never read."""
+    from app.finale import FinaleClient, FinaleListFull
+    stored = tracking.get_json("finale_product_count") or {}
+    fresh = stored.get("checked_at") and (datetime.now(timezone.utc) - datetime.fromisoformat(stored["checked_at"])) < timedelta(hours=24)
+    if fresh or not FinaleClient.configured():
+        return stored.get("count")
+    try:
+        count = len(FinaleClient()._list("product"))
+    except FinaleListFull:
+        count = FinaleClient.PAGE_LIMIT
+    except Exception as exc:  # noqa: BLE001 -- the alerts go on; the count is retried tomorrow
+        print(f"WARNING: order alerts: Finale product count failed: {exc}")
+        return stored.get("count")
+    tracking.set_json("finale_product_count", {"count": count, "checked_at": datetime.now(timezone.utc).isoformat()})
+    return count
+
+
 def _run_alerts(live: bool) -> dict:
     """Find order outliers (today: ShipStation label with no CRSTL 856) and email the
     new ones to ALERT_RECIPIENTS in ONE message (live), or preview it (dry)."""
@@ -101,7 +121,8 @@ def _run_alerts(live: bool) -> dict:
     finale_shipments = FinaleClient().list_shipments() if FinaleClient.configured() else []
     _fill_older_pos(crstl, cfg, shipments, finale_shipments, asn_pos, po_ids, dropship_pos)
     result = run_alerts(shipments, asn_pos, po_ids, config=cfg, live=live, recipients=alert_recipients(),
-                        send=send_mail, finale_shipments=finale_shipments, dropship_pos=dropship_pos)
+                        send=send_mail, finale_shipments=finale_shipments, dropship_pos=dropship_pos,
+                        product_count=_product_count(), product_limit=FinaleClient.PAGE_LIMIT)
     # The dashboard's "last alerts run" (read back by finale_jobs.finale_state()).
     tracking.set_json("finale_state:alerts", {"last_run": datetime.now(timezone.utc).isoformat(),
                                               **{k: v for k, v in result.items() if k != "body_html"}})

@@ -296,3 +296,45 @@ def test_an_open_alert_resolves_even_when_its_asn_is_older_than_the_window(monke
     alert_jobs._fill_older_pos(HistoryCrstl(t850, t856), {}, [], [], asn_pos, po_ids, set())
     assert "RELABEL" in asn_pos and po_ids["RELABEL"] == "850-RELABEL"
     assert [r["key"] for r in resolved_asn_missing(tracking.open_alert_receipts(), asn_pos)] == ["asn_missing:99"]
+
+
+# ── Finale catalogue early warning (2026-09-21) ────────────────────────────
+
+def test_catalogue_warning_fires_once_at_the_threshold_and_clears_under_it(tmp_path, monkeypatch):
+    from app import tracking
+    from app.alerts import find_catalogue_near_limit
+    assert find_catalogue_near_limit(7999, warn_at=8000, limit=10000) == []
+    assert find_catalogue_near_limit(None, warn_at=8000, limit=10000) == []
+    assert find_catalogue_near_limit(8120, warn_at=8000, limit=10000)[0]["note"] == "8,120 of 10,000 products"
+    assert "invoicing has stopped" in find_catalogue_near_limit(10000, warn_at=8000, limit=10000)[0]["note"]
+    send = MagicMock()
+    cfg = {**CFG, "product_warn_at": 8000}
+    r1 = run_alerts([], set(), {}, config=cfg, live=True, recipients=["g@x"], send=send, now=NOW, product_count=8120)
+    assert r1["sent"] and send.call_args.kwargs["subject"] == "Order alert: Finale product list near its limit — Finale catalogue"
+    assert "8,120 of 10,000 products" in send.call_args.kwargs["body_html"]
+    r2 = run_alerts([], set(), {}, config=cfg, live=True, recipients=["g@x"], send=send, now=NOW, product_count=8300)
+    assert not r2["sent"] and send.call_count == 1                                   # once, not every 15 min
+    r3 = run_alerts([], set(), {}, config=cfg, live=True, recipients=["g@x"], send=send, now=NOW, product_count=None)
+    assert r3["resolved"] == [] and tracking.open_alert_receipts()                   # count unknown: stays open
+    r4 = run_alerts([], set(), {}, config=cfg, live=True, recipients=["g@x"], send=send, now=NOW, product_count=7000)
+    assert r4["resolved"] == ["catalogue_near_limit"] and tracking.open_alert_receipts() == []
+
+
+def test_the_product_count_is_read_at_most_once_a_day(monkeypatch):
+    from app import alert_jobs, tracking
+    from app.finale import FinaleListFull
+    reads = []
+    class FC:
+        PAGE_LIMIT = 10000
+        configured = staticmethod(lambda: True)
+        def _list(self, what):
+            reads.append(what)
+            if len(reads) == 2:
+                raise FinaleListFull("full")
+            return [{}] * 5384
+    monkeypatch.setattr("app.finale.FinaleClient", FC)
+    assert alert_jobs._product_count() == 5384
+    assert alert_jobs._product_count() == 5384 and reads == ["product"]              # cached for the day
+    stale = {"count": 5384, "checked_at": "2026-09-01T00:00:00+00:00"}
+    tracking.set_json("finale_product_count", stale)
+    assert alert_jobs._product_count() == 10000                                      # a full list counts as the limit
