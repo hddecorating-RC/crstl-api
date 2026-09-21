@@ -183,9 +183,10 @@ def rate_limit_wait(headers, now: float | None = None, fallback: float = 20.0) -
 
 
 class RateLimitRetry(HTTPAdapter):
-    """Finale allows ~120 API requests a minute per ACCOUNT (X-RateLimit-Limit: 120,
-    seen 2026-09-16) -- shared with the ShipStation connection and every other user of
-    the account -- and answers 429 past it, with X-RateLimit-Reset but no Retry-After,
+    """Finale allows ~120 API requests a minute (X-RateLimit-Limit: 120, seen on a 429
+    2026-09-16) -- whether per API key or per account (i.e. shared with the ShipStation
+    connection) is unverified: Finale sends no rate-limit headers on a normal response,
+    checked 2026-09-21 -- and answers 429 past it, with X-RateLimit-Reset but no Retry-After,
     so urllib3's own Retry cannot time the wait. A GET that gets a 429 waits for the
     window to reset and is sent again, up to MAX_RETRIES times; then the 429 is returned
     and raises as before. Never a POST: a write is only ever retried by the next poll,
