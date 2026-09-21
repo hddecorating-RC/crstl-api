@@ -23,7 +23,13 @@ import functools
 import json
 import pathlib
 
-_CONFIG = pathlib.Path(__file__).parent.parent / "config" / "netsuite_customers.json"
+_CONFIG_DIR = pathlib.Path(__file__).parent.parent / "config"
+_CONFIG = _CONFIG_DIR / "netsuite_customers.json"
+# Split out 2026-09-21 so each service's settings live on their own: the Finale
+# worker's blocks (finale, shipstation, dropship_prefill) and order alerts. Callers
+# still get every block from load_refs(), exactly as when it was one file.
+_FINALE_CONFIG = _CONFIG_DIR / "finale.json"
+_ALERTS_CONFIG = _CONFIG_DIR / "alerts.json"
 
 
 @functools.lru_cache(maxsize=None)
@@ -31,6 +37,8 @@ def load_refs() -> dict:
     """The internal-id maps from config, defaulted so a missing block is empty
     rather than a KeyError."""
     cfg = json.loads(_CONFIG.read_text())
+    cfg.update(json.loads(_FINALE_CONFIG.read_text()))
+    cfg.update(json.loads(_ALERTS_CONFIG.read_text()))
     return {
         "item_ids": cfg.get("item_ids", {}),
         "tax_code_ids": cfg.get("tax_code_ids", {}),
