@@ -3,7 +3,7 @@ while Crstl's public API omits TXI segments on dropship 810s. Suggestion is
 purely additive; it must never mutate the raw fields (tax_amount, tax_breakdown,
 discrepancy) so the "report what Crstl says" contract still holds."""
 
-from app.main import _annotate_tax_suggestion
+from app.crstl_cache import _annotate_tax_suggestion
 
 
 def _base(**overrides):
@@ -127,7 +127,7 @@ RATE_SHEET = {
 def test_rate_table_matches_accountings_sheet():
     """Pinned to the sheet so a rate change has to be a deliberate edit here.
     SK sat at 5% for months because nothing compared the two."""
-    from app.main import _PROVINCE_TAX_RATES
+    from app.crstl_cache import _PROVINCE_TAX_RATES
     assert _PROVINCE_TAX_RATES == RATE_SHEET
 
 

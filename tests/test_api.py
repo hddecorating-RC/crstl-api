@@ -109,8 +109,8 @@ def client(monkeypatch, tmp_path):
     # Finale is a real third-party API and the sync now calls it. Stubbed here
     # so the suite neither reaches the network nor depends on whoever runs it
     # having Finale credentials.
-    monkeypatch.setattr("app.main.FinaleClient.configured", staticmethod(lambda: False))
-    with patch("app.main.CrstlClient") as MockClient:
+    monkeypatch.setattr("app.finale.FinaleClient.configured", staticmethod(lambda: False))
+    with patch("app.crstl_cache.CrstlClient") as MockClient:
         mock_instance = MagicMock()
         mock_instance.fetch_invoices.return_value = MOCK_INVOICES
         # A real dict, not a MagicMock: _refresh_cache now keeps this map so the
@@ -119,7 +119,9 @@ def client(monkeypatch, tmp_path):
         mock_instance._fetch_transaction_detail.side_effect = _detail_side_effect
         MockClient.return_value = mock_instance
 
-        from app.main import app, _cache, _netsuite_state
+        from app.main import app
+        from app.crstl_cache import _cache
+        from app.accounting import _netsuite_state
         with TestClient(app) as c:
             # Reset cache after startup so each test controls its own state
             _cache["invoices"] = []
@@ -194,9 +196,9 @@ def test_export_reports_the_810_figures_not_the_cached_ones(client):
 def test_export_502s_when_crstl_returns_nothing(client):
     """An empty workbook reads as "a quiet day" to whoever opens it. If every
     detail fetch failed, that must surface as an error instead."""
-    from app.main import _cache
+    from app.crstl_cache import _cache
     client.post("/api/sync")
-    with patch("app.main.rows_for_transactions", return_value=[]):
+    with patch("app.accounting.rows_for_transactions", return_value=[]):
         resp = client.post("/api/export", json={})
     assert resp.status_code == 502
     assert "no detail" in resp.json()["message"]
@@ -255,7 +257,7 @@ def test_netsuite_push_error_detail_is_sanitized(client, monkeypatch):
                 "summary": {"built": 1, "sent": 0, "failed": 1, "skipped_no_map": 0},
                 "results": [{"transaction_id": "X", "channel": "dsd", "where": "VAUGHAN",
                              "status": "failed", "error": "NetSuite 400: {internal field detail}"}]}
-    monkeypatch.setattr("app.main.push_invoices", fake_push)
+    monkeypatch.setattr("app.accounting.push_invoices", fake_push)
     resp = client.post("/api/netsuite", json={"dry_run": False, "ids": ["X"]})
     err = resp.json()["results"][0]["error"]
     assert "internal field detail" not in err
@@ -308,7 +310,7 @@ def _scheduled_jobs(monkeypatch, tmp_path):
     monkeypatch.setenv("SCHEDULER_ENABLED", "true")
     jobs: dict[str, dict] = {}
 
-    with patch("app.main.CrstlClient") as MockClient, \
+    with patch("app.crstl_cache.CrstlClient") as MockClient, \
          patch("app.main.AsyncIOScheduler") as MockScheduler:
         mock_instance = MagicMock()
         mock_instance.fetch_invoices.return_value = MOCK_INVOICES
@@ -365,7 +367,7 @@ def _mixed_status_invoices():
 
 
 def test_reportable_keeps_accepted_and_drops_drafts():
-    from app.main import _reportable
+    from app.accounting import _reportable
     kept = _reportable(_mixed_status_invoices())
     assert [i["transaction_id"] for i in kept] == ["tx-acc"]
 
@@ -374,7 +376,7 @@ def test_reportable_withholds_unknown_status_and_warns(capsys):
     """An unrecognised state must not reach accounting silently. If Crstl ever
     adds a status that means "good", this warning is how we find out rather
     than invoices quietly vanishing from the digest."""
-    from app.main import _reportable
+    from app.accounting import _reportable
     rows = _mixed_status_invoices() + [{"transaction_id": "tx-new", "status": "Submitted"}]
     kept = _reportable(rows)
     assert [i["transaction_id"] for i in kept] == ["tx-acc"]
@@ -386,7 +388,7 @@ def test_reportable_withholds_unknown_status_and_warns(capsys):
 
 def test_bulk_export_excludes_drafts(client):
     """A bulk export is a report, so it carries Accepted only."""
-    from app.main import _cache
+    from app.crstl_cache import _cache
     client.post("/api/sync")
     with patch.dict(_cache, {"invoices": _mixed_status_invoices()}):
         content = client.post("/api/export", json={}).content
@@ -397,7 +399,7 @@ def test_bulk_export_excludes_drafts(client):
 def test_explicit_id_selection_is_honoured_even_for_a_draft(client):
     """Picking specific invoices on the dashboard is a deliberate act, so it is
     not second-guessed — only the automatic bulk report filters."""
-    from app.main import _cache
+    from app.crstl_cache import _cache
     client.post("/api/sync")
     with patch.dict(_cache, {"invoices": _mixed_status_invoices()}):
         content = client.post("/api/export", json={"ids": ["tx-dr1"]}).content
@@ -439,7 +441,8 @@ def test_so_digest_lists_pushed_sos_gaps_and_marks_reported(client, monkeypatch)
     """The daily digest lists SOs actually pushed to NetSuite (with a direct link),
     flags invoiced-but-no-SO as an issue, and marks the reported ones so they don't
     repeat tomorrow -- sourced from durable receipts, not in-memory state."""
-    from app.main import _cache, _send_daily_digest
+    from app.crstl_cache import _cache
+    from app.accounting import _send_daily_digest
     from app import tracking
     tracking.init_db()
     monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
@@ -448,7 +451,7 @@ def test_so_digest_lists_pushed_sos_gaps_and_marks_reported(client, monkeypatch)
     tracking.record_events(["so-1"], "netsuite")
     tracking.record_netsuite_push("CRSTL-sd1", "22699999", "T1")
     with patch.dict(_cache, {"invoices": _so_ready_invoices()}), \
-         patch("app.main.send_mail") as mail:
+         patch("app.accounting.send_mail") as mail:
         result = _send_daily_digest()
     assert result["count"] == 1 and result["gaps"] == 1
     body = mail.call_args.kwargs["body_html"]
@@ -466,7 +469,7 @@ def test_so_digest_lists_pushed_sos_gaps_and_marks_reported(client, monkeypatch)
 def test_so_digest_workbook_adds_linked_so_column(monkeypatch):
     """The digest Excel is the export workbook (Invoices sheet) plus a
     'Netsuite SO created' column whose cell links straight to the SO."""
-    from app.main import _so_digest_workbook
+    from app.accounting import _so_digest_workbook
     from openpyxl import Workbook
     # stand-in export workbook: one invoice row + a Total row, matching the real shape
     wb = Workbook(); ws = wb.active; ws.title = "Invoices"
@@ -475,7 +478,7 @@ def test_so_digest_workbook_adds_linked_so_column(monkeypatch):
     ws.append(["Total", "", 100.0])
     ws.auto_filter.ref = "A1:C2"
     buf = io.BytesIO(); wb.save(buf); wb_bytes = buf.getvalue()
-    monkeypatch.setattr("app.main._workbook_for", lambda invs: wb_bytes)
+    monkeypatch.setattr("app.accounting._workbook_for", lambda invs: wb_bytes)
 
     url = "https://734463.app.netsuite.com/app/accounting/transactions/salesord.nl?id=999"
     out = _so_digest_workbook([{"invoice_number": "INV-SO-1"}],
@@ -495,7 +498,7 @@ def test_sync_survives_finale_being_down(monkeypatch, client):
     down = MagicMock()
     down.configured.return_value = True
     down.side_effect = RuntimeError("finale is down")
-    monkeypatch.setattr("app.main.FinaleClient", down)
+    monkeypatch.setattr("app.crstl_cache.FinaleClient", down)
     resp = client.post("/api/sync")
     assert resp.status_code == 200
     assert client.get("/api/invoices").json()["status"] == "ok"
@@ -540,7 +543,7 @@ def test_reportable_defers_send_success_without_warning(capsys):
     """Send_Success is a transient CRSTL state (810 transmitted to HD, not yet
     acknowledged) -- deferred like a Draft, and NOT warned about. We only book
     invoices HD has Accepted."""
-    from app.main import _reportable
+    from app.accounting import _reportable
     rows = [{"status": "Send_Success", "transaction_id": "t1"},
             {"status": "Accepted", "transaction_id": "t2"}]
     kept = _reportable(rows)
@@ -551,19 +554,20 @@ def test_reportable_defers_send_success_without_warning(capsys):
 def test_live_push_fires_digest_dry_run_does_not(client, monkeypatch):
     """The digest fires the moment a live push lands SOs (no waiting for 7:15); a
     dry run never sends. Guarded by the auto-digest toggle."""
-    from app.main import _run_netsuite_push, _cache
-    monkeypatch.setattr("app.main._auto_digest_enabled", lambda: True)
+    from app.accounting import _run_netsuite_push
+    from app.crstl_cache import _cache
+    monkeypatch.setattr("app.accounting._auto_digest_enabled", lambda: True)
     fake = {"mode": "live", "summary": {"sent": 2, "failed": 0}, "unresolved": [],
             "results": [], "blocked": None}
     with patch.dict(_cache, {"invoices": []}), \
-         patch("app.main.push_invoices", return_value=fake), \
-         patch("app.main._send_digest_safe") as digest:
+         patch("app.accounting.push_invoices", return_value=fake), \
+         patch("app.accounting._send_digest_safe") as digest:
         _run_netsuite_push(live=True, ids=["x"], limit=None)
     digest.assert_called_once()
 
     with patch.dict(_cache, {"invoices": []}), \
-         patch("app.main.push_invoices", return_value={**fake, "mode": "dry", "summary": {"sent": 0, "failed": 0}}), \
-         patch("app.main._send_digest_safe") as digest2:
+         patch("app.accounting.push_invoices", return_value={**fake, "mode": "dry", "summary": {"sent": 0, "failed": 0}}), \
+         patch("app.accounting._send_digest_safe") as digest2:
         _run_netsuite_push(live=False, ids=None, limit=None)
     digest2.assert_not_called()
 
@@ -571,40 +575,42 @@ def test_live_push_fires_digest_dry_run_does_not(client, monkeypatch):
 def test_live_push_invoices_in_finale_only_when_enabled(monkeypatch):
     """Finale invoicing rides the NetSuite push: the ids that actually SENT get a
     Finale invoice in the same run -- only when the toggle is on, never on a dry run."""
-    from app.main import _run_netsuite_push, _cache
-    monkeypatch.setattr("app.main._auto_digest_enabled", lambda: False)
+    from app.accounting import _run_netsuite_push
+    from app.crstl_cache import _cache
+    monkeypatch.setattr("app.accounting._auto_digest_enabled", lambda: False)
     fake = {"mode": "live", "summary": {"sent": 2, "failed": 0}, "unresolved": [], "blocked": None,
             "results": [{"transaction_id": "x", "status": "sent"}, {"transaction_id": "y", "status": "sent"},
                         {"transaction_id": "z", "status": "skipped_exists"}]}
-    with patch.dict(_cache, {"invoices": []}), patch("app.main.push_invoices", return_value=fake), \
-         patch("app.main._finale_enabled", return_value=True), \
-         patch("app.main._run_finale_push_safe") as fin:
+    with patch.dict(_cache, {"invoices": []}), patch("app.accounting.push_invoices", return_value=fake), \
+         patch("app.finale_jobs._finale_enabled", return_value=True), \
+         patch("app.finale_jobs._run_finale_push_safe") as fin:
         _run_netsuite_push(live=True, ids=["x", "y", "z"], limit=None)
     fin.assert_called_once_with(["x", "y"])                 # only what SENT, not the skipped one
-    with patch.dict(_cache, {"invoices": []}), patch("app.main.push_invoices", return_value=fake), \
-         patch("app.main._finale_enabled", return_value=False), \
-         patch("app.main._run_finale_push_safe") as fin2:
+    with patch.dict(_cache, {"invoices": []}), patch("app.accounting.push_invoices", return_value=fake), \
+         patch("app.finale_jobs._finale_enabled", return_value=False), \
+         patch("app.finale_jobs._run_finale_push_safe") as fin2:
         _run_netsuite_push(live=True, ids=["x"], limit=None)
     fin2.assert_not_called()
     with patch.dict(_cache, {"invoices": []}), \
-         patch("app.main.push_invoices", return_value={**fake, "mode": "dry", "summary": {"sent": 0, "failed": 0}}), \
-         patch("app.main._finale_enabled", return_value=True), \
-         patch("app.main._run_finale_push_safe") as fin3:
+         patch("app.accounting.push_invoices", return_value={**fake, "mode": "dry", "summary": {"sent": 0, "failed": 0}}), \
+         patch("app.finale_jobs._finale_enabled", return_value=True), \
+         patch("app.finale_jobs._run_finale_push_safe") as fin3:
         _run_netsuite_push(live=False, ids=None, limit=None)
     fin3.assert_not_called()
 
 
 def test_finale_push_safe_honors_cap_and_never_raises(monkeypatch):
-    from app.main import _run_finale_push_safe, _cache
+    from app.finale_jobs import _run_finale_push_safe
+    from app.crstl_cache import _cache
     from app import tracking
     tracking.init_db()
-    monkeypatch.setattr("app.main._finale_config", lambda: {"enabled": True, "max_per_run": 1, "go_live_after": "2026-09-15"})
-    monkeypatch.setattr("app.main.load_refs", lambda: {"automation": {"created_within_days": 365}})
+    monkeypatch.setattr("app.finale_jobs._finale_config", lambda: {"enabled": True, "max_per_run": 1, "go_live_after": "2026-09-15"})
+    monkeypatch.setattr("app.finale_jobs.load_refs", lambda: {"automation": {"created_within_days": 365}})
     inv = [{"transaction_id": "a", "created_at": "2026-09-16T01:00:00Z"}, {"transaction_id": "b", "created_at": "2026-09-16T01:00:00Z"}]
-    with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push") as run:
+    with patch.dict(_cache, {"invoices": inv}), patch("app.finale_jobs._run_finale_push") as run:
         _run_finale_push_safe(["a", "b"])
     run.assert_called_once_with(True, ["a", "b"], None, max_per_run=1)  # cap handed to the engine (counts writes)
-    with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push", side_effect=RuntimeError("boom")):
+    with patch.dict(_cache, {"invoices": inv}), patch("app.finale_jobs._run_finale_push", side_effect=RuntimeError("boom")):
         _run_finale_push_safe(["a"])                        # failure is swallowed, never fails the push
 
 
@@ -612,19 +618,20 @@ def test_finale_push_safe_applies_the_finale_floor_and_window(monkeypatch):
     """A manual NetSuite push is unlimited by design; the Finale ride-along is not:
     only ids inside Finale's own floor + rolling window are invoiced, the rest are
     left to the warehouse. Unknown ids (not in the cache) are out of scope."""
-    from app.main import _run_finale_push_safe, _cache
+    from app.finale_jobs import _run_finale_push_safe
+    from app.crstl_cache import _cache
     from app import tracking
     tracking.init_db()
-    monkeypatch.setattr("app.main._finale_config", lambda: {"enabled": True, "max_per_run": 75, "go_live_after": "2026-09-15"})
-    monkeypatch.setattr("app.main.load_refs", lambda: {"automation": {"go_live_after": "2026-09-11", "created_within_days": 365}})
+    monkeypatch.setattr("app.finale_jobs._finale_config", lambda: {"enabled": True, "max_per_run": 75, "go_live_after": "2026-09-15"})
+    monkeypatch.setattr("app.finale_jobs.load_refs", lambda: {"automation": {"go_live_after": "2026-09-11", "created_within_days": 365}})
     inv = [{"transaction_id": "old", "created_at": "2026-09-12T01:00:00Z"},     # NetSuite floor ok, Finale floor not
            {"transaction_id": "new", "created_at": "2026-09-16T01:00:00Z"}]
-    with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push") as run, \
+    with patch.dict(_cache, {"invoices": inv}), patch("app.finale_jobs._run_finale_push") as run, \
          patch("app.tracking.record_job_run") as job:
         _run_finale_push_safe(["old", "new", "ghost"])
     run.assert_called_once_with(True, ["new"], None, max_per_run=75)
     assert any("2 sent to NetSuite left alone" in str(c.args) for c in job.call_args_list)
-    with patch.dict(_cache, {"invoices": inv}), patch("app.main._run_finale_push") as run2:
+    with patch.dict(_cache, {"invoices": inv}), patch("app.finale_jobs._run_finale_push") as run2:
         _run_finale_push_safe(["old"])
     run2.assert_not_called()
 
@@ -634,7 +641,7 @@ def test_one_finale_run_at_a_time_across_every_entry_point(monkeypatch, client):
     second run is refused (409 / skipped), never interleaved; the poll's own passes
     re-enter the lock on the same thread."""
     import threading
-    from app import main as m
+    from app import finale_jobs as m
     from app import tracking
     tracking.init_db()
     fake = {"mode": "dry", "unresolved": [], "results": [], "summary": {"built": 0, "posted": 0, "draft": 0, "failed": 0}}
@@ -645,20 +652,20 @@ def test_one_finale_run_at_a_time_across_every_entry_point(monkeypatch, client):
             held.set(); release.wait(5)
     th = threading.Thread(target=hold); th.start(); held.wait(5)
     try:
-        with patch.dict(m._cache, {"invoices": [], "po_provinces": {}}), patch("app.main.push_finale_invoices", return_value=fake):
+        with patch.dict(m._cache, {"invoices": [], "po_provinces": {}}), patch("app.finale_jobs.push_finale_invoices", return_value=fake):
             assert client.post("/api/finale", json={"dry_run": True}).status_code == 409
             assert client.get("/api/finale-push/latest").json()["running"] is True
-        with patch("app.main.push_nonedi_invoices", return_value=fake), patch("app.finale.FinaleClient.configured", return_value=True), \
+        with patch("app.finale_jobs.push_nonedi_invoices", return_value=fake), patch("app.finale.FinaleClient.configured", return_value=True), \
              patch("app.finale.FinaleClient"):
             assert client.post("/api/finale/nonedi", json={"dry_run": True}).status_code == 409
         with patch.dict(m._cache, {"invoices": [{"transaction_id": "a", "created_at": "2026-09-16T01:00:00Z"}]}), \
-             patch("app.main._finale_config", return_value={"enabled": True, "go_live_after": "2026-09-15", "max_per_run": 75}), \
-             patch("app.main.load_refs", return_value={"automation": {"created_within_days": 365}}), \
-             patch("app.main.push_finale_invoices", return_value=fake) as push, patch("app.tracking.record_job_run") as job:
+             patch("app.finale_jobs._finale_config", return_value={"enabled": True, "go_live_after": "2026-09-15", "max_per_run": 75}), \
+             patch("app.finale_jobs.load_refs", return_value={"automation": {"created_within_days": 365}}), \
+             patch("app.finale_jobs.push_finale_invoices", return_value=fake) as push, patch("app.tracking.record_job_run") as job:
             m._run_finale_push_safe(["a"])                       # ride-along: skipped, not queued, not raised
         push.assert_not_called()
         assert any("in progress" in str(c.args) for c in job.call_args_list)
-        with patch("app.main._finale_enabled", return_value=True), patch("app.main._finale_poll_passes") as passes, \
+        with patch("app.finale_jobs._finale_enabled", return_value=True), patch("app.finale_jobs._finale_poll_passes") as passes, \
              patch("app.tracking.record_job_run") as job2:
             m._run_finale_push_job()                             # a second poll: skipped
         passes.assert_not_called()
@@ -667,11 +674,11 @@ def test_one_finale_run_at_a_time_across_every_entry_point(monkeypatch, client):
         release.set(); th.join(5)
     assert client.get("/api/finale-push/latest").json()["running"] is False
     # released: the poll's passes run nested inside its own hold (re-entrant), and the endpoint works again
-    with patch("app.main._finale_enabled", return_value=True), patch("app.main._finale_edi_pass") as edi, \
-         patch("app.main._run_nonedi_push") as ne, patch("app.main._finale_config", return_value={"enabled": True}):
+    with patch("app.finale_jobs._finale_enabled", return_value=True), patch("app.finale_jobs._finale_edi_pass") as edi, \
+         patch("app.finale_jobs._run_nonedi_push") as ne, patch("app.finale_jobs._finale_config", return_value={"enabled": True}):
         m._run_finale_push_job()
     edi.assert_called_once(); ne.assert_called_once()
-    with patch.dict(m._cache, {"invoices": [], "po_provinces": {}}), patch("app.main.push_finale_invoices", return_value=fake), \
+    with patch.dict(m._cache, {"invoices": [], "po_provinces": {}}), patch("app.finale_jobs.push_finale_invoices", return_value=fake), \
          patch("app.tracking.record_job_run"):
         assert client.post("/api/finale", json={"dry_run": True}).status_code == 200
 
@@ -681,7 +688,7 @@ def test_finale_endpoint_live_requires_ids_and_dry_run_previews(client):
     assert r.status_code == 400 and "ids" in r.json()["message"]
     fake = {"mode": "dry", "unresolved": [], "results": [{"transaction_id": "t", "status": "built"}],
             "summary": {"built": 1, "posted": 0, "draft": 0, "failed": 0}}
-    with patch("app.main.push_finale_invoices", return_value=fake), \
+    with patch("app.finale_jobs.push_finale_invoices", return_value=fake), \
          patch("app.tracking.record_job_run"):
         r2 = client.post("/api/finale", json={"dry_run": True})
     assert r2.status_code == 200 and r2.json()["summary"]["built"] == 1
@@ -691,7 +698,8 @@ def test_finale_endpoint_live_requires_ids_and_dry_run_previews(client):
 def test_so_digest_reports_finale_line_and_holds(client, monkeypatch):
     """One headline line for Finale, and drafts called out under Issues; nothing
     Finale-related when the feature is off and nothing was invoiced."""
-    from app.main import _cache, _send_daily_digest
+    from app.crstl_cache import _cache
+    from app.accounting import _send_daily_digest
     from app import tracking
     tracking.init_db()
     monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
@@ -699,8 +707,8 @@ def test_so_digest_reports_finale_line_and_holds(client, monkeypatch):
     tracking.record_events(["so-1"], "netsuite")
     tracking.record_netsuite_push("CRSTL-sd1", "22699999", "T1")
     tracking.record_finale_invoice("so-1", "PO-1", "100407", "/i/100407", "PO-1-1", "draft")
-    with patch.dict(_cache, {"invoices": _so_ready_invoices()}), patch("app.main.send_mail") as mail, \
-         patch("app.main._finale_enabled", return_value=True):
+    with patch.dict(_cache, {"invoices": _so_ready_invoices()}), patch("app.accounting.send_mail") as mail, \
+         patch("app.finale_jobs._finale_enabled", return_value=True):
         _send_daily_digest()
     body = mail.call_args.kwargs["body_html"]
     assert "Finale" not in body                                # nothing Finale in accounting's email
@@ -713,13 +721,13 @@ def test_so_digest_reports_finale_line_and_holds(client, monkeypatch):
 
 
 def test_so_digest_workbook_adds_finale_column(monkeypatch):
-    from app.main import _so_digest_workbook
+    from app.accounting import _so_digest_workbook
     from openpyxl import Workbook
     wb = Workbook(); ws = wb.active; ws.title = "Invoices"
     ws.append(["Invoice", "Type", "Total"]); ws.append(["INV-SO-1", "Dropship", 100.0]); ws.append(["Total", "", 100.0])
     ws.auto_filter.ref = "A1:C2"
     buf = io.BytesIO(); wb.save(buf)
-    monkeypatch.setattr("app.main._workbook_for", lambda invs: buf.getvalue())
+    monkeypatch.setattr("app.accounting._workbook_for", lambda invs: buf.getvalue())
     out = _so_digest_workbook([{"invoice_number": "INV-SO-1"}], {"INV-SO-1": ("2026-09-15", "")},
                               {"INV-SO-1": ("PO-1-1", "posted", "API_KEY_U_BLINDS", 0.0)})
     ws2 = load_workbook(io.BytesIO(out))["Invoices"]
@@ -740,29 +748,30 @@ def test_so_digest_workbook_adds_finale_column(monkeypatch):
 def test_finale_poll_job_gates_refreshes_and_invoices_only_unfinaled(monkeypatch):
     """The 15-min poll: no-op when off; when on it refreshes incrementally, then invoices
     the Accepted-not-yet-invoiced set under the automation guards + the finale cap."""
-    from app.main import _run_finale_push_job, _cache
+    from app.finale_jobs import _run_finale_push_job
+    from app.crstl_cache import _cache
     from app import tracking
     tracking.init_db()
     invs = [{"transaction_id": "a", "source_document_id": "sa", "status": "Accepted", "subtotal": 10,
              "created_at": "2026-09-15T10:00:00Z", "invoice_date": "2026-09-15"},
             {"transaction_id": "b", "source_document_id": "sb", "status": "Accepted", "subtotal": 10,
              "created_at": "2026-09-15T10:00:00Z", "invoice_date": "2026-09-15"}]
-    with patch("app.main._finale_enabled", return_value=False), patch("app.main._run_finale_push") as run:
+    with patch("app.finale_jobs._finale_enabled", return_value=False), patch("app.finale_jobs._run_finale_push") as run:
         _run_finale_push_job()
     run.assert_not_called()
-    with patch.dict(_cache, {"invoices": invs}), patch("app.main._finale_enabled", return_value=True), \
-         patch("app.main._refresh_new_accepted", return_value=0) as refresh, \
-         patch("app.main._finale_config", return_value={"enabled": True, "max_per_run": 75}), \
+    with patch.dict(_cache, {"invoices": invs}), patch("app.finale_jobs._finale_enabled", return_value=True), \
+         patch("app.crstl_cache._refresh_new_accepted", return_value=0) as refresh, \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True, "max_per_run": 75}), \
          patch("app.tracking.get_unfinaled_ids", return_value=["b"]), \
-         patch("app.main._run_finale_push") as run2:
+         patch("app.finale_jobs._run_finale_push") as run2:
         _run_finale_push_job()
     refresh.assert_called_once()
     run2.assert_called_once_with(True, ["b"], None, max_per_run=75)    # only the un-invoiced one; cap to the engine
-    with patch.dict(_cache, {"invoices": invs}), patch("app.main._finale_enabled", return_value=True), \
-         patch("app.main._refresh_new_accepted", return_value=0), \
-         patch("app.main._finale_config", return_value={"enabled": True, "max_per_run": 1}), \
+    with patch.dict(_cache, {"invoices": invs}), patch("app.finale_jobs._finale_enabled", return_value=True), \
+         patch("app.crstl_cache._refresh_new_accepted", return_value=0), \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True, "max_per_run": 1}), \
          patch("app.tracking.get_unfinaled_ids", return_value=["a", "b"]), \
-         patch("app.main._run_finale_push") as run3:
+         patch("app.finale_jobs._run_finale_push") as run3:
         _run_finale_push_job()
     run3.assert_called_once_with(True, ["a", "b"], None, max_per_run=1)  # the ENGINE caps, on invoices it would create
 
@@ -770,7 +779,7 @@ def test_finale_poll_job_gates_refreshes_and_invoices_only_unfinaled(monkeypatch
 def test_refresh_new_accepted_fetches_only_changed_and_merges(monkeypatch):
     """One list call; details only for new/changed transactions; missing 850s fetched
     for just those POs; cache entries replaced in place, new ones appended."""
-    from app.main import _refresh_new_accepted, _cache
+    from app.crstl_cache import _refresh_new_accepted, _cache
     class FakeCrstl:
         def __init__(self): self.calls = []
         def list_transaction_states(self):
@@ -785,8 +794,8 @@ def test_refresh_new_accepted_fetches_only_changed_and_merges(monkeypatch):
             self.calls.append(("fetch_po_provinces", sorted(only_pos)))
             return {p: {"province": "ON", "store": None, "vendor_items": [], "lines": []} for p in only_pos}
     fake = FakeCrstl()
-    monkeypatch.setattr("app.main._mock_mode", lambda: False)
-    monkeypatch.setattr("app.main._get_client", lambda: fake)
+    monkeypatch.setattr("app.crstl_cache._mock_mode", lambda: False)
+    monkeypatch.setattr("app.crstl_cache._get_client", lambda: fake)
     start = [{"transaction_id": "a", "po_number": "PO-A", "status": "Accepted"},
              {"transaction_id": "b", "po_number": "PO-B", "status": "Draft"}]
     with patch.dict(_cache, {"invoices": start, "po_provinces": {"PO-A": {"province": "ON", "store": None, "vendor_items": []}}}):
@@ -802,7 +811,7 @@ def test_refresh_new_accepted_fetches_only_changed_and_merges(monkeypatch):
         def fetch_invoices(self, only_ids=None):
             _cache["po_provinces"]["PO-NEW"] = {"province": "QC"}
             return super().fetch_invoices(only_ids)
-    monkeypatch.setattr("app.main._get_client", lambda: Racing())
+    monkeypatch.setattr("app.crstl_cache._get_client", lambda: Racing())
     with patch.dict(_cache, {"invoices": list(start), "po_provinces": {"PO-A": {"province": "ON"}}}):
         _refresh_new_accepted()
         assert "PO-NEW" in _cache["po_provinces"] and "PO-B" in _cache["po_provinces"]
@@ -810,17 +819,18 @@ def test_refresh_new_accepted_fetches_only_changed_and_merges(monkeypatch):
 
 
 def test_finale_poll_job_also_runs_the_nonedi_pass(monkeypatch):
-    from app.main import _run_finale_push_job, _cache
+    from app.finale_jobs import _run_finale_push_job
+    from app.crstl_cache import _cache
     from app import tracking
     tracking.init_db()
-    with patch.dict(_cache, {"invoices": []}), patch("app.main._finale_enabled", return_value=True), \
-         patch("app.main._refresh_new_accepted", return_value=0), \
-         patch("app.main._finale_config", return_value={"enabled": True, "max_per_run": 75}), \
+    with patch.dict(_cache, {"invoices": []}), patch("app.finale_jobs._finale_enabled", return_value=True), \
+         patch("app.crstl_cache._refresh_new_accepted", return_value=0), \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True, "max_per_run": 75}), \
          patch("app.tracking.get_unfinaled_ids", return_value=[]), \
-         patch("app.main._run_nonedi_push") as nonedi:
+         patch("app.finale_jobs._run_nonedi_push") as nonedi:
         _run_finale_push_job()
     nonedi.assert_called_once_with(True, None, None)
-    with patch("app.main._finale_enabled", return_value=False), patch("app.main._run_nonedi_push") as nonedi2:
+    with patch("app.finale_jobs._finale_enabled", return_value=False), patch("app.finale_jobs._run_nonedi_push") as nonedi2:
         _run_finale_push_job()
     nonedi2.assert_not_called()
 
@@ -828,7 +838,8 @@ def test_finale_poll_job_also_runs_the_nonedi_pass(monkeypatch):
 def test_nonedi_endpoint_and_runner_classify_by_exclusion(client, monkeypatch):
     """The runner feeds the engine Finale's sale-order list and the Crstl PO set; the
     endpoint previews by default and refuses an unscoped live run."""
-    from app.main import _cache, _run_nonedi_push
+    from app.crstl_cache import _cache
+    from app.finale_jobs import _run_nonedi_push
     from app import tracking
     tracking.init_db()
     r = client.post("/api/finale/nonedi", json={"dry_run": False})
@@ -844,9 +855,9 @@ def test_nonedi_endpoint_and_runner_classify_by_exclusion(client, monkeypatch):
         def get_order(self, oid): return orders[1]
         def order_invoices(self, o): return []
         def shipment_qty_for_order(self, o): return {"/p/a": 1.0}
-    with patch("app.main.FinaleClient", create=True), patch("app.finale.FinaleClient") as FC, \
+    with patch("app.crstl_cache.FinaleClient", create=True), patch("app.finale.FinaleClient") as FC, \
          patch.dict(_cache, {"invoices": [{"po_number": "538831979"}], "po_provinces": {}}), \
-         patch("app.main._finale_config", return_value={"enabled": True, "nonedi_go_live_after": "2026-09-15", "max_per_run": 75}), \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True, "nonedi_go_live_after": "2026-09-15", "max_per_run": 75}), \
          patch("app.tracking.get_finale_invoices", return_value={}), patch("app.tracking.record_job_run"):
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         out = _run_nonedi_push(False, None, None)
@@ -868,7 +879,8 @@ def test_digest_reconciles_finale_rolling_within_the_floor(client, monkeypatch):
     age in bold once over stale_pickup_days), every Finale invoice that does not tie
     to the 810 is listed with who keyed it and the delta -- and anything created
     before the floor never appears. Recent non-EDI receipts get their own line."""
-    from app.main import _cache, _send_daily_digest
+    from app.crstl_cache import _cache
+    from app.accounting import _send_daily_digest
     from app import tracking
     from datetime import datetime, timezone, timedelta
     tracking.init_db()
@@ -887,11 +899,11 @@ def test_digest_reconciles_finale_rolling_within_the_floor(client, monkeypatch):
     floor = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%d")      # the 6-day-old SOs are inside it
     class FakeFinale:
         def get_invoice(self, url): return {"statusId": "INVOICE_IN_PROCESS"}
-    with patch.dict(_cache, {"invoices": invs + [pre, nons]}), patch("app.main.send_mail") as mail, \
-         patch("app.main._finale_enabled", return_value=True), \
-         patch("app.main._finale_config", return_value={"enabled": True, "stale_pickup_days": 4, "max_per_run": 75}), \
-         patch("app.main._finale_floor", return_value=floor), \
-         patch("app.main.push_finale_invoices", side_effect=_not_shipped), \
+    with patch.dict(_cache, {"invoices": invs + [pre, nons]}), patch("app.accounting.send_mail") as mail, \
+         patch("app.finale_jobs._finale_enabled", return_value=True), \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True, "stale_pickup_days": 4, "max_per_run": 75}), \
+         patch("app.finale_jobs._finale_floor", return_value=floor), \
+         patch("app.finale_jobs.push_finale_invoices", side_effect=_not_shipped), \
          patch("app.finale.FinaleClient") as FC:
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         _send_daily_digest()
@@ -907,11 +919,11 @@ def test_digest_reconciles_finale_rolling_within_the_floor(client, monkeypatch):
     # on the 'does not tie' list, naming who keyed it
     tracking.record_finale_invoice(invs[0]["transaction_id"], invs[0]["po_number"], "1", "/i/1", "x-1", "external",
                                    created_by="edward.schiavon", finale_total=107.19, delta=0.05)
-    with patch.dict(_cache, {"invoices": invs + [pre, nons]}), patch("app.main.send_mail") as mail2, \
-         patch("app.main._finale_enabled", return_value=True), \
-         patch("app.main._finale_config", return_value={"enabled": True, "stale_pickup_days": 6, "max_per_run": 75}), \
-         patch("app.main._finale_floor", return_value=floor), \
-         patch("app.main.push_finale_invoices", side_effect=_not_shipped), \
+    with patch.dict(_cache, {"invoices": invs + [pre, nons]}), patch("app.accounting.send_mail") as mail2, \
+         patch("app.finale_jobs._finale_enabled", return_value=True), \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True, "stale_pickup_days": 6, "max_per_run": 75}), \
+         patch("app.finale_jobs._finale_floor", return_value=floor), \
+         patch("app.finale_jobs.push_finale_invoices", side_effect=_not_shipped), \
          patch("app.finale.FinaleClient") as FC:
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         _send_daily_digest()
@@ -925,7 +937,8 @@ def test_digest_keeps_the_normal_pipeline_out_of_needs_attention(client, monkeyp
     """An SO not shipped yet (and not stale), and an 810 accepted after the last
     NetSuite push, are information -- no red section, no issue count in the subject.
     The same 810 accepted BEFORE the last push is a real gap."""
-    from app.main import _cache, _send_daily_digest
+    from app.crstl_cache import _cache
+    from app.accounting import _send_daily_digest
     from app import tracking
     from datetime import datetime, timezone, timedelta
     tracking.init_db()
@@ -935,11 +948,11 @@ def test_digest_keeps_the_normal_pipeline_out_of_needs_attention(client, monkeyp
     tracking.record_events(["so-1"], "netsuite")       # so-1 in NetSuite, waiting on the warehouse; so-2 not pushed yet
     tracking.record_job_run("netsuite_push", "ok", "nothing new to push")   # ran BEFORE so-2 was accepted...
     invs[1]["created_at"] = (datetime.now(timezone.utc) + timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail, \
-         patch("app.main._finale_enabled", return_value=True), \
-         patch("app.main._finale_config", return_value={"enabled": True, "stale_pickup_days": 4, "max_per_run": 75}), \
-         patch("app.main._finale_floor", return_value="2026-09-15"), \
-         patch("app.main.push_finale_invoices", side_effect=_not_shipped), \
+    with patch.dict(_cache, {"invoices": invs}), patch("app.accounting.send_mail") as mail, \
+         patch("app.finale_jobs._finale_enabled", return_value=True), \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True, "stale_pickup_days": 4, "max_per_run": 75}), \
+         patch("app.finale_jobs._finale_floor", return_value="2026-09-15"), \
+         patch("app.finale_jobs.push_finale_invoices", side_effect=_not_shipped), \
          patch("app.finale.FinaleClient") as FC:
         FC.configured.return_value = True
         _send_daily_digest()
@@ -951,11 +964,11 @@ def test_digest_keeps_the_normal_pipeline_out_of_needs_attention(client, monkeyp
     # the push ran AFTER so-2 was accepted and still no SO: that is a gap to act on
     invs[1]["created_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     tracking.record_job_run("netsuite_push", "ok", "1 pushed")
-    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail2, \
-         patch("app.main._finale_enabled", return_value=True), \
-         patch("app.main._finale_config", return_value={"enabled": True, "stale_pickup_days": 4, "max_per_run": 75}), \
-         patch("app.main._finale_floor", return_value="2026-09-15"), \
-         patch("app.main.push_finale_invoices", side_effect=_not_shipped), \
+    with patch.dict(_cache, {"invoices": invs}), patch("app.accounting.send_mail") as mail2, \
+         patch("app.finale_jobs._finale_enabled", return_value=True), \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True, "stale_pickup_days": 4, "max_per_run": 75}), \
+         patch("app.finale_jobs._finale_floor", return_value="2026-09-15"), \
+         patch("app.finale_jobs.push_finale_invoices", side_effect=_not_shipped), \
          patch("app.finale.FinaleClient") as FC:
         FC.configured.return_value = True
         _send_daily_digest()
@@ -967,7 +980,8 @@ def test_digest_keeps_the_normal_pipeline_out_of_needs_attention(client, monkeyp
 def test_digest_reads_a_hand_made_invoice_before_the_poll_receipts_it(client, monkeypatch):
     """The dry run finds an invoice someone keyed on the order: the digest shows it as
     invoiced by hand (headline + Excel), lists its delta, and does NOT call it missing."""
-    from app.main import _cache, _send_daily_digest
+    from app.crstl_cache import _cache
+    from app.accounting import _send_daily_digest
     from app import tracking
     tracking.init_db()
     monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
@@ -979,10 +993,10 @@ def test_digest_reads_a_hand_made_invoice_before_the_poll_receipts_it(client, mo
                  "external": {"invoice_id": "100405", "invoice_url": "/i/100405", "invoice_id_user": "PO1-1",
                               "created_by": "edward.schiavon", "finale_status": "posted", "finale_total": 107.64, "delta": 0.5}}],
                 "summary": {}, "unresolved": []}
-    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail, \
-         patch("app.main._finale_enabled", return_value=True), \
-         patch("app.main._finale_floor", return_value="2026-09-15"), \
-         patch("app.main.push_finale_invoices", side_effect=dry), \
+    with patch.dict(_cache, {"invoices": invs}), patch("app.accounting.send_mail") as mail, \
+         patch("app.finale_jobs._finale_enabled", return_value=True), \
+         patch("app.finale_jobs._finale_floor", return_value="2026-09-15"), \
+         patch("app.finale_jobs.push_finale_invoices", side_effect=dry), \
          patch("app.finale.FinaleClient") as FC:
         FC.configured.return_value = True
         _send_daily_digest()
@@ -998,7 +1012,8 @@ def test_digest_reads_a_hand_made_invoice_before_the_poll_receipts_it(client, mo
 
 def test_digest_summary_table_splits_dsd_and_dropship(client, monkeypatch):
     """The summary table is channel x product with a subtotal per channel, DSD first."""
-    from app.main import _cache, _send_daily_digest
+    from app.crstl_cache import _cache
+    from app.accounting import _send_daily_digest
     from app import tracking
     tracking.init_db()
     monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
@@ -1006,7 +1021,7 @@ def test_digest_summary_table_splits_dsd_and_dropship(client, monkeypatch):
     invs = _so_ready_invoices()
     invs[0]["store"] = "VAUGHAN"; invs[0]["product"] = "Blind"          # a DSD blind, and a dropship drape
     tracking.record_events(["so-1", "so-2"], "netsuite")
-    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail:
+    with patch.dict(_cache, {"invoices": invs}), patch("app.accounting.send_mail") as mail:
         _send_daily_digest()
     body = mail.call_args.kwargs["body_html"]
     assert body.index("<td>DSD</td><td>Blind</td>") < body.index("<td>DSD total</td>") \
@@ -1018,7 +1033,8 @@ def test_digest_summary_table_splits_dsd_and_dropship(client, monkeypatch):
 def test_digest_backfills_a_receipt_from_before_the_reconciliation_columns(client, monkeypatch):
     """A 'posted' receipt written before who/total/delta existed is completed once
     from the live invoice, so the Finale sheet never shows a blank app-made row."""
-    from app.main import _cache, _send_daily_digest
+    from app.crstl_cache import _cache
+    from app.accounting import _send_daily_digest
     from app import tracking
     tracking.init_db()
     monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
@@ -1036,9 +1052,9 @@ def test_digest_backfills_a_receipt_from_before_the_reconciliation_columns(clien
                                         {"invoiceItemTypeId": "INV_SALES_TAX", "amount": 12.33}],
                     "statusIdHistoryList": [{"statusId": None, "userLoginUrl": "/x/api/userlogin/API_KEY_U_BLINDS"}]}
     for _ in range(2):
-        with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail, \
-             patch("app.main._finale_enabled", return_value=True), \
-             patch("app.main._finale_floor", return_value="2026-09-15"), \
+        with patch.dict(_cache, {"invoices": invs}), patch("app.accounting.send_mail") as mail, \
+             patch("app.finale_jobs._finale_enabled", return_value=True), \
+             patch("app.finale_jobs._finale_floor", return_value="2026-09-15"), \
              patch("app.finale.FinaleClient") as FC:
             FC.configured.return_value = True; FC.return_value = FakeFinale()
             _send_daily_digest()
@@ -1050,7 +1066,8 @@ def test_digest_backfills_a_receipt_from_before_the_reconciliation_columns(clien
 
 
 def test_digest_drops_a_held_draft_once_someone_posts_it(client, monkeypatch):
-    from app.main import _cache, _send_daily_digest
+    from app.crstl_cache import _cache
+    from app.accounting import _send_daily_digest
     from app import tracking
     tracking.init_db()
     monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
@@ -1064,9 +1081,9 @@ def test_digest_drops_a_held_draft_once_someone_posts_it(client, monkeypatch):
             return {"statusId": "INVOICE_APPROVED", "statusIdHistoryList": [
                 {"statusId": None, "userLoginUrl": "/x/api/userlogin/API_KEY_U_BLINDS"},
                 {"statusId": "INVOICE_APPROVED", "userLoginUrl": "/x/api/userlogin/edward.schiavon"}]}
-    with patch.dict(_cache, {"invoices": invs}), patch("app.main.send_mail") as mail, \
-         patch("app.main._finale_enabled", return_value=True), \
-         patch("app.main._finale_floor", return_value="2026-09-15"), \
+    with patch.dict(_cache, {"invoices": invs}), patch("app.accounting.send_mail") as mail, \
+         patch("app.finale_jobs._finale_enabled", return_value=True), \
+         patch("app.finale_jobs._finale_floor", return_value="2026-09-15"), \
          patch("app.finale.FinaleClient") as FC:
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         _send_daily_digest()
@@ -1077,7 +1094,7 @@ def test_digest_drops_a_held_draft_once_someone_posts_it(client, monkeypatch):
 
 
 def test_digest_nonedi_window_starts_at_the_last_sent_digest(client):
-    from app.main import _last_digest_sent_at
+    from app.accounting import _last_digest_sent_at
     from app import tracking
     tracking.init_db()
     assert _last_digest_sent_at() is None
@@ -1091,34 +1108,35 @@ def test_digest_nonedi_window_starts_at_the_last_sent_digest(client):
 def test_dsd_prefill_runs_in_the_finale_job_only_when_toggled_on(monkeypatch, client):
     """The DSD pass is a dashboard toggle (Automation panel, default off) that rides
     inside the Finale poll; the panel lists it and its next run is the poll's."""
-    from app.main import _run_finale_push_job, AUTO_DSD_SETTING
+    from app.finale_jobs import _run_finale_push_job
+    from app.automation import AUTO_DSD_SETTING
     from app import tracking
-    monkeypatch.setattr("app.main._finale_enabled", lambda: True)
-    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), \
-         patch("app.main._finale_config", return_value={"enabled": True}), \
-         patch("app.main._run_dsd_prefill") as dsd0:
+    monkeypatch.setattr("app.finale_jobs._finale_enabled", lambda: True)
+    with patch("app.finale_jobs._finale_edi_pass"), patch("app.finale_jobs._run_nonedi_push"), \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True}), \
+         patch("app.finale_jobs._run_dsd_prefill") as dsd0:
         _run_finale_push_job()                                   # default: off
     dsd0.assert_not_called()
     r = client.post("/api/automation", json={"job": "finale_dsd", "enabled": True})
     assert r.status_code == 200 and tracking.get_setting(AUTO_DSD_SETTING) == "true"
     row = [j for j in client.get("/api/automation").json()["jobs"] if j["id"] == "finale_dsd"][0]
     assert row["enabled"] is True and "PRO" in row["label"]
-    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), \
-         patch("app.main._finale_config", return_value={"enabled": True}), \
-         patch("app.main._run_dsd_prefill") as dsd:
+    with patch("app.finale_jobs._finale_edi_pass"), patch("app.finale_jobs._run_nonedi_push"), \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True}), \
+         patch("app.finale_jobs._run_dsd_prefill") as dsd:
         _run_finale_push_job()
     dsd.assert_called_once_with(True, None, None)
     client.post("/api/automation", json={"job": "finale_dsd", "enabled": False})
-    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), \
-         patch("app.main._finale_config", return_value={"enabled": True}), \
-         patch("app.main._run_dsd_prefill") as dsd2:
+    with patch("app.finale_jobs._finale_edi_pass"), patch("app.finale_jobs._run_nonedi_push"), \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True}), \
+         patch("app.finale_jobs._run_dsd_prefill") as dsd2:
         _run_finale_push_job()
     dsd2.assert_not_called()
     # a DSD failure is isolated, like the other passes
     client.post("/api/automation", json={"job": "finale_dsd", "enabled": True})
-    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), \
-         patch("app.main._finale_config", return_value={"enabled": True}), \
-         patch("app.main._run_dsd_prefill", side_effect=RuntimeError("boom")), \
+    with patch("app.finale_jobs._finale_edi_pass"), patch("app.finale_jobs._run_nonedi_push"), \
+         patch("app.finale_jobs._finale_config", return_value={"enabled": True}), \
+         patch("app.finale_jobs._run_dsd_prefill", side_effect=RuntimeError("boom")), \
          patch("app.tracking.record_job_run") as job:
         _run_finale_push_job()
     assert ("finale_dsd", "error") in {(c.args[0], c.args[1]) for c in job.call_args_list}
@@ -1129,7 +1147,7 @@ def test_dsd_endpoint_live_requires_ids_and_dry_run_previews(client):
     assert r.status_code == 400 and "ASN ids" in r.json()["message"]
     fake = {"mode": "dry", "results": [{"asn_id": "a1", "status": "would_prefill"}],
             "summary": {"candidates": 1, "would_prefill": 1}}
-    with patch("app.main._run_dsd_prefill", return_value=fake) as run:
+    with patch("app.finale_jobs._run_dsd_prefill", return_value=fake) as run:
         r2 = client.post("/api/finale/dsd", json={"dry_run": True, "ids": ["a1"]})
     assert r2.status_code == 200 and r2.json()["summary"]["would_prefill"] == 1
     run.assert_called_once_with(False, ["a1"], None)
@@ -1138,7 +1156,7 @@ def test_dsd_endpoint_live_requires_ids_and_dry_run_previews(client):
 def test_run_dsd_prefill_applies_the_shared_guards_to_the_automated_pass(monkeypatch):
     """ids=None (the 15-min pass): Accepted 856s after the floor, no receipt, under the
     cap -- and only those get a detail fetch. A named run fetches exactly the ids given."""
-    from app.main import _run_dsd_prefill
+    from app.finale_jobs import _run_dsd_prefill
     from app import tracking
     tracking.init_db()
     states = {"new": {"state": "Accepted", "created_at": "2026-09-16T01:00:00Z", "po_number": "1"},
@@ -1147,11 +1165,11 @@ def test_run_dsd_prefill_applies_the_shared_guards_to_the_automated_pass(monkeyp
     crstl = type("C", (), {"list_transaction_states": lambda self, transaction_type="810": states,
                            "fetch_asn_refs": lambda self, ids: [{"asn_id": i, "po_number": "1", "state": "Accepted",
                                                                  "pro": "6100", "rts": "3200", "pickup_date": ""} for i in ids]})()
-    monkeypatch.setattr("app.main._get_client", lambda: crstl)
-    monkeypatch.setattr("app.main._finale_config", lambda: {"enabled": True, "go_live_after": "2026-09-15", "max_per_run": 5})
-    monkeypatch.setattr("app.main.load_refs", lambda: {"automation": {"created_within_days": 365}})
+    monkeypatch.setattr("app.crstl_cache._get_client", lambda: crstl)
+    monkeypatch.setattr("app.finale_jobs._finale_config", lambda: {"enabled": True, "go_live_after": "2026-09-15", "max_per_run": 5})
+    monkeypatch.setattr("app.finale_jobs.load_refs", lambda: {"automation": {"created_within_days": 365}})
     with patch("app.finale.FinaleClient.configured", return_value=True), patch("app.finale.FinaleClient") as fc, \
-         patch("app.main.push_dsd_prefill", return_value={"mode": "dry", "results": [], "summary": {"candidates": 1}}) as push:
+         patch("app.finale_jobs.push_dsd_prefill", return_value={"mode": "dry", "results": [], "summary": {"candidates": 1}}) as push:
         fc.configured.return_value = True
         _run_dsd_prefill(False, None, None)
         assert [a["asn_id"] for a in push.call_args[0][0]] == ["new"]
@@ -1162,13 +1180,13 @@ def test_run_dsd_prefill_applies_the_shared_guards_to_the_automated_pass(monkeyp
 def test_finale_poll_runs_the_shipstation_close_only_when_enabled(monkeypatch):
     """The DSD close pass rides the 15-min Finale poll and is gated by config
     shipstation.enabled; a manual live run must name order numbers."""
-    from app.main import _finale_poll_passes
-    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
-         patch("app.main._shipstation_config", return_value={"enabled": False}), patch("app.main._run_shipstation_close") as close:
+    from app.finale_jobs import _finale_poll_passes
+    with patch("app.finale_jobs._finale_edi_pass"), patch("app.finale_jobs._run_nonedi_push"), patch("app.finale_jobs._dsd_prefill_enabled", return_value=False), \
+         patch("app.finale_jobs._shipstation_config", return_value={"enabled": False}), patch("app.finale_jobs._run_shipstation_close") as close:
         _finale_poll_passes()
     close.assert_not_called()
-    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
-         patch("app.main._shipstation_config", return_value={"enabled": True}), patch("app.main._run_shipstation_close") as close2:
+    with patch("app.finale_jobs._finale_edi_pass"), patch("app.finale_jobs._run_nonedi_push"), patch("app.finale_jobs._dsd_prefill_enabled", return_value=False), \
+         patch("app.finale_jobs._shipstation_config", return_value={"enabled": True}), patch("app.finale_jobs._run_shipstation_close") as close2:
         _finale_poll_passes()
     close2.assert_called_once_with(True, None, None)
 
@@ -1176,7 +1194,7 @@ def test_finale_poll_runs_the_shipstation_close_only_when_enabled(monkeypatch):
 def test_shipstation_close_endpoint_requires_ids_for_live(client):
     r = client.post("/api/shipstation/close", json={"dry_run": False})
     assert r.status_code == 400 and "ids" in r.json()["message"]
-    with patch("app.main._run_shipstation_close", return_value={"mode": "dry", "results": [], "summary": {"candidates": 0}}) as run:
+    with patch("app.finale_jobs._run_shipstation_close", return_value={"mode": "dry", "results": [], "summary": {"candidates": 0}}) as run:
         r2 = client.post("/api/shipstation/close", json={"dry_run": True})
     assert r2.status_code == 200 and run.call_args.args == (False, None, None)
 
@@ -1184,21 +1202,21 @@ def test_shipstation_close_endpoint_requires_ids_for_live(client):
 def test_finale_poll_never_runs_alerts(client):
     """Alerts are their own job now: the Finale poll must not run them, even with
     alerts enabled (a monitor must not depend on what it monitors)."""
-    from app.main import _finale_poll_passes
-    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
-         patch("app.main._alerts_config", return_value={"enabled": True}), patch("app.main.alert_day", return_value=True), \
-         patch("app.main._run_alerts") as run:
+    from app.finale_jobs import _finale_poll_passes
+    with patch("app.finale_jobs._finale_edi_pass"), patch("app.finale_jobs._run_nonedi_push"), patch("app.finale_jobs._dsd_prefill_enabled", return_value=False), \
+         patch("app.alert_jobs._alerts_config", return_value={"enabled": True}), patch("app.alert_jobs.alert_day", return_value=True), \
+         patch("app.alert_jobs._run_alerts") as run:
         _finale_poll_passes()
     run.assert_not_called()
 
 
 def _alerts_job(*, config_on=True, toggle_on=True, weekday=True, finale_on=True):
     """Run the scheduled alerts job with its gates set; return (_run_alerts mock, record_job_run mock)."""
-    from app.main import _run_alerts_job
-    with patch("app.main._alerts_config", return_value={"enabled": config_on}), \
-         patch("app.main._job_enabled", return_value=toggle_on), patch("app.main.alert_day", return_value=weekday), \
-         patch("app.main._finale_enabled", return_value=finale_on), \
-         patch("app.main._run_alerts") as run, patch("app.main.tracking.record_job_run") as rec:
+    from app.alert_jobs import _run_alerts_job
+    with patch("app.alert_jobs._alerts_config", return_value={"enabled": config_on}), \
+         patch("app.automation._job_enabled", return_value=toggle_on), patch("app.alert_jobs.alert_day", return_value=weekday), \
+         patch("app.finale_jobs._finale_enabled", return_value=finale_on), \
+         patch("app.alert_jobs._run_alerts") as run, patch("app.tracking.record_job_run") as rec:
         _run_alerts_job()
     return run, rec
 
@@ -1221,8 +1239,8 @@ def test_alerts_job_skips_weekends_but_the_endpoint_still_runs(client):
     run, rec = _alerts_job(weekday=False)
     run.assert_not_called()
     rec.assert_called_once_with("order_alerts", "skipped", "weekend -- alerts resume Monday")
-    with patch("app.main.alert_day", return_value=False), \
-         patch("app.main._run_alerts", return_value={"mode": "dry", "summary": {"found": 0}, "sent": False}) as run2:
+    with patch("app.alert_jobs.alert_day", return_value=False), \
+         patch("app.alert_jobs._run_alerts", return_value={"mode": "dry", "summary": {"found": 0}, "sent": False}) as run2:
         r = client.post("/api/alerts/check", json={"dry_run": True})
     assert r.status_code == 200 and run2.call_args.args == (False,)
 
@@ -1231,7 +1249,8 @@ def test_alerts_job_is_scheduled_on_its_own(monkeypatch, tmp_path):
     jobs = _scheduled_jobs(monkeypatch, tmp_path)
     job = jobs["order_alerts"]
     assert job["trigger"] == "interval" and job["minutes"] == 15
-    from app.main import _run_alerts_job, AUTOMATION_JOBS
+    from app.alert_jobs import _run_alerts_job
+    from app.automation import AUTOMATION_JOBS
     assert any(j["id"] == "order_alerts" and j["default"] == "true" and "runs_with" not in j for j in AUTOMATION_JOBS)
 
 
@@ -1239,23 +1258,23 @@ def test_push_gate_counts_skipped_runs_and_the_live_push_in_progress(client, mon
     """A skipped scheduled run (auto-push off) still means 'the push had its chance',
     and the post-push digest -- fired before the job run is logged -- sees the live
     push that just happened rather than yesterday's run."""
-    from app import main, tracking
+    from app import accounting, tracking
     tracking.init_db()
-    assert main._last_netsuite_push_at() is None
+    assert accounting._last_netsuite_push_at() is None
     tracking.record_job_run("netsuite_push", "skipped", "disabled")
-    skipped_at = main._last_netsuite_push_at()
+    skipped_at = accounting._last_netsuite_push_at()
     assert skipped_at is not None                                              # skipped counts
-    with patch.dict(main._netsuite_push_state, {"last_run": "2099-01-01T00:00:00+00:00", "mode": "live"}):
-        assert main._last_netsuite_push_at() == "2099-01-01T00:00:00+00:00"   # in-flight live push wins
-    with patch.dict(main._netsuite_push_state, {"last_run": "2099-01-01T00:00:00+00:00", "mode": "dry"}):
-        assert main._last_netsuite_push_at() == skipped_at                     # a dry run is not a chance
+    with patch.dict(accounting._netsuite_push_state, {"last_run": "2099-01-01T00:00:00+00:00", "mode": "live"}):
+        assert accounting._last_netsuite_push_at() == "2099-01-01T00:00:00+00:00"   # in-flight live push wins
+    with patch.dict(accounting._netsuite_push_state, {"last_run": "2099-01-01T00:00:00+00:00", "mode": "dry"}):
+        assert accounting._last_netsuite_push_at() == skipped_at                     # a dry run is not a chance
 
 
 
 def test_receipt_refresh_reads_the_ones_that_need_it_not_the_first_fifty(client, monkeypatch):
     """60 receipts, only #55 is a held draft: it is re-read (the bound applies after
     filtering to receipts that need a read)."""
-    from app.main import _finale_reconciliation
+    from app.finale_jobs import _finale_reconciliation
     from app import tracking
     tracking.init_db()
     invs, receipts = [], {}
@@ -1268,7 +1287,7 @@ def test_receipt_refresh_reads_the_ones_that_need_it_not_the_first_fifty(client,
     reads = []
     class FakeFinale:
         def get_invoice(self, url): reads.append(url); return {"statusId": "INVOICE_IN_PROCESS"}
-    with patch("app.main.tracking.get_finale_invoices", return_value=receipts), patch("app.main._finale_floor", return_value="2026-09-15"), \
+    with patch("app.tracking.get_finale_invoices", return_value=receipts), patch("app.finale_jobs._finale_floor", return_value="2026-09-15"), \
          patch("app.finale.FinaleClient") as FC:
         FC.configured.return_value = True; FC.return_value = FakeFinale()
         _finale_reconciliation(invs, 4)
@@ -1276,13 +1295,13 @@ def test_receipt_refresh_reads_the_ones_that_need_it_not_the_first_fifty(client,
 
 
 def test_poll_runs_it_only_when_enabled(client):
-    from app.main import _finale_poll_passes
-    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
-         patch("app.main._dropship_config", return_value={"enabled": False}), patch("app.main._run_dropship_prefill") as run:
+    from app.finale_jobs import _finale_poll_passes
+    with patch("app.finale_jobs._finale_edi_pass"), patch("app.finale_jobs._run_nonedi_push"), patch("app.finale_jobs._dsd_prefill_enabled", return_value=False), \
+         patch("app.finale_jobs._dropship_config", return_value={"enabled": False}), patch("app.finale_jobs._run_dropship_prefill") as run:
         _finale_poll_passes()
     run.assert_not_called()
-    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
-         patch("app.main._dropship_config", return_value={"enabled": True}), patch("app.main._run_dropship_prefill") as run2:
+    with patch("app.finale_jobs._finale_edi_pass"), patch("app.finale_jobs._run_nonedi_push"), patch("app.finale_jobs._dsd_prefill_enabled", return_value=False), \
+         patch("app.finale_jobs._dropship_config", return_value={"enabled": True}), patch("app.finale_jobs._run_dropship_prefill") as run2:
         _finale_poll_passes()
     run2.assert_called_once_with(True, None, None)
 

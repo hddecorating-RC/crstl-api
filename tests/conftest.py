@@ -31,7 +31,7 @@ def _no_live_credentials(monkeypatch):
 def _config_gated_passes_off():
     """ShipStation close is OFF for every test; a test that wants it on patches
     app.main._shipstation_config itself (an inner patch wins)."""
-    with patch("app.main._shipstation_config", return_value={"enabled": False}), \
-         patch("app.main._alerts_config", return_value={"enabled": False}), \
-         patch("app.main._dropship_config", return_value={"enabled": False}):
+    with patch("app.finale_jobs._shipstation_config", return_value={"enabled": False}), \
+         patch("app.alert_jobs._alerts_config", return_value={"enabled": False}), \
+         patch("app.finale_jobs._dropship_config", return_value={"enabled": False}):
         yield
