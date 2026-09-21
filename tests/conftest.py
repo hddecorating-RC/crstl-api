@@ -19,9 +19,15 @@ LIVE_ENV = ("SHIPSTATION_KEY", "SHIPSTATION_V1_KEY", "SHIPSTATION_V1_SECRET",
 
 
 @pytest.fixture(autouse=True)
-def _no_live_credentials(monkeypatch):
+def _no_live_credentials(monkeypatch, tmp_path):
     for k in LIVE_ENV:
         monkeypatch.delenv(k, raising=False)
+    # Every test gets a throwaway tracking DB (a test may still point it elsewhere).
+    # Without this, tests that didn't set one wrote job runs, run state and the
+    # Finale run-lock file into the developer's own .tmp/tracking.db.
+    monkeypatch.setenv("TRACKING_DB", str(tmp_path / "tracking.db"))
+    from app import tracking
+    tracking.init_db()
     monkeypatch.setenv("SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("PYTEST_RUNNING", "1")
     yield

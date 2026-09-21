@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import os
 import pathlib
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from typing import Optional
 
 from fastapi import FastAPI
@@ -21,7 +21,7 @@ from app.accounting import (
 from app.automation import AUTOMATION_JOBS, AUTO_DIGEST_SETTING, _JOB_BY_ID
 from app.crstl_cache import _cache, _cache_lock
 from app.finale_jobs import FinaleBusy, _finale_push_lock, _finale_push_state
-from app import accounting, alert_jobs, automation, crstl_cache, env, finale_jobs
+from app import accounting, alert_jobs, automation, crstl_cache, env, finale_jobs, schedule
 
 
 env.load_env()
@@ -44,46 +44,21 @@ async def lifespan(app: FastAPI):
         yield
         return
 
-    # misfire_grace_time=3600 lets a job run up to 1 hour late if the host was
-    # paused or the scheduler was down at fire time (LXC snapshots, restarts).
-    # Without this, a missed 07:00 refresh silently vanishes until the next day.
-    # Jobs run through toggle-aware wrappers (_run_*_job) that self-check their
-    # on/off setting and record each run in job_runs, so the Automation panel can
-    # show state + history. A disabled job still fires but no-ops and logs "skipped".
+    # Which jobs this process runs: SCHEDULER_JOBS, or every job (the pre-split setup)
+    # when it is unset. A job another process already holds (the Finale worker,
+    # order-watch) is left to it -- see app.schedule.
     global _scheduler
+    held, refused = schedule.claim(schedule.web_jobs(), "crstl-api")
+    for jid in refused:
+        print(f"WARNING: {jid} is scheduled by another process ({schedule.claim_holder(jid)}) -- not here")
     _scheduler = AsyncIOScheduler()
-    _scheduler.add_job(crstl_cache._run_refresh_job, "cron", id="daily_refresh",
-                       hour=4, minute=45, timezone="America/Toronto",
-                       misfire_grace_time=3600, coalesce=True)
-    # NetSuite auto-push — 5:00 AM ET, before anyone in accounting is entering
-    # invoices, so our writes never collide with a manual entry. Runs after the
-    # 4:45 refresh (fresh data) and before the 7:15 digest (which reports it).
-    # OFF by default until accounting turns it on.
-    _scheduler.add_job(accounting._run_netsuite_push_job, "cron", id="netsuite_push",
-                       day_of_week="mon-fri", hour=5, minute=0, timezone="America/Toronto",
-                       misfire_grace_time=3600, coalesce=True)
-    # Weekdays only — nobody works the digest queue on Sat/Sun, so a weekend
-    # send is just two emails to ignore. Skipping them loses nothing: the digest
-    # sends whatever tracking.db still has unemailed, so Monday 07:15 carries
-    # Friday's late invoices plus anything Crstl added over the weekend.
-    _scheduler.add_job(accounting._run_daily_digest_job, "cron", id="daily_digest",
-                       day_of_week="mon-fri", hour=7, minute=15,
-                       timezone="America/Toronto",
-                       misfire_grace_time=3600, coalesce=True)
-    # Finale invoicing poll -- every 15 minutes. HD accepts the 810 a median 6 min after
-    # the ship, so this lands the Finale invoice + order completion ~15-20 min after
-    # shipping with exact 810 cents. Cheap when idle (one CRSTL list call). OFF unless
-    # config finale.enabled AND the dashboard toggle are both on.
-    _scheduler.add_job(finale_jobs._run_finale_push_job, "interval", id="finale_push", minutes=15,
-                       misfire_grace_time=600, coalesce=True)
-    # Order alerts -- every 15 minutes, its own job (see _run_alerts_job). Offset 7
-    # minutes from the Finale poll so the two don't hit CRSTL and Finale at once.
-    _scheduler.add_job(alert_jobs._run_alerts_job, "interval", id="order_alerts", minutes=15,
-                       next_run_time=datetime.now(timezone.utc) + timedelta(minutes=7),
-                       misfire_grace_time=600, coalesce=True)
+    schedule.register(_scheduler, list(held))
     _scheduler.start()
+    automation.track_next_runs(_scheduler)
+    print(f"Scheduler: running {', '.join(held) or 'no jobs'}")
     yield
     _scheduler.shutdown()
+    schedule.release(held)
 
 
 app = FastAPI(title="HD Decorating Invoice Dashboard", lifespan=lifespan)
@@ -239,8 +214,7 @@ async def finale_push(body: FinalePushRequest = FinalePushRequest()) -> JSONResp
         return JSONResponse(status_code=409, content={"message": str(exc)})
     except Exception as exc:
         print(f"Finale push failed: {exc}")
-        with _finale_push_lock:
-            _finale_push_state["error"] = "push failed — see server logs"
+        finale_jobs._save_state("edi", {"error": "push failed — see server logs"})
         return JSONResponse(status_code=500, content={"message": "Finale push failed — see server logs"})
     with _finale_push_lock:
         last_run = _finale_push_state["last_run"]
@@ -319,8 +293,7 @@ async def alerts_check(body: FinalePushRequest = FinalePushRequest()) -> JSONRes
 
 @app.get("/api/finale-push/latest")
 async def finale_push_latest() -> JSONResponse:
-    with _finale_push_lock:
-        return JSONResponse(content=dict(_finale_push_state))
+    return JSONResponse(content=finale_jobs.finale_state())
 
 
 @app.get("/api/netsuite-push/latest")
@@ -451,7 +424,9 @@ def automation_status() -> dict:
     jobs = [{
         "id": j["id"], "label": j["label"], "schedule": j["schedule"],
         "enabled": automation._job_enabled(j["setting"], j["default"]),
-        "next_run": next_runs.get(j.get("runs_with") or j["id"]),
+        # This process's own scheduler, else what the process that runs it stored.
+        "next_run": (next_runs.get(j.get("runs_with") or j["id"])
+                     or automation.stored_next_run(j.get("runs_with") or j["id"])),
         "last_run": last.get(j["id"]),
     } for j in AUTOMATION_JOBS]
     return {"jobs": jobs, "scheduler_running": _scheduler is not None}

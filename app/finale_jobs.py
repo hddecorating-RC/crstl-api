@@ -2,6 +2,8 @@
 numbers, ShipStation DSD close, dropship pre-fill, and the Finale reconciliation the
 digest reads. The 15-min poll (_run_finale_push_job) is the Finale worker's job."""
 import contextlib
+import fcntl
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -33,21 +35,69 @@ _finale_push_state: dict = {"last_run": None, "mode": None, "summary": None,
 # Why: preflight (receipt + order invoices) and the create POST are not atomic, and
 # Finale's collection POST always creates -- two overlapping runs could post two
 # invoices on one order.
+#
+# Two halves since 2026-09-21, when the poll moved into its own process (the Finale
+# worker) while the manual endpoints and the NetSuite ride-along stayed in the web app:
+# the RLock covers threads in THIS process, and an flock on a file beside tracking.db
+# covers every process on the box. The kernel drops an flock when its process dies, so
+# a crash can never leave the lock held.
 _finale_run_lock = threading.RLock()
 _finale_run_holder: Optional[str] = None
+_finale_run_fd: Optional[int] = None
 
 
 class FinaleBusy(RuntimeError):
     """Another Finale run holds the lock; nothing was done."""
 
 
+def _run_lock_path() -> str:
+    folder = os.path.dirname(os.path.abspath(tracking._db_path()))
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "finale-run.lock")
+
+
+def _run_lock_holder() -> Optional[str]:
+    """Who holds the Finale run lock in ANY process ("poll, pid 123"), or None. Read
+    from the note the holder leaves in the lock file; a note left by a process that
+    has since died is ignored."""
+    try:
+        with open(_run_lock_path()) as f:
+            note = f.read().strip()
+    except OSError:
+        return None
+    label, _, pid = note.rpartition(" pid ")
+    if not label:
+        return None
+    try:
+        os.kill(int(pid), 0)
+    except (ValueError, ProcessLookupError):
+        return None
+    except PermissionError:
+        pass                                  # alive, owned by another user
+    return f"{label}, pid {pid}"
+
+
 @contextlib.contextmanager
 def _finale_run(label: str):
-    global _finale_run_holder
+    global _finale_run_holder, _finale_run_fd
     if not _finale_run_lock.acquire(blocking=False):
         raise FinaleBusy(f"another Finale run is in progress ({_finale_run_holder or 'unknown'})")
     outer = _finale_run_holder is None
     if outer:
+        try:
+            fd = os.open(_run_lock_path(), os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError:
+            _finale_run_lock.release()
+            raise
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            _finale_run_lock.release()
+            raise FinaleBusy(f"another Finale run is in progress ({_run_lock_holder() or 'another process'})")
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f"{label} pid {os.getpid()}".encode(), 0)
+        _finale_run_fd = fd
         _finale_run_holder = label
         with _finale_push_lock:
             _finale_push_state["running"] = True
@@ -58,7 +108,48 @@ def _finale_run(label: str):
             _finale_run_holder = None
             with _finale_push_lock:
                 _finale_push_state["running"] = False
+            fd, _finale_run_fd = _finale_run_fd, None
+            try:
+                os.ftruncate(fd, 0)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
         _finale_run_lock.release()
+
+
+# The last run of each pass, for the dashboard (GET /api/finale-push/latest). Kept in
+# memory AND in tracking.db: the web app serves the dashboard, but the poll runs in
+# the Finale worker and alerts in order-watch, so the web app reads what they wrote.
+# "edi" is the top-level Finale-invoicing fields; the others are one pass each.
+_STATE_SECTIONS = ("nonedi", "dsd", "shipstation", "dropship", "alerts")
+_EDI_STATE_KEYS = ("last_run", "mode", "summary", "results", "blocked", "error")
+
+
+def _save_state(section: str, data: dict) -> None:
+    key = f"finale_state:{section}"
+    with _finale_push_lock:
+        if section == "edi":
+            _finale_push_state.update(data)
+        else:
+            _finale_push_state[section] = data
+    # "edi" merges (a ride-along error updates just `error`), into what is STORED --
+    # this process's memory may be older than a run the other process made.
+    tracking.set_json(key, {**(tracking.get_json(key) or {}), **data} if section == "edi" else data)
+
+
+def finale_state() -> dict:
+    """What the dashboard shows: each pass's last run, whichever process made it, and
+    whether a Finale run is in progress in any process."""
+    with _finale_push_lock:
+        out = dict(_finale_push_state)
+    stored = tracking.get_json("finale_state:edi") or {}
+    out.update({k: stored[k] for k in _EDI_STATE_KEYS if k in stored})
+    for section in _STATE_SECTIONS:
+        v = tracking.get_json(f"finale_state:{section}")
+        if v is not None:
+            out[section] = v
+    out["running"] = bool(out.get("running")) or _run_lock_holder() is not None
+    return out
 
 
 def _finale_config() -> dict:
@@ -81,12 +172,11 @@ def _run_finale_push(live: bool, ids: Optional[list[str]], limit: Optional[int],
         po_map = dict(_cache["po_provinces"])
     with _finale_run("edi"):
         result = push_finale_invoices(invoices, po_map, live=live, only=ids, limit=limit, max_per_run=max_per_run)
-    with _finale_push_lock:
-        _finale_push_state.update({
-            "last_run": datetime.now(timezone.utc).isoformat(), "mode": result["mode"],
-            "summary": result["summary"], "results": result["results"],
-            "blocked": result.get("blocked"), "error": None,
-        })
+    _save_state("edi", {
+        "last_run": datetime.now(timezone.utc).isoformat(), "mode": result["mode"],
+        "summary": result["summary"], "results": result["results"],
+        "blocked": result.get("blocked"), "error": None,
+    })
     s = result["summary"]
     tracking.record_job_run("finale_push", "blocked" if result.get("blocked") else
                             ("ok" if s["failed"] == 0 else "partial"),
@@ -135,8 +225,7 @@ def _run_finale_push_safe(sent_ids: list[str]) -> None:
     except FinaleBusy as exc:
         tracking.record_job_run("finale_push", "skipped", f"{exc} -- the 15-min poll will invoice them")
     except Exception as exc:
-        with _finale_push_lock:
-            _finale_push_state["error"] = str(exc)
+        _save_state("edi", {"error": str(exc)})
         print(f"WARNING: Finale invoicing failed after NetSuite push: {exc}")
         tracking.record_job_run("finale_push", "error", str(exc)[:200])
 
@@ -239,8 +328,7 @@ def _run_dsd_prefill(live: bool, ids: Optional[list[str]], limit: Optional[int])
         result = push_dsd_prefill(asns, live=live, only=None, limit=limit, client=FinaleClient(),
                                   max_per_run=fin.get("max_per_run") if automated else None)
     blocked = result.get("blocked")
-    with _finale_push_lock:
-        _finale_push_state["dsd"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
+    _save_state("dsd", {"last_run": datetime.now(timezone.utc).isoformat(), **result})
     s = result["summary"]
     tracking.record_job_run("finale_dsd", "blocked" if blocked else ("ok" if not s.get("failed") else "partial"),
                             (f"{blocked} -- refusing; run manually" if blocked else
@@ -276,8 +364,7 @@ def _run_shipstation_close(live: bool, ids: Optional[list[str]], limit: Optional
                                     carrier_code=str(cfg.get("carrier_code") or "other"),
                                     max_per_run=cfg.get("max_per_run") if automated else None)
     blocked = result.get("blocked")
-    with _finale_push_lock:
-        _finale_push_state["shipstation"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
+    _save_state("shipstation", {"last_run": datetime.now(timezone.utc).isoformat(), **result})
     c = result["summary"]
     tracking.record_job_run("shipstation_close", "blocked" if blocked else ("ok" if not c.get("failed") else "partial"),
                             (f"{blocked} -- refusing; run manually" if blocked else
@@ -313,8 +400,7 @@ def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[
                                        max_per_run=cfg.get("max_per_run") if automated else None)
     result["carrier"] = {"wanted": carrier["name"], "enabled": carrier["enabled"], "note": carrier["reason"] or None}
     blocked = result.get("blocked")
-    with _finale_push_lock:
-        _finale_push_state["dropship"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
+    _save_state("dropship", {"last_run": datetime.now(timezone.utc).isoformat(), **result})
     c = result["summary"]
     tracking.record_job_run("dropship_prefill", "blocked" if blocked else ("ok" if not c.get("failed") else "partial"),
                             (f"{blocked} -- refusing; run manually" if blocked else
@@ -338,8 +424,7 @@ def _run_nonedi_push(live: bool, ids: Optional[list[str]], limit: Optional[int])
                                       client=client, floor=str(fin.get("nonedi_go_live_after") or "") or None,
                                       max_per_run=fin.get("max_per_run") if ids is None else None,   # automation only
                                       auto_reopen=bool(fin.get("auto_reopen")))
-    with _finale_push_lock:
-        _finale_push_state["nonedi"] = {"last_run": datetime.now(timezone.utc).isoformat(), **result}
+    _save_state("nonedi", {"last_run": datetime.now(timezone.utc).isoformat(), **result})
     s = result["summary"]
     tracking.record_job_run("finale_nonedi", "blocked" if result.get("blocked") else ("ok" if s["failed"] == 0 else "partial"),
                             f"{s['candidates']} candidates: {s['posted']} posted, {s['draft']} draft, {s['failed']} failed, "

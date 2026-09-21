@@ -324,3 +324,21 @@ def _run_refresh_job() -> None:
         tracking.record_job_run("daily_refresh", "error", str(status)[:200])
     else:
         tracking.record_job_run("daily_refresh", "ok", f"{n} invoices synced")
+
+
+def _run_worker_refresh() -> None:
+    """The Finale worker's own 4:45 full refresh (its cache is its own). Same toggle as
+    daily_refresh. Only a failure is logged, as a finale_push row like the incremental
+    refresh's -- the panel's daily_refresh row stays the web app's."""
+    if not automation._job_enabled(AUTO_SYNC_SETTING):
+        return
+    _refresh_cache()
+    with _cache_lock:
+        status = str(_cache.get("status", ""))
+    if status.startswith("error"):
+        tracking.record_job_run("finale_push", "error", f"cache refresh: {status[:170]}")
+
+
+def _cache_loaded() -> bool:
+    with _cache_lock:
+        return str(_cache.get("status", "")).startswith("ok")

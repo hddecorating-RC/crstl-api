@@ -8,7 +8,6 @@ from app.shipstation import ShipStationClient
 from app.alerts import alert_day, alert_recipients, run_alerts, sent_asn_pos
 from app.netsuite_payload import load_refs
 from app.automation import AUTO_ALERTS_SETTING
-from app.finale_jobs import _finale_push_lock, _finale_push_state
 from app import automation, crstl_cache
 
 
@@ -55,9 +54,9 @@ def _run_alerts(live: bool) -> dict:
     finale_shipments = FinaleClient().list_shipments() if FinaleClient.configured() else []
     result = run_alerts(shipments, asn_pos, po_ids, config=cfg, live=live, recipients=alert_recipients(),
                         send=send_mail, finale_shipments=finale_shipments, dropship_pos=dropship_pos)
-    with _finale_push_lock:
-        _finale_push_state["alerts"] = {"last_run": datetime.now(timezone.utc).isoformat(),
-                                        **{k: v for k, v in result.items() if k != "body_html"}}
+    # The dashboard's "last alerts run" (read back by finale_jobs.finale_state()).
+    tracking.set_json("finale_state:alerts", {"last_run": datetime.now(timezone.utc).isoformat(),
+                                              **{k: v for k, v in result.items() if k != "body_html"}})
     c = result["summary"]
     tracking.record_job_run("order_alerts", "ok",
                             f"{c['found']} outlier(s): {c['new']} new{' (emailed)' if result['sent'] else ''}, "

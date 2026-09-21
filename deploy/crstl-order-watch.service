@@ -1,0 +1,33 @@
+[Unit]
+Description=CRSTL order-watch (order alerts email)
+Documentation=https://github.com/hddecorating-RC/crstl-api
+After=network-online.target crstl-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crstl
+Group=crstl
+WorkingDirectory=/opt/crstl-api
+EnvironmentFile=/opt/crstl-api/.env
+Environment="TZ=America/Toronto"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/crstl-api/.venv/bin/python -m app.worker alerts
+# Exits 1 while another process still schedules its job (e.g. crstl-api before its
+# SCHEDULER_JOBS was narrowed); systemd retries until it can take it over.
+Restart=on-failure
+RestartSec=30s
+# SIGTERM waits for a running job to finish; an alerts run takes well under a minute.
+TimeoutStopSec=120s
+StandardOutput=journal
+StandardError=journal
+
+# Same hardening as crstl-api -- .tmp (tracking.db, lock files) is the only writable path.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/crstl-api/.tmp
+
+[Install]
+WantedBy=multi-user.target

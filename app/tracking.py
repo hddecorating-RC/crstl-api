@@ -1,4 +1,6 @@
 import contextlib
+import fcntl
+import json
 import os
 import pathlib
 import sqlite3
@@ -22,9 +24,14 @@ def _db_path() -> str:
 def init_db() -> None:
     path = _db_path()
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with contextlib.closing(_connect()) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        _create_or_migrate(conn)
+    # One process at a time: the web app and both workers start together, and two
+    # first-time inits race ("database is locked" on the WAL switch; both would
+    # CREATE invoice_events). Blocking -- the other process's init takes milliseconds.
+    with open(pathlib.Path(path).parent / "tracking-init.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with contextlib.closing(_connect()) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _create_or_migrate(conn)
 
 
 def _create_or_migrate(conn: sqlite3.Connection) -> None:
@@ -133,7 +140,9 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
 
 
 def _connect() -> sqlite3.Connection:
-    return sqlite3.connect(_db_path(), check_same_thread=False)
+    # Three processes write here (web app, Finale worker, order-watch); wait up to
+    # 15 s for another's write to finish rather than sqlite's default 5.
+    return sqlite3.connect(_db_path(), check_same_thread=False, timeout=15)
 
 
 def record_events(transaction_ids: list[str], event_type: str) -> None:
@@ -187,6 +196,23 @@ def set_setting(key: str, value: str) -> None:
                 )
     except Exception as exc:
         print(f"ERROR: settings write failed for {key!r}: {exc}")
+
+
+# State one service writes and another reads, e.g. the Finale worker's last-run
+# results that the web app's dashboard shows. JSON in the settings table; the same
+# best-effort contract as get_setting / set_setting.
+def set_json(key: str, value) -> None:
+    set_setting(key, json.dumps(value, default=str))
+
+
+def get_json(key: str, default=None):
+    raw = get_setting(key)
+    if raw is None:
+        return default
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return default
 
 
 def write_health() -> dict:

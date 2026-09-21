@@ -18,6 +18,10 @@ Environment="TZ=America/Toronto"
 # then landed in journalctl all at one timestamp. Unbuffered keeps the log
 # usable for the troubleshooting steps in DEPLOY.md.
 Environment="PYTHONUNBUFFERED=1"
+# The web app's scheduled jobs. The Finale poll runs in crstl-finale-worker and order
+# alerts in crstl-order-watch (app/schedule.py). Unset = the web app runs every job
+# itself, as before the split -- the rollback: remove this line, stop both workers.
+Environment="SCHEDULER_JOBS=daily_refresh,netsuite_push,daily_digest"
 # Bind loopback only. Tailscale runs in userspace-networking mode here, so
 # there is no tailscale0 interface to bind to -- inbound tailnet traffic
 # arrives through `tailscale serve`, which proxies

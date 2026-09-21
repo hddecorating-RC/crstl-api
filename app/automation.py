@@ -46,3 +46,24 @@ _JOB_BY_ID = {j["id"]: j for j in AUTOMATION_JOBS}
 
 def _job_enabled(setting: str, default: str = "true") -> bool:
     return (tracking.get_setting(setting, default) or default).lower() != "false"
+
+
+# Next-run times. The Automation panel reads them from the web app's own scheduler,
+# but the Finale poll and order alerts are scheduled by the workers, so every process
+# stores its jobs' next run in the settings table after each run.
+def record_next_runs(scheduler) -> None:
+    for job in scheduler.get_jobs():
+        nrt = getattr(job, "next_run_time", None)
+        tracking.set_setting(f"next_run:{job.id}", nrt.isoformat() if nrt else "")
+
+
+def track_next_runs(scheduler) -> None:
+    """Record now (call after scheduler.start()) and again after every run."""
+    from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, EVENT_JOB_MISSED
+    scheduler.add_listener(lambda _event: record_next_runs(scheduler),
+                           EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED)
+    record_next_runs(scheduler)
+
+
+def stored_next_run(job_id: str) -> str | None:
+    return tracking.get_setting(f"next_run:{job_id}") or None

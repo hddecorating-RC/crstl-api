@@ -102,11 +102,12 @@ $EDITOR .env   # fill in CRSTL_API_KEY, GRAPH_*, MAIL_SENDER, MAIL_RECIPIENTS
 mkdir -p .tmp
 chown crstl:crstl .tmp
 
-# 7. Install the systemd unit and start
-cp deploy/crstl-api.service /etc/systemd/system/
+# 7. Install the systemd units and start (the three services: see "Services" below)
+cp deploy/crstl-api.service deploy/crstl-finale-worker.service deploy/crstl-order-watch.service /etc/systemd/system/
 cp deploy/crstl-api-backup.service deploy/crstl-api-backup.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now crstl-api
+systemctl enable --now crstl-finale-worker crstl-order-watch
 systemctl enable --now crstl-api-backup.timer
 
 # 8. Verify
@@ -141,6 +142,36 @@ Everything the app writes lives under `/opt/crstl-api/.tmp/`:
 
 The LXC's disk holds this — take a Proxmox snapshot before major changes.
 
+## Services
+
+One repo, three processes, one systemd unit each (since 2026-09-21). They share
+`.tmp/tracking.db` (toggles, receipts, job runs, last-run state) and nothing else.
+
+| Unit | Runs | Scheduled jobs |
+|---|---|---|
+| `crstl-api` | the dashboard + every manual endpoint (`uvicorn app.main:app`) | invoice sync 4:45, NetSuite push 5:00, digest 7:15 (its `SCHEDULER_JOBS`) |
+| `crstl-finale-worker` | `python -m app.worker finale` | the 15-min Finale poll (EDI + non-EDI invoicing, DSD + dropship pre-fill, ShipStation close), plus its own 4:45 CRSTL cache refresh |
+| `crstl-order-watch` | `python -m app.worker alerts` | order alerts, every 15 min, Mon–Fri |
+
+- **One process per job.** Each process claims its jobs with a lock file
+  (`.tmp/scheduler-<job>.lock`, holder noted inside) and never schedules a job
+  another process holds. A worker that finds its job taken exits 1 and systemd
+  retries every 30 s -- so starting the workers before `crstl-api` has been
+  restarted with its narrowed `SCHEDULER_JOBS` is harmless; they take over once
+  it lets go.
+- **One Finale run at a time, on the whole box.** The poll (worker) and the manual
+  Finale endpoints + the NetSuite ride-along (web app) share `.tmp/finale-run.lock`.
+  A second run is refused ("another Finale run is in progress (poll, pid N)").
+- **The dashboard shows every service's runs** -- job history, last-run results and
+  next-run times are read from tracking.db, not from the web app's memory.
+- **Stopping waits for a running job.** `systemctl stop/restart` on a worker lets a
+  poll in progress finish (TimeoutStopSec 300 s) before it exits.
+
+**Rollback to one process:** remove the `SCHEDULER_JOBS=` line from
+`/etc/systemd/system/crstl-api.service`, then
+`systemctl disable --now crstl-finale-worker crstl-order-watch && systemctl daemon-reload && systemctl restart crstl-api`.
+The web app then runs every job itself, as before.
+
 ## Updating
 
 ```bash
@@ -149,7 +180,9 @@ cd /opt/crstl-api
 # as root would leave root-owned files in a tree the crstl user must write to.
 runuser -u crstl -- git pull --ff-only
 runuser -u crstl -- .venv/bin/pip install -r requirements.txt   # if requirements.txt changed
-systemctl restart crstl-api
+# If a file in deploy/ changed: cp it to /etc/systemd/system/ and `systemctl daemon-reload`.
+# Restart between Finale polls (see the last finale_push row in the Automation panel).
+systemctl restart crstl-api crstl-finale-worker crstl-order-watch
 
 # Confirm what is actually running. A restart alone is NOT a deploy: the unit
 # has Restart=on-failure and starts on boot, so a reboot re-runs whatever is
@@ -183,6 +216,12 @@ backups do not.
 
 **`systemctl status` shows failed.** `journalctl -u crstl-api -n 50` — almost
 always a bad `.env` (missing `CRSTL_API_KEY`, misspelled `GRAPH_*`).
+
+**A worker keeps restarting.** `journalctl -u crstl-finale-worker -n 20`. "already
+scheduled elsewhere {...}" = another process still holds its job -- usually
+`crstl-api` running without its `SCHEDULER_JOBS` line. "CRSTL cache not loaded" =
+the Finale worker cannot reach CRSTL; it will not poll until it can (by design: the
+cache is what tells an EDI order from a non-EDI one).
 
 **Digest emails not sending.** Curl the endpoint from inside the LXC:
 ```bash
