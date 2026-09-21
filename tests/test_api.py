@@ -505,8 +505,9 @@ def test_automation_status_and_toggle(client):
     resp = client.get("/api/automation")
     assert resp.status_code == 200
     jobs = {j["id"]: j for j in resp.json()["jobs"]}
-    assert set(jobs) == {"daily_refresh", "netsuite_push", "daily_digest", "finale_push", "finale_dsd"}
+    assert set(jobs) == {"daily_refresh", "netsuite_push", "daily_digest", "finale_push", "finale_dsd", "order_alerts"}
     assert jobs["netsuite_push"]["enabled"] is False   # off by default
+    assert jobs["order_alerts"]["enabled"] is True     # were live before they got their own toggle
     assert jobs["daily_digest"]["enabled"] is True
     # toggle push on, verify persisted
     assert client.post("/api/automation", json={"job": "netsuite_push", "enabled": True}).status_code == 200
@@ -1180,20 +1181,58 @@ def test_shipstation_close_endpoint_requires_ids_for_live(client):
     assert r2.status_code == 200 and run.call_args.args == (False, None, None)
 
 
-def test_poll_runs_alerts_only_when_enabled_and_endpoint_previews(client):
+def test_finale_poll_never_runs_alerts(client):
+    """Alerts are their own job now: the Finale poll must not run them, even with
+    alerts enabled (a monitor must not depend on what it monitors)."""
     from app.main import _finale_poll_passes
     with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
-         patch("app.main._alerts_config", return_value={"enabled": False}), patch("app.main._run_alerts") as run:
+         patch("app.main._alerts_config", return_value={"enabled": True}), patch("app.main.alert_day", return_value=True), \
+         patch("app.main._run_alerts") as run:
         _finale_poll_passes()
     run.assert_not_called()
-    with patch("app.main._finale_edi_pass"), patch("app.main._run_nonedi_push"), patch("app.main._dsd_prefill_enabled", return_value=False), \
-         patch("app.main._alerts_config", return_value={"enabled": True}), patch("app.main._run_alerts") as run2:
-        _finale_poll_passes()
-    run2.assert_called_once_with(True)
-    with patch("app.main._run_alerts", return_value={"mode": "dry", "summary": {"found": 0}, "sent": False}) as run3:
-        r = client.post("/api/alerts/check", json={"dry_run": True})
-    assert r.status_code == 200 and run3.call_args.args == (False,)
 
+
+def _alerts_job(*, config_on=True, toggle_on=True, weekday=True, finale_on=True):
+    """Run the scheduled alerts job with its gates set; return (_run_alerts mock, record_job_run mock)."""
+    from app.main import _run_alerts_job
+    with patch("app.main._alerts_config", return_value={"enabled": config_on}), \
+         patch("app.main._job_enabled", return_value=toggle_on), patch("app.main.alert_day", return_value=weekday), \
+         patch("app.main._finale_enabled", return_value=finale_on), \
+         patch("app.main._run_alerts") as run, patch("app.main.tracking.record_job_run") as rec:
+        _run_alerts_job()
+    return run, rec
+
+
+def test_alerts_job_runs_on_weekdays_even_with_finale_off():
+    run, _ = _alerts_job(finale_on=False)
+    run.assert_called_once_with(True)
+
+
+def test_alerts_job_skips_when_off_in_config_or_dashboard():
+    run, rec = _alerts_job(config_on=False)
+    run.assert_not_called(); rec.assert_called_once_with("order_alerts", "skipped", "disabled in config")
+    run, rec = _alerts_job(toggle_on=False)
+    run.assert_not_called(); rec.assert_called_once_with("order_alerts", "skipped", "disabled")
+
+
+def test_alerts_job_skips_weekends_but_the_endpoint_still_runs(client):
+    """Sat/Sun the scheduled job sends no alert email (like the digest) and records a
+    skip; a manual check from the dashboard still works."""
+    run, rec = _alerts_job(weekday=False)
+    run.assert_not_called()
+    rec.assert_called_once_with("order_alerts", "skipped", "weekend -- alerts resume Monday")
+    with patch("app.main.alert_day", return_value=False), \
+         patch("app.main._run_alerts", return_value={"mode": "dry", "summary": {"found": 0}, "sent": False}) as run2:
+        r = client.post("/api/alerts/check", json={"dry_run": True})
+    assert r.status_code == 200 and run2.call_args.args == (False,)
+
+
+def test_alerts_job_is_scheduled_on_its_own(monkeypatch, tmp_path):
+    jobs = _scheduled_jobs(monkeypatch, tmp_path)
+    job = jobs["order_alerts"]
+    assert job["trigger"] == "interval" and job["minutes"] == 15
+    from app.main import _run_alerts_job, AUTOMATION_JOBS
+    assert any(j["id"] == "order_alerts" and j["default"] == "true" and "runs_with" not in j for j in AUTOMATION_JOBS)
 
 
 def test_push_gate_counts_skipped_runs_and_the_live_push_in_progress(client, monkeypatch):

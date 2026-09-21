@@ -21,7 +21,7 @@ from app.netsuite_csv import build_netsuite_csv
 from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation
 from app.finale_invoice import push_finale_invoices
 from app.shipstation import ShipStationClient, push_shipstation_close
-from app.alerts import alert_recipients, run_alerts, sent_asn_pos
+from app.alerts import alert_day, alert_recipients, run_alerts, sent_asn_pos
 from app.dropship import push_dropship_prefill
 from app.finale_nonedi import push_nonedi_invoices
 from app.finale_dsd import push_dsd_prefill, select_dsd_asns
@@ -1051,12 +1051,6 @@ def _finale_poll_passes() -> None:
         except Exception as exc:
             print(f"WARNING: dropship pre-fill poll failed: {exc}")
             tracking.record_job_run("dropship_prefill", "error", str(exc)[:200])
-    if _alerts_config().get("enabled"):
-        try:
-            _run_alerts(True)
-        except Exception as exc:
-            print(f"WARNING: order alerts poll failed: {exc}")
-            tracking.record_job_run("order_alerts", "error", str(exc)[:200])
 
 
 def _dsd_prefill_enabled() -> bool:
@@ -1175,6 +1169,25 @@ def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[
 
 def _alerts_config() -> dict:
     return load_refs().get("alerts") or {}
+
+
+def _run_alerts_job() -> None:
+    """Every 15 minutes as its OWN job -- not a pass of the Finale poll, so switching
+    Finale invoicing off (or a manual Finale run holding its lock) never silences it:
+    a monitor must not depend on what it monitors. Two gates: config alerts.enabled
+    and the dashboard toggle. Weekdays only (Toronto), like the digest -- an outlier
+    still open on Monday is emailed on Monday's first run."""
+    if not _alerts_config().get("enabled"):
+        tracking.record_job_run("order_alerts", "skipped", "disabled in config"); return
+    if not _job_enabled(AUTO_ALERTS_SETTING):
+        tracking.record_job_run("order_alerts", "skipped", "disabled"); return
+    if not alert_day():
+        tracking.record_job_run("order_alerts", "skipped", "weekend -- alerts resume Monday"); return
+    try:
+        _run_alerts(True)
+    except Exception as exc:
+        print(f"WARNING: order alerts run failed: {exc}")
+        tracking.record_job_run("order_alerts", "error", str(exc)[:200])
 
 
 def _run_alerts(live: bool) -> dict:
@@ -1434,6 +1447,9 @@ def _run_daily_digest_job() -> None:
 AUTO_SYNC_SETTING = "auto_sync_enabled"
 AUTO_NS_EXPORT_SETTING = "auto_ns_export_enabled"
 AUTO_NS_PUSH_SETTING = "auto_ns_push_enabled"
+# Order alerts were already live when they got their own job (2026-09-21), so the
+# toggle defaults ON -- the deploy changes when they run, not whether they run.
+AUTO_ALERTS_SETTING = "auto_alerts_enabled"
 
 # Registry drives the /api/automation panel. `default` "false" means the job is
 # off until someone turns it on (the NetSuite auto-push stays off until
@@ -1447,6 +1463,7 @@ AUTOMATION_JOBS = [
     # so its next run is that job's, and it is silent whenever that job is off.
     {"id": "finale_dsd",    "label": "DSD pickup numbers → Finale (PRO / RTS)", "schedule": "Every 15 min · inside Finale invoicing",
      "setting": AUTO_DSD_SETTING, "default": "false", "runs_with": "finale_push"},
+    {"id": "order_alerts",  "label": "Order alerts email",   "schedule": "Mon–Fri · every 15 min", "setting": AUTO_ALERTS_SETTING, "default": "true"},
 ]
 _JOB_BY_ID = {j["id"]: j for j in AUTOMATION_JOBS}
 
@@ -1579,6 +1596,11 @@ async def lifespan(app: FastAPI):
     # shipping with exact 810 cents. Cheap when idle (one CRSTL list call). OFF unless
     # config finale.enabled AND the dashboard toggle are both on.
     _scheduler.add_job(_run_finale_push_job, "interval", id="finale_push", minutes=15,
+                       misfire_grace_time=600, coalesce=True)
+    # Order alerts -- every 15 minutes, its own job (see _run_alerts_job). Offset 7
+    # minutes from the Finale poll so the two don't hit CRSTL and Finale at once.
+    _scheduler.add_job(_run_alerts_job, "interval", id="order_alerts", minutes=15,
+                       next_run_time=datetime.now(timezone.utc) + timedelta(minutes=7),
                        misfire_grace_time=600, coalesce=True)
     _scheduler.start()
     yield

@@ -1,6 +1,7 @@
 """Order alerts: outliers the digest does not cover, emailed to the order.alerts
 group (env ALERT_RECIPIENTS) -- one email per poll, grouped by issue, never the
 same order twice, with a "still open" line for earlier ones not yet fixed.
+Weekdays only (Toronto), like the digest -- see `alert_day`.
 
 Issue 1 (2026-09-16, two misses in one day after 1 in 173 since August):
     ASN not sent to Home Depot -- a non-voided ShipStation label in the HD Dropship
@@ -34,6 +35,14 @@ ISSUES = {
 }
 
 PACKED = "SHIPMENT_PACKED"
+
+
+def alert_day(now: datetime | None = None) -> bool:
+    """True Mon-Fri in Toronto. The scheduled alerts job skips the whole run on
+    Sat/Sun -- no email, no receipts written -- so nothing is lost: an outlier still
+    open on Monday has no receipt, is "new" on Monday's first run, and is emailed
+    then. One that got fixed over the weekend is never reported."""
+    return (now or datetime.now(timezone.utc)).astimezone(ET).weekday() < 5
 
 
 # An 856 in one of these states was never sent to HD: a Draft is a warehouse

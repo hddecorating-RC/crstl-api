@@ -4,6 +4,7 @@ numbers in the subject and clickable in the body, still-open ones listed, resolv
 when the 856 appears."""
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -174,3 +175,15 @@ def test_two_issues_share_one_email():
     assert subject == "Order alert: 2 issues — 538871711, 538873472"
     assert body.index("ASN not sent to HD") < body.index("Packed, not shipped")
     assert "60 min after the label" in body and "packed over 24h ago" in body
+
+
+def test_alert_day_is_mon_to_fri_in_toronto_not_utc():
+    """The weekday is Toronto's: Friday 23:30 ET is already Saturday in UTC but still
+    a send day; Sunday 23:59 ET is Monday in UTC but still the weekend."""
+    from app.alerts import alert_day
+    def et(s):
+        return datetime.fromisoformat(s).replace(tzinfo=ZoneInfo("America/Toronto")).astimezone(timezone.utc)
+    assert alert_day(et("2026-09-18T23:30"))          # Fri
+    assert not alert_day(et("2026-09-19T00:05"))      # Sat
+    assert not alert_day(et("2026-09-20T23:59"))      # Sun
+    assert alert_day(et("2026-09-21T00:00"))          # Mon
