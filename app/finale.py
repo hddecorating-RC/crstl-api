@@ -128,6 +128,12 @@ def adoptable_draft(invoices: list[dict]) -> dict | None:
 ENV_KEYS = ("FINALE_ACCOUNT_ID", "FINALE_API_KEY", "FINALE_API_SECRET")
 
 
+class FinaleListFull(RuntimeError):
+    """A Finale list came back with as many rows as we asked for, so rows are probably
+    missing. Raised instead of acting on part of a list: a missing order or shipment
+    would be skipped without anyone knowing (2026-09-21 -- was a log warning)."""
+
+
 class FinaleUnavailable(RuntimeError):
     """Finale cannot be reached or is not configured. The report continues
     without it: a blank Ship Date is a gap, a wrong one is an error."""
@@ -273,6 +279,17 @@ class FinaleClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _list(self, what: str) -> list[dict]:
+        """A whole Finale collection in ONE request (these endpoints do not page), up to
+        PAGE_LIMIT rows -- a number we choose, not Finale's. A full answer raises
+        FinaleListFull. On 2026-09-21: 5,384 products, 657 shipments, 528 orders.
+        The real fix for growth is the lastUpdatedDate filter (<= 30 days, verified)."""
+        rows = to_rows(self._get(f"{self.base_url}/{what}", limit=self.PAGE_LIMIT))
+        if len(rows) >= self.PAGE_LIMIT:
+            raise FinaleListFull(f"Finale returned {len(rows)} {what} rows, the most we ask for -- the list is "
+                                 f"probably incomplete; narrow it (date filter) or raise FinaleClient.PAGE_LIMIT")
+        return rows
+
     def product_index(self) -> dict:
         """{productId or UPC: productUrl} over the whole catalogue, in one listing.
 
@@ -281,10 +298,7 @@ class FinaleClient:
         returned it, so an invoice line references the product the way Finale
         addresses it. First occurrence wins on a duplicate key.
         """
-        rows = to_rows(self._get(f"{self.base_url}/product", limit=self.PAGE_LIMIT))
-        if len(rows) >= self.PAGE_LIMIT:
-            print(f"WARNING: Finale returned {len(rows)} products, the maximum asked for "
-                  f"-- the product index may be incomplete. Raise FinaleClient.PAGE_LIMIT.")
+        rows = self._list("product")
         index: dict = {}
         for p in rows:
             url = str(p.get("productUrl") or "")
@@ -360,10 +374,7 @@ class FinaleClient:
         """Every shipment in one request (statusId, primaryOrderUrl, shipmentUrl --
         but NOT trackingCode or carrierPartyUrl). Same no-paging caveat as
         fetch_ship_dates: `offset` does not work on this endpoint."""
-        rows = to_rows(self._get(f"{self.base_url}/shipment", limit=self.PAGE_LIMIT))
-        if len(rows) >= self.PAGE_LIMIT:
-            print(f"WARNING: Finale returned {len(rows)} shipments, the maximum asked for "
-                  f"-- the shipment list may be incomplete. Raise FinaleClient.PAGE_LIMIT.")
+        rows = self._list("shipment")
         return rows
 
     def order_shipments(self, order: dict) -> list[dict]:
@@ -471,7 +482,7 @@ class FinaleClient:
         """Every sale order in one listing (orderId, statusId, saleSourceId, orderDate,
         invoiceUrlList, shipmentUrlList, orderRoleList...). The non-EDI invoicer
         classifies from this list and GETs an order individually only to build."""
-        rows = to_rows(self._get(f"{self.base_url}/order", limit=self.PAGE_LIMIT))
+        rows = self._list("order")
         return [r for r in rows if r.get("orderTypeId") == "SALES_ORDER"]
 
     def party_province_index(self) -> dict:
@@ -480,7 +491,7 @@ class FinaleClient:
         postal address (e.g. the EDI 'Home Depot Canada - Dropship' party) are simply
         absent, so the caller skips them rather than guessing a tax province."""
         index: dict = {}
-        for p in to_rows(self._get(f"{self.base_url}/partygroup", limit=self.PAGE_LIMIT)):
+        for p in self._list("partygroup"):
             pid = str(p.get("partyId") or "").strip() or str(p.get("partyUrl") or "").rstrip("/").rsplit("/", 1)[-1]
             for cm in (p.get("contactMechList") or []):
                 if isinstance(cm, dict) and cm.get("contactMechTypeId") == "POSTAL_ADDRESS" and cm.get("stateProvinceGeoId"):

@@ -239,3 +239,18 @@ def test_every_finale_request_goes_through_the_rate_limit_adapter():
     from app.finale import RateLimitRetry
     c = FinaleClient(account_id="a", api_key="k", api_secret="s")
     assert isinstance(c.session.get_adapter("https://app.finaleinventory.com/a/api/order/1"), RateLimitRetry)
+
+
+def test_a_full_list_stops_instead_of_acting_on_part_of_it():
+    """Finale's collection endpoints do not page; an answer with as many rows as we
+    asked for is probably cut off, and acting on it would skip orders silently."""
+    from unittest.mock import patch as _patch
+    from app.finale import FinaleListFull
+    c = FinaleClient(account_id="a", api_key="k", api_secret="s")
+    full = {"shipmentUrl": ["/s/%d" % i for i in range(3)], "statusId": ["SHIPMENT_PACKED"] * 3}
+    with _patch.object(FinaleClient, "PAGE_LIMIT", 3), _patch.object(c, "_get", return_value=full):
+        for call in (c.list_shipments, c.list_sale_orders, c.product_index, c.party_province_index):
+            with pytest.raises(FinaleListFull, match="probably incomplete"):
+                call()
+    with _patch.object(FinaleClient, "PAGE_LIMIT", 4), _patch.object(c, "_get", return_value=full):
+        assert len(c.list_shipments()) == 3
