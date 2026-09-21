@@ -766,14 +766,14 @@ def test_finale_poll_job_gates_refreshes_and_invoices_only_unfinaled(monkeypatch
          patch("app.finale_jobs._run_finale_push") as run2:
         _run_finale_push_job()
     refresh.assert_called_once()
-    run2.assert_called_once_with(True, ["b"], None, max_per_run=75)    # only the un-invoiced one; cap to the engine
+    run2.assert_called_once_with(True, ["b"], None, max_per_run=75, prefilter=True)    # only the un-invoiced one; cap to the engine
     with patch.dict(_cache, {"invoices": invs}), patch("app.finale_jobs._finale_enabled", return_value=True), \
          patch("app.crstl_cache._refresh_new_accepted", return_value=0), \
          patch("app.finale_jobs._finale_config", return_value={"enabled": True, "max_per_run": 1}), \
          patch("app.tracking.get_unfinaled_ids", return_value=["a", "b"]), \
          patch("app.finale_jobs._run_finale_push") as run3:
         _run_finale_push_job()
-    run3.assert_called_once_with(True, ["a", "b"], None, max_per_run=1)  # the ENGINE caps, on invoices it would create
+    run3.assert_called_once_with(True, ["a", "b"], None, max_per_run=1, prefilter=True)  # the ENGINE caps, on invoices it would create
 
 
 def test_refresh_new_accepted_fetches_only_changed_and_merges(monkeypatch):

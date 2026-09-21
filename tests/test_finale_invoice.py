@@ -539,3 +539,52 @@ def test_carrier_listing_failure_is_reported_as_such_on_every_row():
     notes = [r["carrier"]["note"] for r in out["results"]]
     assert len(notes) == 2 and all("could not read Finale's carriers: partygroup timeout" in n for n in notes)
     assert not any("not on Finale's Carriers list" in n for n in notes)
+
+
+# ── the poll's read shortcut (2026-09-21) ────────────────────────────────────
+
+def _poll(client, shipped_pos, order_status, refs=REFS):
+    with patch("app.tracking.get_finale_invoices", return_value={}), \
+         patch("app.tracking.record_finale_invoice"), patch("app.tracking.record_events"):
+        return push_finale_invoices([INV], PO_MAP, live=True, refs=refs, client=client,
+                                    shipped_pos=shipped_pos, order_status=order_status)
+
+
+def test_an_open_order_with_nothing_shipped_is_skipped_without_reading_it():
+    client = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    out = _poll(client, shipped_pos=set(), order_status={"PO1": "ORDER_LOCKED"})
+    r = out["results"][0]
+    assert r["status"] == "skipped_not_shipped" and r["error"] == "not shipped in Finale yet -- will retry"
+    assert client.calls == []                                           # no get_order, no shipment reads
+    assert out["summary"]["skipped_not_shipped"] == 1
+
+
+def test_a_shipped_order_is_read_and_invoiced_as_before():
+    client = FakeFinale(shipped={"/hddecorating/api/product/138VB5236WHTC": 1.0})
+    out = _poll(client, shipped_pos={"PO1"}, order_status={"PO1": "ORDER_LOCKED"})
+    assert out["results"][0]["status"] == "posted"
+    assert [c[0] for c in client.calls] == ["get_order", "create", "complete", "complete_order"]
+
+
+def test_a_closed_cancelled_or_unknown_order_still_gets_the_full_check():
+    """The shortcut is only for an OPEN order: a completed one may need reopening (the
+    ShipStation connection closes orders on the label), a cancelled one is reported as
+    such, and one the listing does not know is read as before."""
+    gate_on = {"finale": {**REFS["finale"], "auto_reopen": True}}
+    closed = FakeFinale(shipped=None)
+    closed._order = {**closed._order, "statusId": "ORDER_COMPLETED"}
+    out = _poll(closed, shipped_pos=set(), order_status={"PO1": "ORDER_COMPLETED"}, refs=gate_on)
+    assert out["results"][0]["reopened"] is True and [c[0] for c in closed.calls] == ["get_order", "reopen"]
+    cancelled = FakeFinale(shipped=None)
+    cancelled._order = {**cancelled._order, "statusId": "ORDER_CANCELLED"}
+    out2 = _poll(cancelled, shipped_pos=set(), order_status={"PO1": "ORDER_CANCELLED"})
+    assert out2["results"][0]["status"] == "skipped_completed"
+    unknown = FakeFinale(shipped=None)
+    _poll(unknown, shipped_pos=set(), order_status={})
+    assert ("get_order", "PO1") in unknown.calls
+
+
+def test_without_listings_every_order_is_read_as_before():
+    client = FakeFinale(shipped=None)
+    out = _poll(client, shipped_pos=None, order_status=None)
+    assert out["results"][0]["status"] == "skipped_not_shipped" and ("get_order", "PO1") in client.calls

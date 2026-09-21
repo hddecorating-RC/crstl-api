@@ -35,6 +35,9 @@ from app.netsuite_payload import load_refs
 from app.netsuite_push import _select, eligible_for_push
 from app.finale import API_LOGIN, MOVED, adoptable_draft, approved_by, carrier_fix, created_by, invoice_total, wanted_carrier
 
+# An order in one of these states is still open: nothing to reopen, nothing to skip.
+OPEN_ORDERS = ("ORDER_CREATED", "ORDER_LOCKED")
+
 INVOICE_TYPE = "SALES_INVOICE"
 CANCELLED = "INVOICE_CANCELLED"
 
@@ -210,6 +213,8 @@ def push_finale_invoices(
     account: str | None = None,
     auto_reopen: bool | None = None,
     max_per_run: int | None = None,
+    shipped_pos: set | None = None,
+    order_status: dict | None = None,
 ) -> dict:
     """Build (and, when live, create + post) Finale invoices for these Crstl invoices.
 
@@ -222,6 +227,15 @@ def push_finale_invoices(
     810 whose order has not shipped yet is waiting, not writing, and must never
     push the poll into refusing. Over the cap the whole run is refused (nothing
     written, `blocked` set); it is never truncated. Manual runs pass None.
+
+    `shipped_pos` (POs with a shipped/delivered shipment) and `order_status` ({po:
+    statusId}) come from one shipment listing and one sale-order listing, and let the
+    15-min poll skip its reads for an order with nothing shipped yet that is still
+    open -- those reads could only end in skipped_not_shipped, and re-reading every
+    waiting order every poll ran it past Finale's 120 reads/minute (2026-09-21). An
+    order that is completed or cancelled, or that the listing does not know, gets the
+    full check as before (reopen, cancelled). None = read every order (manual runs,
+    the NetSuite ride-along, the digest's reconciliation).
     """
     if limit is not None and limit < 1:
         raise ValueError("limit must be >= 1")
@@ -318,7 +332,13 @@ def push_finale_invoices(
             row["error"] = f"already invoiced in Finale ({prior.get('invoice_id_user') or prior.get('invoice_id')}, {prior.get('status')})"
             counts["skipped_exists"] += 1
             return None
-        order = client.get_order(str(row["po_number"]))
+        po = str(row["po_number"])
+        if shipped_pos is not None and po not in shipped_pos and (order_status or {}).get(po) in OPEN_ORDERS:
+            row["status"] = "skipped_not_shipped"
+            row["error"] = "not shipped in Finale yet -- will retry"
+            counts["skipped_not_shipped"] += 1
+            return None
+        order = client.get_order(po)
         if order is None:
             row["status"] = "skipped_no_order"
             row["error"] = f"no Finale order {row['po_number']}"

@@ -287,3 +287,26 @@ def test_processes_starting_together_can_all_init_a_fresh_db(tmp_path):
                               cwd=REPO, env=env, stderr=subprocess.PIPE, text=True) for _ in range(4)]
     errors = [p.communicate(timeout=30)[1] for p in procs]
     assert [p.returncode for p in procs] == [0, 0, 0, 0], errors
+
+
+def test_only_the_poll_uses_the_invoicing_read_shortcut(monkeypatch):
+    """The 15-min poll passes the listings; manual runs and the NetSuite ride-along
+    read every order (exact reasons). A failed listing falls back to reading all."""
+    from app import finale_jobs
+    fin = MagicMock()
+    fin.list_shipments.return_value = [
+        {"statusId": "SHIPMENT_SHIPPED", "primaryOrderUrl": "/hddecorating/api/order/538900001"},
+        {"statusId": "SHIPMENT_PACKED", "primaryOrderUrl": "/hddecorating/api/order/538900002"}]
+    fin.list_sale_orders.return_value = [{"orderId": "538900002", "statusId": "ORDER_LOCKED"}]
+    fake = {"mode": "live", "results": [], "summary": {"posted": 0, "draft": 0, "failed": 0}}
+    with patch("app.finale.FinaleClient", return_value=fin) as FC, \
+         patch("app.finale_jobs.push_finale_invoices", return_value=fake) as push:
+        FC.configured.return_value = True
+        finale_jobs._run_finale_push(True, ["t"], None, prefilter=True)
+        kw = push.call_args.kwargs
+        assert kw["shipped_pos"] == {"538900001"} and kw["order_status"] == {"538900002": "ORDER_LOCKED"}
+        finale_jobs._run_finale_push(False, ["t"], None)                      # manual / ride-along
+        assert push.call_args.kwargs["shipped_pos"] is None and push.call_args.kwargs["client"] is None
+        fin.list_shipments.side_effect = RuntimeError("429")
+        finale_jobs._run_finale_push(True, ["t"], None, prefilter=True)
+        assert push.call_args.kwargs["shipped_pos"] is None and push.call_args.kwargs["order_status"] is None

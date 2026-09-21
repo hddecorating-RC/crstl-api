@@ -160,18 +160,41 @@ def _finale_enabled() -> bool:
     return bool(_finale_config().get("enabled")) and automation._job_enabled(AUTO_FINALE_SETTING, default="false")
 
 
+def _finale_listings(client) -> tuple[Optional[set], Optional[dict]]:
+    """For the poll's read shortcut: the POs with a shipped/delivered shipment, and
+    every sale order's status -- two listings (collection requests; Finale allows 300
+    an hour). (None, None) if either fails: the pass then reads every order, as before."""
+    from app.dropship import po_of
+    from app.finale import MOVED
+    try:
+        shipped = {po_of(s) for s in client.list_shipments() if str(s.get("statusId") or "") in MOVED}
+        status = {str(o.get("orderId")): str(o.get("statusId") or "") for o in client.list_sale_orders()}
+        return shipped, status
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: Finale invoicing: listings failed, reading every order: {exc}")
+        return None, None
+
+
 def _run_finale_push(live: bool, ids: Optional[list[str]], limit: Optional[int],
-                     max_per_run: Optional[int] = None) -> dict:
+                     max_per_run: Optional[int] = None, prefilter: bool = False) -> dict:
     """Create (live) or preview (dry) Finale invoices for cached invoices via the
     shared engine, and record the run. The engine enforces eligibility, the exact-
     cents build, the reconcile + qty gates (posted vs draft), idempotency and, for
     the automated callers that pass it, the blast cap on invoices about to be
-    created. Manual runs (the endpoint) are uncapped, like manual NetSuite pushes."""
+    created. Manual runs (the endpoint) are uncapped, like manual NetSuite pushes.
+    `prefilter` (the 15-min poll only): skip the reads for orders the listings show
+    still open with nothing shipped -- see push_finale_invoices."""
+    from app.finale import FinaleClient
     with _cache_lock:
         invoices = list(_cache["invoices"])
         po_map = dict(_cache["po_provinces"])
     with _finale_run("edi"):
-        result = push_finale_invoices(invoices, po_map, live=live, only=ids, limit=limit, max_per_run=max_per_run)
+        client = shipped_pos = order_status = None
+        if prefilter and FinaleClient.configured():
+            client = FinaleClient()
+            shipped_pos, order_status = _finale_listings(client)
+        result = push_finale_invoices(invoices, po_map, live=live, only=ids, limit=limit, max_per_run=max_per_run,
+                                      client=client, shipped_pos=shipped_pos, order_status=order_status)
     _save_state("edi", {
         "last_run": datetime.now(timezone.utc).isoformat(), "mode": result["mode"],
         "summary": result["summary"], "results": result["results"],
@@ -249,7 +272,7 @@ def _finale_edi_pass() -> None:
     if not to_push:
         tracking.record_job_run("finale_push", "ok", "nothing new to invoice"); return
     _run_finale_push(True, [str(i["transaction_id"]) for i in to_push], None,
-                     max_per_run=_finale_config().get("max_per_run"))
+                     max_per_run=_finale_config().get("max_per_run"), prefilter=True)
 
 
 def _run_finale_push_job() -> None:
