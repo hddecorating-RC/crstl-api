@@ -25,7 +25,20 @@ on that ordering.
 Strict by design (Ritchie: start strict and see what it reports): it writes only when
 the PO has exactly ONE live Finale shipment and exactly ONE non-voided ShipStation
 label. Split shipments and re-labels are reported, never guessed at.
+
+Reads (2026-09-21): the pass used to GET every packed shipment AND its order on every
+poll -- 2 reads per label, including ones filled in hours earlier -- and on a busy
+Monday (36 labels) that ran the 15-min poll past Finale's ~120 requests/minute. Now a
+shipment it has already filled in (or found filled in) is remembered (tracking
+dropship_marks) and not read again while the listing still shows it packed with the
+same label and carrier, and its order is open. Order status comes from ONE sale-order
+listing; an order is read individually only when that listing says it is completed,
+i.e. when it has to be reopened -- including one the connection closed AFTER we filled
+its shipment in, which is why a remembered shipment with a completed order still gets
+the full treatment. A shipment someone edits by hand after we filled it is not
+re-checked (and so not overwritten).
 """
+COMPLETED = "ORDER_COMPLETED"
 OPEN = ("SHIPMENT_INPUT", "SHIPMENT_PACKED")
 CANCELLED = "SHIPMENT_CANCELLED"
 
@@ -72,7 +85,8 @@ def plan_prefill(shipment: dict, tracking: str, carrier_url: str | None) -> dict
 def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live: bool = False,
                           only: list[str] | None = None, limit: int | None = None, client=None,
                           carrier_url: str | None = None, created_after: str | None = None,
-                          max_per_run: int | None = None, reopen: bool = True) -> dict:
+                          max_per_run: int | None = None, reopen: bool = True,
+                          order_status: dict | None = None, marks: dict | None = None) -> dict:
     """Write carrier + tracking onto the packed Finale shipment of each dropship
     label (live), or report what would be written (dry). One row per PO:
       status: prefilled | would_prefill | skipped_equal | skipped_shipped |
@@ -84,7 +98,10 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
     `shipment_rows` is a Finale shipment LISTING (one request, no per-order reads);
     `labels` are ShipStation v1 shipment records for the dropship store. `max_per_run`
     counts the shipments about to be written; over it the run is refused before the
-    first write.
+    first write. `order_status` is {po: statusId} from the sale-order listing (None =
+    read every order, as before); `marks` is {shipment_url: (tracking, carrier_url)}
+    already on the shipment. A row carries `mark` when this run established (live
+    write, or a read) what is on the shipment -- the caller records it.
     """
     if limit is not None and limit < 1:
         raise ValueError("limit must be >= 1")
@@ -137,14 +154,21 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
         if str(listed.get("statusId") or "") not in OPEN:
             finish(row, "skipped_shipped",
                    error=f"already {str(listed.get('statusId')).replace('SHIPMENT_', '').lower()}"); continue
+        url = str(listed.get("shipmentUrl"))
+        listed_status = (order_status or {}).get(po) if order_status is not None else None
+        wanted = (row["tracking"] or "", carrier_url or "")
+        if marks and tuple(marks.get(url) or ()) == wanted and listed_status not in (None, COMPLETED):
+            # Filled in on an earlier run, still packed, same label and carrier, order open.
+            finish(row, "skipped_equal", error="carrier/tracking already on the shipment (checked earlier)"); continue
         try:
             # The listing carries no trackingCode/carrierPartyUrl, so the decision to
             # write needs the full record. Only ever for a packed dropship shipment.
-            full = client.get_shipment(str(listed.get("shipmentUrl")))
+            full = client.get_shipment(url)
             # A closed order makes the shipment unwritable AND unshippable by the
-            # warehouse, so reopen it whether or not we have anything to write.
-            order = client.get_order(po)
-            if reopen and order is not None and str(order.get("statusId") or "") == "ORDER_COMPLETED":
+            # warehouse, so reopen it whether or not we have anything to write. The
+            # order is read only if the listing says it is closed (or cannot say).
+            order = client.get_order(po) if listed_status in (None, COMPLETED) else None
+            if reopen and order is not None and str(order.get("statusId") or "") == COMPLETED:
                 if live:
                     client.reopen_order(order)
                 row["reopened"] = True
@@ -152,7 +176,9 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
             finish(row, "failed", error=f"Finale read failed: {exc}"); continue
         p = plan_prefill(full, row["tracking"] or "", carrier_url)
         row["fields"], row["error"] = p["fields"], (p["reason"] or None)
+        mark = {"shipment_url": url, "po_number": po, "tracking": wanted[0], "carrier_url": wanted[1]}
         if p["action"] == "equal":
+            row["mark"] = mark
             # Nothing to write, but the reopen above may still have been the point.
             finish(row, "skipped_equal"); continue
         if p["action"] == "shipped":
@@ -168,6 +194,8 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
         try:
             client.update_shipment(str(full.get("shipmentUrl")), fields)
             row["status"] = "prefilled"; counts["prefilled"] += 1
+            row["mark"] = {"shipment_url": str(full.get("shipmentUrl")), "po_number": row["po_number"],
+                           "tracking": row["tracking"] or "", "carrier_url": carrier_url or ""}
         except Exception as exc:  # noqa: BLE001
             row.update(status="failed", error=str(exc)); counts["failed"] += 1
 

@@ -382,7 +382,9 @@ def _dropship_config() -> dict:
 def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[int]) -> dict:
     """Write carrier + tracking onto the packed Finale shipment of each dropship label
     (live) or preview it (dry). `ids` names PO numbers; the automated pass (ids=None)
-    applies the label-date floor and the cap. Two listings, no per-order reads."""
+    applies the label-date floor and the cap. Listings for shipments, sale orders and
+    carriers; a shipment is read only if it has not been filled in yet, an order only
+    if it has to be reopened (see app.dropship). Live runs remember what they found."""
     from app.finale import FinaleClient, FinaleUnavailable, wanted_carrier
     if not ShipStationClient.configured():
         raise FinaleUnavailable("SHIPSTATION_V1_KEY / SHIPSTATION_V1_SECRET not set")
@@ -393,11 +395,19 @@ def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[
     since = (datetime.now(timezone.utc) - timedelta(days=int(cfg.get("lookback_days") or 3))).strftime("%Y-%m-%d")
     labels = ShipStationClient().list_shipments(int(cfg.get("store_id") or 0), since)
     carrier = wanted_carrier(_finale_config(), "dropship", client.carrier_index())
+    try:
+        order_status = {str(o.get("orderId")): str(o.get("statusId") or "") for o in client.list_sale_orders()}
+    except Exception as exc:  # noqa: BLE001 -- without it, read each order as before
+        print(f"WARNING: dropship pre-fill: sale-order listing failed, reading orders one by one: {exc}")
+        order_status = None
     with _finale_run("dropship"):
         result = push_dropship_prefill(client.list_shipments(), labels, live=live, only=ids, limit=limit,
                                        client=client, carrier_url=carrier["url"] if carrier["enabled"] else None,
                                        created_after=(str(cfg.get("go_live_after") or "") or None) if automated else None,
-                                       max_per_run=cfg.get("max_per_run") if automated else None)
+                                       max_per_run=cfg.get("max_per_run") if automated else None,
+                                       order_status=order_status, marks=tracking.get_dropship_marks())
+    if live:
+        tracking.record_dropship_marks([r["mark"] for r in result["results"] if r.get("mark")])
     result["carrier"] = {"wanted": carrier["name"], "enabled": carrier["enabled"], "note": carrier["reason"] or None}
     blocked = result.get("blocked")
     _save_state("dropship", {"last_run": datetime.now(timezone.utc).isoformat(), **result})

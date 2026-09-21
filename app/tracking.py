@@ -82,6 +82,13 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
             sent_at     TEXT NOT NULL,
             resolved_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS dropship_marks (
+            shipment_url TEXT PRIMARY KEY,
+            po_number    TEXT,
+            tracking     TEXT NOT NULL,
+            carrier_url  TEXT NOT NULL,
+            marked_at    TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS shipstation_marks (
             order_id     TEXT PRIMARY KEY,
             order_number TEXT,
@@ -513,6 +520,37 @@ def record_shipstation_mark(order_id: str, order_number: str | None, tracking: s
                     (order_id, order_number, tracking, ship_date, status, now))
     except Exception as exc:
         print(f"ERROR: shipstation_marks write failed for {order_id!r}: {exc}")
+
+
+def record_dropship_marks(marks: list[dict]) -> None:
+    """Remember that these packed dropship shipments carry this tracking + carrier --
+    written by the pre-fill, or read back and found already there -- so the next poll
+    need not read them again. Best-effort: a lost mark only costs a re-read."""
+    if not marks:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with contextlib.closing(_connect()) as conn:
+            with conn:
+                conn.executemany(
+                    "INSERT INTO dropship_marks (shipment_url, po_number, tracking, carrier_url, marked_at) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(shipment_url) DO UPDATE SET po_number = excluded.po_number, "
+                    "tracking = excluded.tracking, carrier_url = excluded.carrier_url, marked_at = excluded.marked_at",
+                    [(m["shipment_url"], m.get("po_number"), m["tracking"], m["carrier_url"], now) for m in marks])
+    except Exception as exc:
+        print(f"ERROR: dropship_marks write failed ({len(marks)} rows): {exc}")
+
+
+def get_dropship_marks() -> dict[str, tuple[str, str]]:
+    """{shipment_url: (tracking, carrier_url)} for every dropship shipment the pre-fill
+    has filled in or found filled in."""
+    try:
+        with contextlib.closing(_connect()) as conn:
+            rows = conn.execute("SELECT shipment_url, tracking, carrier_url FROM dropship_marks").fetchall()
+        return {r[0]: (r[1], r[2]) for r in rows}
+    except Exception as exc:
+        print(f"WARNING: dropship_marks read failed: {exc}")
+        return {}
 
 
 def get_shipstation_marks(order_ids: list[str]) -> dict[str, dict]:

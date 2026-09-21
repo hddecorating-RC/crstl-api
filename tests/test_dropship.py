@@ -129,3 +129,99 @@ def test_a_closed_order_is_reopened_so_the_warehouse_can_ship_it():
     dry = FakeFinale(order_status="ORDER_COMPLETED")
     out4 = push_dropship_prefill([fship()], [label()], live=False, client=dry, carrier_url=PUROLATOR)
     assert out4["results"][0]["reopened"] is True and "reopen" not in [c[0] for c in dry.calls]
+
+
+# ── fewer Finale reads (2026-09-21: Monday's 36 labels ran the poll into 429s) ──
+
+class CountingFinale(FakeFinale):
+    """FakeFinale that also records order reads."""
+    def get_order(self, po):
+        self.calls.append(("order", po)); return super().get_order(po)
+
+
+FILLED = ("520756038656", PUROLATOR)
+
+
+def test_a_shipment_filled_in_earlier_is_not_read_again_while_its_order_is_open():
+    f = CountingFinale()
+    out = push_dropship_prefill([fship()], [label()], live=True, client=f, carrier_url=PUROLATOR,
+                                order_status={"538873472": "ORDER_LOCKED"}, marks={SURL: FILLED})
+    r = out["results"][0]
+    assert r["status"] == "skipped_equal" and "checked earlier" in r["error"]
+    assert f.calls == [] and "mark" not in r                        # no reads, nothing new to record
+
+
+def test_a_remembered_shipment_whose_order_was_closed_since_is_still_reopened():
+    """The connection closes the order seconds to minutes after the label -- possibly
+    after we filled the shipment in. The listing shows it closed: full treatment."""
+    f = CountingFinale(full={"shipmentUrl": SURL, "statusId": "SHIPMENT_PACKED",
+                             "trackingCode": FILLED[0], "carrierPartyUrl": PUROLATOR},
+                       order_status="ORDER_COMPLETED")
+    out = push_dropship_prefill([fship()], [label()], live=True, client=f, carrier_url=PUROLATOR,
+                                order_status={"538873472": "ORDER_COMPLETED"}, marks={SURL: FILLED})
+    r = out["results"][0]
+    assert r["status"] == "skipped_equal" and r["reopened"] is True
+    assert [c[0] for c in f.calls] == ["get", "order", "reopen"]
+
+
+def test_a_changed_label_or_carrier_means_a_fresh_read():
+    for mark in (("520700000000", PUROLATOR), (FILLED[0], "/hddecorating/api/partygroup/1")):
+        f = CountingFinale()
+        push_dropship_prefill([fship()], [label()], live=True, client=f, carrier_url=PUROLATOR,
+                              order_status={"538873472": "ORDER_LOCKED"}, marks={SURL: mark})
+        assert ("get", SURL) in f.calls
+
+
+def test_an_open_order_in_the_listing_is_not_read_one_by_one():
+    f = CountingFinale()
+    out = push_dropship_prefill([fship()], [label()], live=True, client=f, carrier_url=PUROLATOR,
+                                order_status={"538873472": "ORDER_LOCKED"}, marks={})
+    assert out["results"][0]["status"] == "prefilled"
+    assert [c[0] for c in f.calls] == ["get", "update"]              # no ("order", ...)
+    # a PO the listing does not know: read it, as before
+    g = CountingFinale()
+    push_dropship_prefill([fship()], [label()], live=True, client=g, carrier_url=PUROLATOR, order_status={}, marks={})
+    assert ("order", "538873472") in g.calls
+
+
+def test_rows_carry_a_mark_only_for_what_this_run_established():
+    wrote = push_dropship_prefill([fship()], [label()], live=True, client=CountingFinale(), carrier_url=PUROLATOR)
+    assert wrote["results"][0]["mark"] == {"shipment_url": SURL, "po_number": "538873472",
+                                           "tracking": FILLED[0], "carrier_url": PUROLATOR}
+    already = CountingFinale(full={"shipmentUrl": SURL, "statusId": "SHIPMENT_PACKED",
+                                   "trackingCode": FILLED[0], "carrierPartyUrl": PUROLATOR})
+    assert push_dropship_prefill([fship()], [label()], live=True, client=already,
+                                 carrier_url=PUROLATOR)["results"][0]["mark"]["tracking"] == FILLED[0]
+    dry = push_dropship_prefill([fship()], [label()], live=False, client=CountingFinale(), carrier_url=PUROLATOR)
+    assert "mark" not in dry["results"][0]                             # would_prefill: nothing on it yet
+    failed = push_dropship_prefill([fship()], [label()], live=True, client=CountingFinale(fail_update=True),
+                                   carrier_url=PUROLATOR)
+    assert "mark" not in failed["results"][0]
+
+
+def test_the_runner_remembers_live_results_and_survives_a_failed_order_listing(monkeypatch):
+    from app import finale_jobs, tracking
+    fin = CountingFinale()
+    fin.carrier_index = lambda: {"Purolator Canada": PUROLATOR}
+    fin.list_shipments = lambda: [fship()]
+    fin.list_sale_orders = lambda: [{"orderId": "538873472", "statusId": "ORDER_LOCKED"}]
+    ss = type("SS", (), {"list_shipments": lambda self, store, since: [label()]})
+    monkeypatch.setattr("app.finale_jobs._dropship_config", lambda: {"enabled": True, "store_id": 1})
+    monkeypatch.setattr("app.finale_jobs._finale_config",
+                        lambda: {"carriers": {"enabled": True, "dropship": "Purolator Canada"}})
+    with patch("app.finale.FinaleClient", return_value=fin) as FC, patch("app.finale_jobs.ShipStationClient") as SC:
+        FC.configured.return_value = True
+        SC.configured.return_value = True
+        SC.return_value = ss()
+        finale_jobs._run_dropship_prefill(False, ["538873472"], None)
+        assert tracking.get_dropship_marks() == {}                        # a dry run remembers nothing
+        finale_jobs._run_dropship_prefill(True, ["538873472"], None)
+        assert tracking.get_dropship_marks() == {SURL: FILLED}
+        fin.calls.clear()
+        again = finale_jobs._run_dropship_prefill(True, ["538873472"], None)
+        assert again["results"][0]["status"] == "skipped_equal" and fin.calls == []
+        def boom():
+            raise RuntimeError("429")
+        fin.list_sale_orders = boom                                        # listing down: per-order reads
+        finale_jobs._run_dropship_prefill(False, ["538873472"], None)
+        assert ("order", "538873472") in fin.calls

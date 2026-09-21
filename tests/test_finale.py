@@ -190,3 +190,52 @@ def test_set_order_user_fields_merges_and_edits_only_when_locked():
     with pytest.raises(RuntimeError, match="write 400"):
         c.set_order_user_fields(locked, {"user_10000": "x"})
     assert "/h/api/order/1/lock" in [u for u, _ in calls]
+
+
+# ── rate limit (2026-09-21) ────────────────────────────────────────────────
+
+def _resp(status, reset_ms=None):
+    import requests
+    r = requests.Response()
+    r.status_code = status
+    if reset_ms is not None:
+        r.headers["X-RateLimit-Reset"] = str(reset_ms)
+    r._content = b"{}"
+    import io
+    r.raw = io.BytesIO(b"{}")          # a real response has a stream the retry closes
+    return r
+
+
+def test_rate_limit_wait_reads_the_reset_header_and_is_bounded():
+    from app.finale import rate_limit_wait
+    assert rate_limit_wait({"X-RateLimit-Reset": "1000030000"}, now=1000000.0) == pytest.approx(30.5)
+    assert rate_limit_wait({"X-RateLimit-Reset": "999000000"}, now=1000000.0) == 1.0     # already past
+    assert rate_limit_wait({"X-RateLimit-Reset": "9999999999999"}, now=1000000.0) == 65.0
+    assert rate_limit_wait({}, now=1000000.0) == 20.0
+
+
+def test_a_rate_limited_get_waits_and_retries_but_a_post_never_does():
+    import requests
+    from unittest.mock import patch as _patch
+    from app.finale import RateLimitRetry
+    adapter = RateLimitRetry()
+    get = requests.Request("GET", "https://app.finaleinventory.com/x/api/shipment/1").prepare()
+    post = requests.Request("POST", "https://app.finaleinventory.com/x/api/shipment/1", json={}).prepare()
+    with _patch("requests.adapters.HTTPAdapter.send", side_effect=[_resp(429), _resp(200)]) as send, \
+         _patch("app.finale.time.sleep") as sleep:
+        assert adapter.send(get).status_code == 200
+    assert send.call_count == 2 and sleep.call_count == 1
+    with _patch("requests.adapters.HTTPAdapter.send", side_effect=[_resp(429)]) as send, \
+         _patch("app.finale.time.sleep") as sleep:
+        assert adapter.send(post).status_code == 429
+    assert send.call_count == 1 and sleep.call_count == 0
+    with _patch("requests.adapters.HTTPAdapter.send", side_effect=[_resp(429)] * 4) as send, \
+         _patch("app.finale.time.sleep"):
+        assert adapter.send(get).status_code == 429                          # gives up: raises as before
+    assert send.call_count == 1 + RateLimitRetry.MAX_RETRIES
+
+
+def test_every_finale_request_goes_through_the_rate_limit_adapter():
+    from app.finale import RateLimitRetry
+    c = FinaleClient(account_id="a", api_key="k", api_secret="s")
+    assert isinstance(c.session.get_adapter("https://app.finaleinventory.com/a/api/order/1"), RateLimitRetry)

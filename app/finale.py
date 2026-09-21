@@ -29,8 +29,10 @@ DSD ship date to show; the cell fills on a later re-export. That is why a
 missing date here is left blank rather than treated as an error.
 """
 import os
+import time
 
 import requests
+from requests.adapters import HTTPAdapter
 
 # Both mean the goods have left. Filtering to SHIPMENT_SHIPPED alone drops the
 # 122 records that have since been marked delivered.
@@ -168,6 +170,43 @@ def ship_date_index(shipments) -> dict:
     return by_po
 
 
+def rate_limit_wait(headers, now: float | None = None, fallback: float = 20.0) -> float:
+    """Seconds until Finale's rate-limit window resets, from X-RateLimit-Reset (epoch
+    MILLISECONDS), plus a small margin; `fallback` when the header is missing or bad.
+    Clamped to 1..65 s -- the window is about a minute."""
+    now = time.time() if now is None else now
+    try:
+        wait = float(headers.get("X-RateLimit-Reset")) / 1000.0 - now + 0.5
+    except (TypeError, ValueError):
+        wait = fallback
+    return max(1.0, min(wait, 65.0))
+
+
+class RateLimitRetry(HTTPAdapter):
+    """Finale allows ~120 API requests a minute per ACCOUNT (X-RateLimit-Limit: 120,
+    seen 2026-09-16) -- shared with the ShipStation connection and every other user of
+    the account -- and answers 429 past it, with X-RateLimit-Reset but no Retry-After,
+    so urllib3's own Retry cannot time the wait. A GET that gets a 429 waits for the
+    window to reset and is sent again, up to MAX_RETRIES times; then the 429 is returned
+    and raises as before. Never a POST: a write is only ever retried by the next poll,
+    after its preflight has re-checked what is already there.
+    Added 2026-09-21: Monday's volume (36 packed dropship labels) pushed the 15-min poll
+    past the limit and its last pass failed 12 reads with 429."""
+    MAX_RETRIES = 3
+
+    def send(self, request, **kwargs):
+        resp = super().send(request, **kwargs)
+        tries = 0
+        while resp.status_code == 429 and request.method == "GET" and tries < self.MAX_RETRIES:
+            wait = rate_limit_wait(resp.headers)
+            print(f"Finale rate limit: waiting {wait:.0f}s before retrying {request.url}")
+            resp.close()
+            time.sleep(wait)
+            resp = super().send(request, **kwargs)
+            tries += 1
+        return resp
+
+
 class FinaleClient:
     """Read-only client for the one thing the workbook needs from Finale."""
 
@@ -191,6 +230,7 @@ class FinaleClient:
         self.base_url = f"{self.HOST}/{account_id}/api"
         self.session = requests.Session()
         self.session.auth = (api_key, api_secret)
+        self.session.mount("https://", RateLimitRetry())
 
     @staticmethod
     def configured() -> bool:
