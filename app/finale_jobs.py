@@ -341,12 +341,13 @@ def _run_dsd_prefill(live: bool, ids: Optional[list[str]], limit: Optional[int])
     fin, auto = _finale_config(), (load_refs().get("automation") or {})
     automated = ids is None
     if automated:
-        states = crstl.list_transaction_states(transaction_type="856")
+        states = crstl.list_transaction_states(transaction_type="856", created_after=crstl_cache._poll_window())
         todo = tracking.get_unprefilled_asn_ids(list(states))
         ids = select_dsd_asns(states, set(states) - set(todo),
                               created_after=_finale_floor(),
                               created_within_days=auto.get("created_within_days"))
-    asns = crstl.fetch_asn_refs(ids) if ids else []
+    # A manual run may name any ASN, so only the automated pass narrows the listing.
+    asns = crstl.fetch_asn_refs(ids, created_after=crstl_cache._poll_window() if automated else None) if ids else []
     with _finale_run("dsd"):
         result = push_dsd_prefill(asns, live=live, only=None, limit=limit, client=FinaleClient(),
                                   max_per_run=fin.get("max_per_run") if automated else None)

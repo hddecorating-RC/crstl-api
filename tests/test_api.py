@@ -782,7 +782,8 @@ def test_refresh_new_accepted_fetches_only_changed_and_merges(monkeypatch):
     from app.crstl_cache import _refresh_new_accepted, _cache
     class FakeCrstl:
         def __init__(self): self.calls = []
-        def list_transaction_states(self):
+        def list_transaction_states(self, created_after=None):
+            self.calls.append(("list", created_after is not None))       # the poll lists a recent window only
             return {"a": {"state": "Accepted", "updated_at": "", "po_number": "PO-A"},   # unchanged
                     "b": {"state": "Accepted", "updated_at": "", "po_number": "PO-B"},   # Draft -> Accepted
                     "c": {"state": "Draft",    "updated_at": "", "po_number": "PO-C"}}   # new
@@ -803,7 +804,7 @@ def test_refresh_new_accepted_fetches_only_changed_and_merges(monkeypatch):
         by = {i["transaction_id"]: i for i in _cache["invoices"]}
         pos = set(_cache["po_provinces"])
     assert n == 2
-    assert fake.calls == [("fetch_invoices", ["b", "c"]), ("fetch_po_provinces", ["PO-B", "PO-C"])]
+    assert fake.calls == [("list", True), ("fetch_invoices", ["b", "c"]), ("fetch_po_provinces", ["PO-B", "PO-C"])]
     assert by["b"]["status"] == "Accepted" and "c" in by and by["a"]["status"] == "Accepted"
     assert pos == {"PO-A", "PO-B", "PO-C"} and by["b"]["province"] == "ON"
     # a PO the 4:45 full refresh added WHILE this poll was fetching survives the merge
@@ -1162,8 +1163,8 @@ def test_run_dsd_prefill_applies_the_shared_guards_to_the_automated_pass(monkeyp
     states = {"new": {"state": "Accepted", "created_at": "2026-09-16T01:00:00Z", "po_number": "1"},
               "old": {"state": "Accepted", "created_at": "2026-09-01T01:00:00Z", "po_number": "2"},
               "draft": {"state": "Draft", "created_at": "2026-09-16T01:00:00Z", "po_number": "3"}}
-    crstl = type("C", (), {"list_transaction_states": lambda self, transaction_type="810": states,
-                           "fetch_asn_refs": lambda self, ids: [{"asn_id": i, "po_number": "1", "state": "Accepted",
+    crstl = type("C", (), {"list_transaction_states": lambda self, transaction_type="810", created_after=None: states,
+                           "fetch_asn_refs": lambda self, ids, created_after=None: [{"asn_id": i, "po_number": "1", "state": "Accepted",
                                                                  "pro": "6100", "rts": "3200", "pickup_date": ""} for i in ids]})()
     monkeypatch.setattr("app.crstl_cache._get_client", lambda: crstl)
     monkeypatch.setattr("app.finale_jobs._finale_config", lambda: {"enabled": True, "go_live_after": "2026-09-15", "max_per_run": 5})

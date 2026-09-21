@@ -103,6 +103,21 @@ def packed_at(shipment: dict) -> datetime | None:
     return None
 
 
+def _packed_sales(shipments: list[dict]):
+    """(po, shipment) for every Finale SALE shipment still PACKED, test orders excluded."""
+    for s in shipments:
+        if str(s.get("statusId") or "") != PACKED or s.get("shipmentTypeId") != "SALES_SHIPMENT":
+            continue
+        po = str(s.get("primaryOrderUrl") or "").rstrip("/").rsplit("/", 1)[-1]
+        if po and not po.upper().startswith("TEST_"):
+            yield po, s
+
+
+def packed_sales_pos(shipments: list[dict]) -> set:
+    """The POs of every packed sale shipment -- the ones packed_dropship asks about."""
+    return {po for po, _ in _packed_sales(shipments)}
+
+
 def packed_dropship(shipments: list[dict], dropship_pos: set, *, now: datetime | None = None) -> list[dict]:
     """Every Finale sale shipment still PACKED on a DROPSHIP order, with how long it has
     been packed. The raw material for the alert AND for choosing its threshold. Pure.
@@ -114,11 +129,8 @@ def packed_dropship(shipments: list[dict], dropship_pos: set, *, now: datetime |
     """
     now = now or datetime.now(timezone.utc)
     out = []
-    for s in shipments:
-        if str(s.get("statusId") or "") != PACKED or s.get("shipmentTypeId") != "SALES_SHIPMENT":
-            continue
-        po = str(s.get("primaryOrderUrl") or "").rstrip("/").rsplit("/", 1)[-1]
-        if not po or po.upper().startswith("TEST_") or po not in dropship_pos:
+    for po, s in _packed_sales(shipments):
+        if po not in dropship_pos:
             continue
         when = packed_at(s)
         if when is None:

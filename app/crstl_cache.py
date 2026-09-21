@@ -6,7 +6,8 @@ import os
 import threading
 from datetime import date, datetime, timedelta, timezone
 
-from app.crstl import CrstlClient
+from app.crstl import CrstlClient, created_since
+from app.netsuite_payload import load_refs
 from app import tracking
 from app.report import flavor_of, product_for
 from app.finale import FinaleClient
@@ -275,7 +276,7 @@ def _refresh_new_accepted() -> int:
         return 0
     try:
         client = _get_client()
-        states = client.list_transaction_states()
+        states = client.list_transaction_states(created_after=_poll_window())
         with _cache_lock:
             cached = {str(i.get("transaction_id")): str(i.get("status") or "") for i in _cache["invoices"]}
             po_map = dict(_cache["po_provinces"])
@@ -302,6 +303,15 @@ def _refresh_new_accepted() -> int:
         print(f"WARNING: incremental 810 refresh failed: {exc}")
         tracking.record_job_run("finale_push", "error", f"refresh: {str(exc)[:160]}")
         return 0
+
+
+def _poll_window() -> str | None:
+    """`created_after` for the 15-min jobs' CRSTL listings: the automation's rolling
+    window (created_within_days -- nothing older is ever acted on) plus 2 days' margin.
+    None = all history, only if no window is configured. Listing all history every 15
+    minutes grew with every order ever received (2026-09-21)."""
+    days = (load_refs().get("automation") or {}).get("created_within_days")
+    return created_since(float(days) + 2) if days is not None else None
 
 
 def _crstl_po_set() -> set:

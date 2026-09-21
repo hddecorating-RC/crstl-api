@@ -1,11 +1,14 @@
 """Order alerts job: find order outliers (app.alerts) and email the new ones to the
 order.alerts group. Its own 15-min job, weekdays only."""
+import time
 from datetime import datetime, timedelta, timezone
 
 from app import tracking
+from app.crstl import created_since
 from app.mail import send_mail
 from app.shipstation import ShipStationClient
-from app.alerts import alert_day, alert_recipients, run_alerts, sent_asn_pos
+from app.alerts import (alert_day, alert_recipients, find_asn_missing, packed_sales_pos, run_alerts,
+                        sent_asn_pos)
 from app.netsuite_payload import load_refs
 from app.automation import AUTO_ALERTS_SETTING
 from app import automation, crstl_cache
@@ -34,6 +37,48 @@ def _run_alerts_job() -> None:
         tracking.record_job_run("order_alerts", "error", str(exc)[:200])
 
 
+# What the alerts need to know about a PO that never changes -- its 850's CRSTL id and
+# whether it is dropship -- kept for the life of the process (order-watch runs for days),
+# so a non-CRSTL order (HD Supply...) sitting packed is not looked up every 15 minutes.
+# A PO CRSTL does not know is asked again after a day.
+_PO_850: dict[str, tuple[float, tuple[str, bool] | None]] = {}
+_PO_MISS_TTL = 24 * 3600
+
+
+def _lookup_850(crstl, po: str) -> tuple[str, bool] | None:
+    hit = _PO_850.get(po)
+    if hit and (hit[1] is not None or time.time() - hit[0] < _PO_MISS_TTL):
+        return hit[1]
+    rows = crstl.find_850(po)
+    meta = (rows[0].get("metadata") or rows[0]) if rows else None
+    found = (str(meta.get("id") or rows[0].get("id")),
+             "dropship" in str(meta.get("trading_partner_flavor") or "").lower()) if meta else None
+    _PO_850[po] = (time.time(), found)
+    return found
+
+
+def _fill_older_pos(crstl, cfg: dict, shipments: list[dict], finale_shipments: list[dict],
+                    asn_pos: set, po_ids: dict, dropship_pos: set) -> None:
+    """The CRSTL listings cover the last lookback+2 days. A PO the alerts can still ask
+    about may be older -- a re-labelled order's earlier ASN, a packed shipment's 850, an
+    open alert -- so look those few up exactly (by PO), which gives the same answer as
+    listing all history. Updates asn_pos / po_ids / dropship_pos in place."""
+    open_all = tracking.open_alert_receipts()
+    would_alert = {r["po_number"] for r in find_asn_missing(
+        shipments, asn_pos, {}, after_minutes=int(cfg.get("asn_missing_after_minutes") or 60))}
+    open_asn = {str(r.get("po_number")) for r in open_all if r.get("issue") == "asn_missing" and r.get("po_number")}
+    open_pos = {str(r.get("po_number")) for r in open_all if r.get("po_number")}
+    for po in sorted((would_alert | open_pos | packed_sales_pos(finale_shipments)) - set(po_ids)):
+        found = _lookup_850(crstl, po)
+        if found:
+            po_ids[po] = found[0]
+            if found[1]:
+                dropship_pos.add(po)
+    for po in sorted((would_alert | open_asn) - asn_pos):
+        if po in po_ids:
+            asn_pos.update(sent_asn_pos(crstl.list_transaction_states("856", source_document_ids=po_ids[po])))
+
+
 def _run_alerts(live: bool) -> dict:
     """Find order outliers (today: ShipStation label with no CRSTL 856) and email the
     new ones to ALERT_RECIPIENTS in ONE message (live), or preview it (dry)."""
@@ -41,17 +86,20 @@ def _run_alerts(live: bool) -> dict:
     if not ShipStationClient.configured():
         raise FinaleUnavailable("SHIPSTATION_V1_KEY / SHIPSTATION_V1_SECRET not set")
     cfg = _alerts_config()
-    since = (datetime.now(timezone.utc) - timedelta(days=int(cfg.get("lookback_days") or 7))).strftime("%Y-%m-%d")
+    lookback = int(cfg.get("lookback_days") or 7)
+    since = (datetime.now(timezone.utc) - timedelta(days=lookback)).strftime("%Y-%m-%d")
     shipments = ShipStationClient().list_shipments(int(cfg.get("dropship_store_id") or 0), since)
     crstl = crstl_cache._get_client()
-    asn_pos = sent_asn_pos(crstl.list_transaction_states("856"))       # Draft/Rejected do not count as sent
-    orders_850 = [(tx.get("metadata") or tx) for tx in crstl._fetch_all_transactions("850")]
+    window = created_since(lookback + 2)        # recent CRSTL only; _fill_older_pos covers the rest
+    asn_pos = sent_asn_pos(crstl.list_transaction_states("856", created_after=window))  # Draft/Rejected do not count as sent
+    orders_850 = [(tx.get("metadata") or tx) for tx in crstl._fetch_all_transactions("850", created_after=window)]
     po_ids = {str(m.get("reference_id")): str(m.get("id")) for m in orders_850}
     # The dropship/DSD split comes from CRSTL's own flavour on the 850, not the PO format.
     dropship_pos = {str(m.get("reference_id")) for m in orders_850
                     if "dropship" in str(m.get("trading_partner_flavor") or "").lower()}
     from app.finale import FinaleClient
     finale_shipments = FinaleClient().list_shipments() if FinaleClient.configured() else []
+    _fill_older_pos(crstl, cfg, shipments, finale_shipments, asn_pos, po_ids, dropship_pos)
     result = run_alerts(shipments, asn_pos, po_ids, config=cfg, live=live, recipients=alert_recipients(),
                         send=send_mail, finale_shipments=finale_shipments, dropship_pos=dropship_pos)
     # The dashboard's "last alerts run" (read back by finale_jobs.finale_state()).

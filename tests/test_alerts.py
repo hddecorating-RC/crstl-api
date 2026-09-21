@@ -187,3 +187,112 @@ def test_alert_day_is_mon_to_fri_in_toronto_not_utc():
     assert not alert_day(et("2026-09-19T00:05"))      # Sat
     assert not alert_day(et("2026-09-20T23:59"))      # Sun
     assert alert_day(et("2026-09-21T00:00"))          # Mon
+
+
+# ── recent CRSTL only, older POs looked up exactly (2026-09-21) ──────────────
+
+class HistoryCrstl:
+    """CRSTL with created_at-dated history; honours created_after / reference_id /
+    source_document_ids like the live API (verified 2026-09-21)."""
+    def __init__(self, t850, t856):
+        self.t850, self.t856, self.calls = t850, t856, []
+    def _fetch_all_transactions(self, typ, created_after=None, **f):
+        self.calls.append((typ, created_after is not None, tuple(sorted(f))))
+        rows = self.t850 if typ == "850" else self.t856
+        rows = [r for r in rows if not created_after or r["created_at"] >= created_after]
+        if "reference_id" in f:
+            rows = [r for r in rows if r["reference_id"] == f["reference_id"]]
+        if "source_document_ids" in f:
+            rows = [r for r in rows if r["source_document_id"] == f["source_document_ids"]]
+        return [{"id": r["id"], "metadata": r} for r in rows]
+    def find_850(self, po):
+        return self._fetch_all_transactions("850", reference_id=po)
+    def list_transaction_states(self, typ="810", created_after=None, **f):
+        return {t["id"]: {"state": t["metadata"]["state"], "po_number": t["metadata"]["source_document_reference_id"]}
+                for t in self._fetch_all_transactions(typ, created_after, **f)}
+
+
+def _ago(days):
+    return (NOW - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _history():
+    def o850(po, days, flavor="HD Canada Dropship"):
+        return {"id": f"850-{po}", "reference_id": po, "trading_partner_flavor": flavor, "created_at": _ago(days)}
+    def o856(po, days, state="Accepted"):
+        return {"id": f"856-{po}", "source_document_reference_id": po, "source_document_id": f"850-{po}",
+                "state": state, "created_at": _ago(days)}
+    t850 = [o850("RELABEL", 30), o850("RECENT", 3), o850("MISSING", 2), o850("OLDPACK", 40), o850("DSDPACK", 20, "HD Canada DSD")]
+    t856 = [o856("RELABEL", 30), o856("RECENT", 1)]
+    return t850, t856
+
+
+def _labels():
+    pt = lambda hours: (NOW - timedelta(hours=hours)).astimezone(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%dT%H:%M:%S")
+    return [{"shipmentId": 1, "orderNumber": "RELABEL", "createDate": pt(2), "voided": False, "trackingNumber": "t1"},
+            {"shipmentId": 2, "orderNumber": "RECENT", "createDate": pt(24), "voided": False, "trackingNumber": "t2"},
+            {"shipmentId": 3, "orderNumber": "MISSING", "createDate": pt(3), "voided": False, "trackingNumber": "t3"}]
+
+
+def _packed(po, sid, days):
+    return {"shipmentId": sid, "statusId": "SHIPMENT_PACKED", "shipmentTypeId": "SALES_SHIPMENT",
+            "primaryOrderUrl": f"/hddecorating/api/order/{po}",
+            "statusIdHistoryList": [{"statusId": "SHIPMENT_PACKED", "txStamp": int((NOW - timedelta(days=days)).timestamp())}]}
+
+
+def _found(asn_pos, po_ids, dropship_pos, labels, finale):
+    from app.alerts import find_packed_unshipped
+    rows = find_asn_missing(labels, asn_pos, po_ids, after_minutes=60, now=NOW)
+    rows += find_packed_unshipped(finale, po_ids, dropship_pos, after_hours=24, now=NOW)
+    return sorted((r["key"], r["url"]) for r in rows)
+
+
+def test_recent_listing_plus_exact_lookups_finds_what_all_history_finds(monkeypatch, tmp_path):
+    from app import alert_jobs
+    from app.alerts import sent_asn_pos
+    monkeypatch.setattr(alert_jobs, "_PO_850", {})
+    monkeypatch.setattr("app.alert_jobs.created_since", lambda days: _ago(days))
+    t850, t856 = _history()
+    labels, finale = _labels(), [_packed("OLDPACK", 10, 2), _packed("DSDPACK", 11, 3), _packed("HDSUPPLY-1", 12, 5)]
+    # the old way: all history
+    full = HistoryCrstl(t850, t856)
+    metas = [t["metadata"] for t in full._fetch_all_transactions("850")]
+    want = _found(sent_asn_pos(full.list_transaction_states("856")), {m["reference_id"]: m["id"] for m in metas},
+                  {m["reference_id"] for m in metas if "dropship" in m["trading_partner_flavor"].lower()}, labels, finale)
+    # the new way: 9 days, then exact lookups for the POs the alerts ask about
+    crstl = HistoryCrstl(t850, t856)
+    window = _ago(9)
+    asn_pos = sent_asn_pos(crstl.list_transaction_states("856", created_after=window))
+    metas = [t["metadata"] for t in crstl._fetch_all_transactions("850", created_after=window)]
+    po_ids = {m["reference_id"]: m["id"] for m in metas}
+    dropship = {m["reference_id"] for m in metas if "dropship" in m["trading_partner_flavor"].lower()}
+    assert "RELABEL" not in asn_pos and "OLDPACK" not in dropship                   # the window alone would be wrong
+    alert_jobs._fill_older_pos(crstl, {"asn_missing_after_minutes": 60}, labels, finale, asn_pos, po_ids, dropship)
+    assert _found(asn_pos, po_ids, dropship, labels, finale) == want
+    assert [k for k, _ in want] == ["asn_missing:3", "packed_unshipped:10"]          # the real missing ASN + the old packed one
+    assert all(windowed or lookup for _, windowed, lookup in crstl.calls)            # never an all-history listing
+
+
+def test_a_po_crstl_does_not_know_is_looked_up_once_a_day(monkeypatch):
+    from app import alert_jobs
+    monkeypatch.setattr(alert_jobs, "_PO_850", {})
+    crstl = HistoryCrstl(*_history())
+    finale = [_packed("HDSUPPLY-1", 12, 5)]
+    for _ in range(3):
+        alert_jobs._fill_older_pos(crstl, {}, [], finale, set(), {}, set())
+    assert sum(1 for c in crstl.calls if c[0] == "850") == 1
+    monkeypatch.setattr("app.alert_jobs.time.time", lambda: 10 ** 12)                # a day+ later: asked again
+    alert_jobs._fill_older_pos(crstl, {}, [], finale, set(), {}, set())
+    assert sum(1 for c in crstl.calls if c[0] == "850") == 2
+
+
+def test_an_open_alert_resolves_even_when_its_asn_is_older_than_the_window(monkeypatch, tmp_path):
+    from app import alert_jobs, tracking
+    from app.alerts import resolved_asn_missing
+    monkeypatch.setattr(alert_jobs, "_PO_850", {})
+    t850, t856 = _history()
+    tracking.record_alert("asn_missing:99", "RELABEL", "asn_missing")
+    asn_pos, po_ids = set(), {}
+    alert_jobs._fill_older_pos(HistoryCrstl(t850, t856), {}, [], [], asn_pos, po_ids, set())
+    assert "RELABEL" in asn_pos and po_ids["RELABEL"] == "850-RELABEL"
+    assert [r["key"] for r in resolved_asn_missing(tracking.open_alert_receipts(), asn_pos)] == ["asn_missing:99"]

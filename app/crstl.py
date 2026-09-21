@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -7,6 +8,18 @@ from urllib3.util.retry import Retry
 from app.products import vendor_items_in
 from app.shipments import asn_date_index, asn_shipping_refs
 from app.sac_codes import classify
+
+
+def created_since(days) -> str | None:
+    """The `created_after` value for "the last `days` days" -- CRSTL takes an ISO
+    datetime (a bare date is a 400) -- or None (no filter) when days is None."""
+    if days is None:
+        return None
+    return (datetime.now(timezone.utc) - timedelta(days=float(days))).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Lookups by PO for a handful of POs; more than this and one full listing is cheaper.
+EXACT_LOOKUP_MAX = 20
 
 
 class CrstlClient:
@@ -49,13 +62,16 @@ class CrstlClient:
         resp.raise_for_status()
         return resp.json()
 
-    def list_transaction_states(self, transaction_type: str = "810") -> dict[str, dict]:
+    def list_transaction_states(self, transaction_type: str = "810", created_after: str | None = None,
+                                **filters) -> dict[str, dict]:
         """{transaction_id: {"state": "Accepted"|..., "updated_at": ..., "po_number": ...,
         "created_at": ...}} for every transaction of this type (810 by default, 856 for
         the DSD pass), from the LIST call alone (paginated, no per-transaction detail).
-        The cheap poll the 15-minute Finale job uses to spot new acceptances."""
+        The cheap poll the 15-minute Finale job uses to spot new acceptances.
+        `created_after` / `filters` narrow the listing server-side (see
+        _fetch_all_transactions) -- the 15-min jobs pass a recent window."""
         out = {}
-        for tx in self._fetch_all_transactions(transaction_type=transaction_type):
+        for tx in self._fetch_all_transactions(transaction_type=transaction_type, created_after=created_after, **filters):
             m = tx.get("metadata") or tx
             tid = tx.get("id") or m.get("id") or tx.get("transaction_id")
             if not tid:
@@ -68,7 +84,7 @@ class CrstlClient:
                              "flavor": str(m.get("trading_partner_flavor") or "")}
         return out
 
-    def fetch_asn_refs(self, asn_ids) -> list[dict]:
+    def fetch_asn_refs(self, asn_ids, created_after: str | None = None) -> list[dict]:
         """The DSD pickup numbers on these 856s: one row per ASN --
         {asn_id, po_number, state, created_at, pro, rts, pickup_date} (see
         app.shipments.asn_shipping_refs). Detail fetches only for the ids asked for,
@@ -78,7 +94,7 @@ class CrstlClient:
         if not wanted:
             return []
         rows = []
-        for asn in self._fetch_all_transactions(transaction_type="856"):
+        for asn in self._fetch_all_transactions(transaction_type="856", created_after=created_after):
             meta = asn.get("metadata") or asn
             aid = str(asn.get("id") or meta.get("id") or "")
             if aid not in wanted:
@@ -131,7 +147,12 @@ class CrstlClient:
         Province column does.
         """
         from app.products import po_lines_in
-        pos = self._fetch_all_transactions(transaction_type="850")
+        if only_pos is not None and len(set(only_pos)) <= EXACT_LOOKUP_MAX:
+            # The incremental path asks for a few new POs: look each one up by its PO
+            # number rather than listing every 850 on record.
+            pos = [t for p in sorted({str(x) for x in only_pos} - {""}) for t in self.find_850(p)]
+        else:
+            pos = self._fetch_all_transactions(transaction_type="850")
         # (po_id, po_number) pairs — skip anything missing either
         to_fetch = [
             (po.get("id") or po.get("metadata", {}).get("id"),
@@ -221,13 +242,27 @@ class CrstlClient:
                     print(f"WARNING: failed to fetch 856 detail for {futures[future]}: {exc}")
         return asn_date_index(details)
 
-    def _fetch_all_transactions(self, transaction_type: str = "810") -> list:
+    def find_850(self, po_number: str) -> list:
+        """The 850 for this PO number (its reference_id), exactly -- [] if CRSTL has none."""
+        return self._fetch_all_transactions("850", reference_id=str(po_number))
+
+    def _fetch_all_transactions(self, transaction_type: str = "810", created_after: str | None = None,
+                                **filters) -> list:
+        """Every transaction of this type, paged 20 at a time. Filters narrow it server-
+        side (verified on live data 2026-09-21 to match filtering the full list):
+        created_after (ISO datetime), reference_id (an 850's is its PO number),
+        source_document_ids (an 856's / 810's 850 id). Unfiltered it is ALL history,
+        which grows forever -- the 15-min jobs pass a recent window instead."""
         results = []
         offset = 0
+        base = {"transaction_type": transaction_type}
+        if created_after:
+            base["created_after"] = created_after
+        base.update({k: v for k, v in filters.items() if v})
         while True:
             resp = self.session.get(
                 f"{self.base_url}/transaction",
-                params={"transaction_type": transaction_type, "limit": self.PAGE_SIZE, "offset": offset},
+                params={**base, "limit": self.PAGE_SIZE, "offset": offset},
                 timeout=30,
             )
             resp.raise_for_status()

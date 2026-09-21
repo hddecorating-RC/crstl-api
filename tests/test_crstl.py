@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from app.crstl import CrstlClient
 
 
@@ -308,3 +308,32 @@ def test_client_retries_transient_failures():
     assert 429 in retry.status_forcelist
     assert {500, 502, 503, 504}.issubset(set(retry.status_forcelist))
     assert retry.respect_retry_after_header is True
+
+
+def test_listing_filters_are_sent_and_created_since_is_an_iso_datetime():
+    """CRSTL 400s a bare date for created_after; an ISO datetime works (2026-09-21)."""
+    import re
+    from app.crstl import created_since
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", created_since(9))
+    assert created_since(None) is None
+    client = CrstlClient(base_url="https://api.crstl.so/v2", api_key="k")
+    resp = MagicMock(); resp.json.return_value = {"data": {"transactions": []}}
+    with patch.object(client.session, "get", return_value=resp) as get:
+        client.list_transaction_states("856", created_after="2026-09-12T00:00:00Z")
+        client.find_850("538900001")
+        client._fetch_all_transactions("856", source_document_ids="850-id", reference_id=None)
+    params = [c.kwargs["params"] for c in get.call_args_list]
+    assert params[0]["created_after"] == "2026-09-12T00:00:00Z" and params[0]["transaction_type"] == "856"
+    assert params[1]["reference_id"] == "538900001" and "created_after" not in params[1]
+    assert params[2]["source_document_ids"] == "850-id" and "reference_id" not in params[2]
+
+
+def test_a_few_missing_pos_are_looked_up_by_po_not_by_listing_every_850():
+    client = CrstlClient(base_url="https://api.crstl.so/v2", api_key="k")
+    with patch.object(client, "find_850", return_value=[]) as find, \
+         patch.object(client, "_fetch_all_transactions", return_value=[]) as listing:
+        client.fetch_po_provinces(only_pos=["PO-1", "PO-2"])
+        assert sorted(c.args[0] for c in find.call_args_list) == ["PO-1", "PO-2"]
+        listing.assert_not_called()
+        client.fetch_po_provinces(only_pos=[f"PO-{i}" for i in range(25)])     # many: one listing is cheaper
+        listing.assert_called_once_with(transaction_type="850")
