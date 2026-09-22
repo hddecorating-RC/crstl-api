@@ -326,7 +326,7 @@ class CrstlClient:
         # are fees. Classify each and sum into the appropriate bucket. tax_amount
         # is the sum of tax-categorized entries — NOT derived from the total.
         category_totals = {"allowance": 0.0, "discount": 0.0, "freight": 0.0, "fee": 0.0, "tax": 0.0}
-        tax_breakdown = {}  # {"GST": amount, "HST_QST": amount, "ECO": amount}
+        tax_breakdown = {}  # {"GST": amount, "HST": amount, "QST": amount, "ECO": amount}
         allowances_charges = []
         for entry in summary.get("service_promotion_allowance_or_charge_information_loop", []) or []:
             saci = entry.get("service_promotion_allowance_or_charge_information", {}) or {}
@@ -406,6 +406,13 @@ class CrstlClient:
             "currency":        str(heading.get("currency", {}).get("currency_code") if isinstance(heading.get("currency"), dict) else heading.get("currency") or "CAD"),
             "created_at":      str(meta.get("created_at") or ""),
             "invoice_lines":   lines,
+            # Read by app.invoice_checks (HD's rules, CMP doc v9-12-2025). Dropship tax
+            # travels in TXI, not SAC, so it is kept raw here and NOT folded into
+            # tax_amount/discrepancy, whose SAC-only meaning the dashboard relies on.
+            "txi": [{"code": str(t.get("tax_type_code") or ""), "amount": round(self._parse_float(t.get("monetary_amount")), 2)}
+                    for t in (summary.get("tax_information") or []) if isinstance(t, dict)],
+            "vendor_number":    str((heading.get("remit_to") or {}).get("identification_code") or heading.get("vendor_id") or ""),
+            "gst_registration": str(heading.get("goods_and_service_tax_registration_number") or ""),
         }
 
     @staticmethod

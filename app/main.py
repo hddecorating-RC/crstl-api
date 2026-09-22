@@ -409,6 +409,16 @@ def set_auto_digest(body: AutoDigestToggle) -> dict:
     return {"auto_enabled": body.enabled}
 
 
+@app.get("/api/invoice-checks")
+def get_invoice_checks() -> dict:
+    """Read-only preview of the digest's 'invoices to watch in HD's portal' section
+    (app.invoice_checks): what the next digest would show, whether or not the section
+    is enabled. Writes nothing -- the record is only kept once a digest is sent."""
+    chk = accounting._invoice_check_data()
+    chk.pop("current", None)
+    return {"enabled": bool(accounting._invoice_checks_config().get("enabled")), **chk}
+
+
 @app.get("/api/automation")
 def automation_status() -> dict:
     """The scheduled jobs with their on/off state, schedule, next run, and last

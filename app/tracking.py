@@ -82,6 +82,14 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
             sent_at     TEXT NOT NULL,
             resolved_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS invoice_checks (
+            key            TEXT PRIMARY KEY,
+            invoice_number TEXT NOT NULL,
+            issue          TEXT NOT NULL,
+            problem        TEXT,
+            first_seen     TEXT NOT NULL,
+            resolved_at    TEXT
+        );
         CREATE TABLE IF NOT EXISTS dropship_marks (
             shipment_url TEXT PRIMARY KEY,
             po_number    TEXT,
@@ -500,6 +508,45 @@ def open_alert_receipts() -> list[dict]:
     except Exception as exc:
         print(f"WARNING: alerts read failed: {exc}")
         return []
+
+
+def get_invoice_checks() -> dict[str, dict]:
+    """Every invoice-check finding ever recorded (app.invoice_checks), keyed by
+    'invoice_number:issue'. Open rows have resolved_at None."""
+    try:
+        with contextlib.closing(_connect()) as conn:
+            rows = conn.execute("SELECT key, invoice_number, issue, problem, first_seen, resolved_at FROM invoice_checks").fetchall()
+        return {r[0]: {"key": r[0], "invoice_number": r[1], "issue": r[2], "problem": r[3],
+                       "first_seen": r[4], "resolved_at": r[5]} for r in rows}
+    except Exception as exc:
+        print(f"WARNING: invoice_checks read failed: {exc}")
+        return {}
+
+
+def sync_invoice_checks(current: list[dict]) -> None:
+    """Record today's findings AFTER the digest that showed them went out: a new (or
+    reopened) finding gets first_seen = now, an open one keeps its date, and an open
+    finding no longer present is resolved. `current` = [{key, invoice_number, issue,
+    problem}]. The caller must not pass an empty list because the invoice data failed
+    to load -- that would clear every open finding."""
+    now = datetime.now(timezone.utc).isoformat()
+    keys = [c["key"] for c in current]
+    try:
+        with contextlib.closing(_connect()) as conn:
+            with conn:
+                for c in current:
+                    conn.execute(
+                        "INSERT INTO invoice_checks (key, invoice_number, issue, problem, first_seen) VALUES (?, ?, ?, ?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET problem = excluded.problem, "
+                        "first_seen = CASE WHEN invoice_checks.resolved_at IS NULL THEN invoice_checks.first_seen ELSE excluded.first_seen END, "
+                        "resolved_at = NULL",
+                        (c["key"], c["invoice_number"], c["issue"], c.get("problem"), now))
+                open_keys = [r[0] for r in conn.execute("SELECT key FROM invoice_checks WHERE resolved_at IS NULL")]
+                for k in open_keys:
+                    if k not in keys:
+                        conn.execute("UPDATE invoice_checks SET resolved_at = ? WHERE key = ?", (now, k))
+    except Exception as exc:
+        print(f"ERROR: invoice_checks write failed: {exc}")
 
 
 def record_shipstation_mark(order_id: str, order_number: str | None, tracking: str | None,

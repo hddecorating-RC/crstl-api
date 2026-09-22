@@ -19,7 +19,7 @@ from app.report import (
 from app.automation import AUTO_DIGEST_SETTING, AUTO_NS_EXPORT_SETTING, AUTO_NS_PUSH_SETTING
 from app.crstl_cache import _MOCK_PO_PROVINCES, _cache, _cache_lock
 from app.finale_jobs import _EMPTY_RECON
-from app import automation, crstl_cache, finale_jobs
+from app import automation, crstl_cache, finale_jobs, invoice_checks
 
 
 _netsuite_state: dict = {"last_generated": None, "path": None, "count": 0, "skipped": 0, "error": None, "generating": False}
@@ -395,8 +395,103 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
     return h
 
 
+def _invoice_checks_config() -> dict:
+    return load_refs().get("invoice_checks") or {}
+
+
+def _invoice_check_data() -> dict:
+    """The digest's 'invoices to watch in HD's portal' section, computed READ-ONLY:
+    today's findings (app.invoice_checks) set against the tracking.db record, which
+    is only written after the digest that showed them went out (sync_invoice_checks).
+    Per 'reports state what happened': a finding first seen since the last digest is
+    NEW, an older one is shown with the date it was first noted, and one that has
+    gone away since the last digest is listed as cleared."""
+    cfg = _invoice_checks_config()
+    floor = str(cfg.get("created_after") or "")
+    if not crstl_cache._cache_loaded():
+        # Never compare against an empty list: that would read as "everything cleared".
+        return {"unavailable": True, "rows": [], "cleared": [], "current": None, "created_after": floor}
+    with _cache_lock:
+        invoices = list(_cache["invoices"])
+    result = invoice_checks.check_all(invoices, floor)
+    existing = tracking.get_invoice_checks()
+    since_iso = _last_digest_sent_at()
+    since = _parse_iso(since_iso)
+    current, by_inv = [], {}
+    for num, v in result["results"].items():
+        inv = v["invoice"]
+        entry = by_inv.setdefault(num, {
+            "invoice_number": num, "po_number": inv.get("po_number"),
+            "channel": "DSD" if invoice_checks.channel_of(inv) == "dsd" else "Dropship",
+            "province": inv.get("province") or "", "sent": _et(inv.get("created_at"))[:10],
+            "total": inv.get("total_amount"), "problems": [], "outcomes": [], "new": False, "first_seen": None,
+            "draft_note": (f"A corrected version was drafted {_et(v['draft_at'])[:10]} but not sent" if v["draft_at"] else "")})
+        for x in v["issues"]:
+            key = f"{num}:{x['issue']}"
+            current.append({"key": key, "invoice_number": num, "issue": x["issue"], "problem": x["problem"]})
+            entry["problems"].append(x["problem"])
+            if x["outcome"] not in entry["outcomes"]:
+                entry["outcomes"].append(x["outcome"])
+            row = existing.get(key)
+            if not row or row.get("resolved_at"):
+                entry["new"] = True
+            else:
+                entry["first_seen"] = min(entry["first_seen"] or row["first_seen"], row["first_seen"])
+    keys = {c["key"] for c in current}
+    cleared = sorted({r["invoice_number"] for k, r in existing.items()
+                      if not r.get("resolved_at") and k not in keys} - set(by_inv))
+    rows = sorted(by_inv.values(), key=lambda r: (not r["new"], r["sent"], r["invoice_number"]))
+    recent = [i for i in result["latest"] if since is None or (_parse_iso(i.get("created_at")) or since) > since]
+    return {"unavailable": False, "rows": rows, "cleared": cleared, "current": current,
+            "checked": result["checked"], "sent_since_last": len(recent), "since": since_iso,
+            "dropship_without_gst": result["dropship_without_gst"], "created_after": floor}
+
+
+def _invoice_check_html(chk: dict) -> str:
+    """An FYI, not an alarm (Ritchie, 2026-09-22): muted colours, 'may' wording, at the
+    bottom of the digest, subject line untouched."""
+    head = ('<h3 style="color:#1f3a5f;font-weight:normal;margin:24px 0 4px">'
+            "For reference: invoices to watch in HD's portal</h3>")
+    muted = 'style="color:#555;font-size:13px;margin:4px 0 8px"'
+    if chk.get("unavailable"):
+        return head + f"<p {muted}>Not checked today: the invoice data did not load.</p>"
+    rows, cleared = chk["rows"], chk["cleared"]
+    n_new = sum(1 for r in rows if r["new"])
+    h = head
+    if not rows:
+        h += (f"<p {muted}>{chk['sent_since_last']} invoice(s) sent since the last digest, checked against HD's "
+              "invoicing rules: nothing to flag.</p>")
+    else:
+        h += (f"<p {muted}>These invoices differ from HD's invoicing rules. Nothing to do now &mdash; if one shows up "
+              "as returned or on hold in HD's portal, this is likely why. "
+              f"{n_new} noted for the first time in this digest, {len(rows) - n_new} noted earlier.</p>")
+        cell = lambda v: f'<td valign="top">{html.escape(str(v if v not in (None, "") else "—"))}</td>'
+        body = ""
+        for r in rows:
+            what = "<br>".join(html.escape(p) for p in r["problems"])
+            if r["draft_note"]:
+                what += f'<br><span style="color:#777">{html.escape(r["draft_note"])}</span>'
+            noted = "New" if r["new"] else f"Since {_et(r['first_seen'])[:10]}"
+            body += ("<tr>" + cell(r["invoice_number"]) + cell(r["po_number"]) + cell(f"{r['channel']} · {r['province']}")
+                     + cell(r["sent"]) + f'<td valign="top" align="right">${(r["total"] or 0):,.2f}</td>'
+                     + f'<td valign="top">{what}</td>' + cell("; ".join(r["outcomes"])) + cell(noted) + "</tr>")
+        h += ('<table cellpadding="5" cellspacing="0" border="1" '
+              'style="border-collapse:collapse;font-size:12px;border-color:#d0d7e2;margin:6px 0 10px">'
+              '<tr style="background:#eef2f7;color:#1f3a5f"><th align="left">Invoice</th><th align="left">PO</th>'
+              '<th align="left">Channel</th><th align="left">Sent</th><th align="right">Total</th>'
+              "<th align=\"left\">What's different</th><th align=\"left\">HD may</th><th align=\"left\">Noted</th></tr>"
+              + body + "</table>")
+    if cleared:
+        h += f"<p {muted}>Cleared since the last digest (now match HD's rules): {html.escape(', '.join(cleared))}.</p>"
+    if chk.get("dropship_without_gst"):
+        h += (f"<p {muted}>Also: dropship invoices don't include our GST/HST registration number yet, "
+              "so HD may hold the tax on them.</p>")
+    return h
+
+
 def _so_digest_workbook(new_sos: list[dict], so_map: dict, finale_map: dict | None = None,
-                        finale_rows: list[dict] | None = None, nonedi: list[dict] | None = None) -> bytes:
+                        finale_rows: list[dict] | None = None, nonedi: list[dict] | None = None,
+                        check_rows: list[dict] | None = None) -> bytes:
     """The accounting Excel: the SAME export workbook (built from the 810s, so the
     figures match the Export button exactly) PLUS a 'Netsuite SO created' column whose
     cell links straight to each SO. so_map is {invoice_number: (created_date, so_url)}.
@@ -482,6 +577,23 @@ def _so_digest_workbook(new_sos: list[dict], so_map: dict, finale_map: dict | No
         for c, w in zip("ABCDEFGHI", (16, 14, 18, 20, 10, 13, 13, 14, 60)):
             fs.column_dimensions[c].width = w
         fs.auto_filter.ref = f"A1:I{max(fs.max_row, 1)}"
+    if check_rows:
+        cs = wb.create_sheet("Invoices to watch")
+        heads = ["Invoice", "PO", "Channel", "Province", "Sent", "Total", "What's different", "HD may", "Noted"]
+        cs.append(heads)
+        for c in range(1, len(heads) + 1):
+            hc = cs.cell(row=1, column=c)
+            hc.fill = PatternFill("solid", fgColor="EEF2F7"); hc.font = Font(bold=True, color="1F3A5F", size=10)
+        for r in check_rows:
+            what = "; ".join(r["problems"]) + (f" ({r['draft_note']})" if r.get("draft_note") else "")
+            cs.append([r["invoice_number"], r["po_number"], r["channel"], r["province"], r["sent"], r["total"], what,
+                       "; ".join(r["outcomes"]), "New" if r["new"] else f"Since {_et(r['first_seen'])[:10]}"])
+        for c, w in zip("ABCDEFGHI", (16, 12, 10, 9, 11, 12, 70, 28, 14)):
+            cs.column_dimensions[c].width = w
+        for row in cs.iter_rows(min_row=2):
+            row[5].number_format = "#,##0.00"
+            row[6].alignment = Alignment(wrap_text=True, vertical="top")
+        cs.auto_filter.ref = f"A1:I{cs.max_row}"
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -511,10 +623,15 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
     if n_issues:
         subject += f" · {n_issues} issue(s)"
     body_html = _so_digest_html(data, rows)
+    # FYI section at the BOTTOM, subject untouched (config invoice_checks.enabled).
+    checks = _invoice_check_data() if _invoice_checks_config().get("enabled") else None
+    if checks is not None:
+        body_html += _invoice_check_html(checks)
+    check_rows = (checks or {}).get("rows") or None
 
     attachments = None
     finale_rows = recon.get("rows") if data.get("finale_enabled") else None
-    if data["new_sos"] or finale_rows or data.get("nonedi"):
+    if data["new_sos"] or finale_rows or data.get("nonedi") or check_rows:
         finale_by_inv = {str(i.get("invoice_number")): (f.get("invoice_id_user") or f.get("invoice_id") or "", f.get("status") or "",
                                                         f.get("created_by"), f.get("delta"))
                          for i in data["new_sos"]
@@ -523,7 +640,7 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
                         _so_digest_workbook(data["new_sos"], data["so_map"],
                                             finale_by_inv if (data.get("finale_enabled") or finale_by_inv) else None,
                                             finale_rows=(finale_rows if (finale_rows is not None or data.get("nonedi")) else None),
-                                            nonedi=data.get("nonedi")),
+                                            nonedi=data.get("nonedi"), check_rows=check_rows),
                         XLSX_MEDIA_TYPE)]
 
     # Send FIRST; only mark reported once the mail is away, so a send failure leaves
@@ -532,9 +649,12 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
     reported_ids = [str(i["transaction_id"]) for i in data["new_sos"]]
     if reported_ids:
         tracking.record_events(reported_ids, "so_digest")
+    # Only now that the digest showing them is away: today's findings become "noted".
+    if checks is not None and not checks.get("unavailable"):
+        tracking.sync_invoice_checks(checks["current"])
 
     return {"sent_to": recipients, "count": n, "gaps": len(data["gaps"]),
-            "subject": subject, "mode": "so_digest"}
+            "to_watch": len(check_rows or []), "subject": subject, "mode": "so_digest"}
 
 
 def _auto_digest_enabled() -> bool:

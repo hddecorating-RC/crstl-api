@@ -81,6 +81,8 @@
     "CA-S-QST": "476",
     "CA-S-Sask": "13713"
   },
+  "_comment_invoice_checks": "Digest FYI section (app.invoice_checks, Ritchie 2026-09-22): each accepted 810 created on/after created_after is checked against HD's rules (CMP Vendor Best Practice Document v9-12-2025: VAT matrix, reject codes; discounts per the Backward Calculator with a tolerance for CRSTL's per-discount rounding). Shown at the BOTTOM of the digest as 'invoices to watch in HD's portal' -- muted, 'may' wording, subject untouched: an FYI for accounting, not an alarm. New / noted-earlier / cleared are tracked in tracking.db (invoice_checks), written only after the digest is sent. created_after 2026-09-11 = CRSTL's discount fix; earlier problems are on the Sep 22 summary spreadsheet. enabled=false leaves the digest unchanged; GET /api/invoice-checks previews the section read-only.",
+  "invoice_checks": {"enabled": false, "created_after": "2026-09-11"},
   "_comment_sk_tax": "SK is GST 5% ONLY for HD (2026-09-22): HD Canada is PST-exempt on merchandise bought for resale -- CMP Vendor Best Practice Document v9-12-2025 p.13 (ED41P) and the p.23 VAT matrix (SK = D360 GST 5%). The 11% GST+PST mapping (CA-S-Sask 13713, 2026-09-14) drew E995 rejects on six SK invoices. CA-S-Sask stays in tax_code_ids but nothing maps to it.",
   "_comment_class": "NetSuite classification for HD Canada revenue = STOCK-PRODUCTS (id 7), created 2026-09-14. Distinguishes HD Canada stock products from OMIS cutdown (class 5 = OMIS-3DIF, which we must NOT reuse). Applied to the SO header (and invoice, if that path is ever used). Verified read-only: active, top-level; behaves like class 5 which is live on real SOs.",
   "class_id": "7",
