@@ -112,43 +112,44 @@ def test_tolerance_absorbs_cent_rounding():
 
 
 # ── Accounting's rate sheet, 2026-09-03 ──────────────────────────────────────
-# Transcribed from the sheet itself, not from the code it checks. These are the
-# rates we charge HD, which is not the same as the rates each province levies:
-# BC levies PST at 7% and we do not charge it, so BC is GST-only here.
+# Transcribed from HD's VAT matrix (CMP Vendor Best Practice Document v9-12-2025,
+# p.23), not from the code it checks. These are the rates HD pays, which is not
+# the same as the rates each province levies: HD is PST-exempt on resale, so BC
+# and SK are GST-only here although both levy PST.
 RATE_SHEET = {
     "AB": ("GST", 0.05),      "BC": ("GST", 0.05),      "MB": ("GST", 0.05),
     "NT": ("GST", 0.05),      "NU": ("GST", 0.05),      "YT": ("GST", 0.05),
-    "SK": ("GST+PST", 0.11),  "ON": ("HST", 0.13),      "NS": ("HST", 0.14),
+    "SK": ("GST", 0.05),      "ON": ("HST", 0.13),      "NS": ("HST", 0.14),
     "NB": ("HST", 0.15),      "NL": ("HST", 0.15),      "PE": ("HST", 0.15),
     "QC": ("GST+QST", 0.14975),
 }
 
 
 def test_rate_table_matches_accountings_sheet():
-    """Pinned to the sheet so a rate change has to be a deliberate edit here.
-    SK sat at 5% for months because nothing compared the two."""
+    """Pinned to HD's matrix so a rate change has to be a deliberate edit here.
+    SK sat at 11% for a week of E995 rejects because the rate came from our own
+    sheet, not HD's."""
     from app.crstl_cache import _PROVINCE_TAX_RATES
     assert _PROVINCE_TAX_RATES == RATE_SHEET
 
 
-def test_saskatchewan_residual_matches_gst_plus_pst():
-    """SK is the one province where we charge PST. At the old 5% the residual
-    on an SK invoice matched nothing and the invoice read as unexplained."""
+def test_saskatchewan_residual_matches_gst_only():
+    """SK is GST-only for HD: a 5% residual is what HD pays, so it is offered."""
     inv = _base(province="SK", subtotal=1000.0, discount_amount=0.0,
-                discrepancy=110.0)
+                discrepancy=50.0)
     _annotate_tax_suggestion([inv])
     ts = inv.get("tax_suggestion")
     assert ts is not None
-    assert ts["kind"] == "GST+PST"
-    assert ts["rate"] == 0.11
-    assert ts["amount"] == 110.0
+    assert ts["kind"] == "GST"
+    assert ts["rate"] == 0.05
+    assert ts["amount"] == 50.0
 
 
-def test_saskatchewan_at_gst_only_is_no_longer_suggested():
-    """The mirror of the above: 5% of net on an SK invoice is not what we
-    charge, so it must not be offered as the explanation for a residual."""
+def test_saskatchewan_gst_plus_pst_is_not_suggested():
+    """The mirror: an 11% residual (GST + SK PST) is the error HD rejects with
+    E995, so it must not resolve to a tidy explanation."""
     inv = _base(province="SK", subtotal=1000.0, discount_amount=0.0,
-                discrepancy=50.0)
+                discrepancy=110.0)
     _annotate_tax_suggestion([inv])
     assert inv.get("tax_suggestion") is None
 

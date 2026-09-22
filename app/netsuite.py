@@ -93,7 +93,7 @@ def resolve_customer(invoice: dict, province, store, config: dict | None = None)
         "customer_name": (config.get("customer_names") or {}).get(str(customer_id)),
         "tax_code": mapping["tax_code"],
         "tax_rate": mapping.get("tax_rate", 0),
-        # Compound-tax provinces (QC GST+QST, SK GST+PST) list their component rates
+        # Compound-tax provinces (QC GST+QST) list their component rates
         # so tax is computed the way CRSTL and NetSuite's tax GROUP do -- each
         # component rounded to cents, then summed -- which differs from one combined
         # rate by up to a cent. Single-tax provinces omit it and use tax_rate.

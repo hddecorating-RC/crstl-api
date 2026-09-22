@@ -208,7 +208,7 @@ def push_invoices(
         row["amount_flag"] = amount_flag(row.get("gross"), row["channel"])
         # Reconcile guard: our total should equal CRSTL's 810 total (hd_total).
         # Flag only STRUCTURAL mismatches (> 1 cent) -- a 1c delta is expected on
-        # compound-tax provinces (QC GST+QST, SK GST+PST): CRSTL and NetSuite's tax
+        # compound-tax provinces (QC GST+QST): CRSTL and NetSuite's tax
         # GROUP round each component separately, while our single-rate reconcile
         # rounds the combined rate. The real errors (e.g. a missing PST) are dollars,
         # never a cent, so a 1c tolerance keeps the guard sharp without false alarms.

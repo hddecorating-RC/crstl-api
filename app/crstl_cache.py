@@ -167,16 +167,17 @@ def _attach_provinces(invoices: list[dict], po_provinces: dict[str, dict]) -> No
 # (their UI shows the value; their JSON does not — support ticket filed).
 # Remove this once Crstl exposes TXI in generic_json_edi.
 #
-# Source: accounting's rate sheet, 2026-09-03. These are the rates we charge,
-# not the rates a province levies, and the two differ:
+# Source: HD's VAT matrix -- CMP Vendor Best Practice Document v9-12-2025,
+# p.23 (reference/). These are the rates HD pays, not the rates a province
+# levies: HD Canada is PST-exempt on merchandise bought for resale (p.13,
+# reject ED41P), so no province carries PST here.
 #
-#   SK  we charge PST. 5% GST + 6% PST = 11%.
-#   BC  we do NOT charge PST, so BC is GST-only at 5% even though BC levies
-#       PST at 7%. Dropship 810s have been arriving with an ST segment of 7%
-#       anyway; Crstl has been asked to remove it and the fix may not have
-#       landed yet, so a BC invoice may still read 12% until it does. Leave
-#       this at 5% regardless -- the sheet is what we charge, and moving it to
-#       match the bad data would make the error permanent.
+#   SK  GST-only at 5%. Accounting's 2026-09-03 sheet had GST 5% + PST 6% =
+#       11%; HD rejected six SK invoices billed that way (E995, Sep 1-16).
+#   BC  GST-only at 5% even though BC levies PST at 7%. Dropship 810s arrived
+#       with a 7% ST segment for a while; one drew E995 on Sep 1. Leave this at
+#       5% regardless -- moving it to match bad data would make the error
+#       permanent.
 #
 #       Note this table does not reach the workbook. app/report.py reads the
 #       TXI segment HD sent, so a BC invoice carrying the extra 7% reconciles
@@ -184,9 +185,8 @@ def _attach_provinces(invoices: list[dict], po_provinces: dict[str, dict]) -> No
 #       reports what was transmitted and does not check it against a rate.
 #       This table only feeds the dashboard's Suggested Tax hint.
 _PROVINCE_TAX_RATES: dict[str, tuple[str, float]] = {
-    "AB": ("GST", 0.05),   "BC": ("GST", 0.05),   "MB": ("GST", 0.05),
+    "AB": ("GST", 0.05),   "BC": ("GST", 0.05),   "MB": ("GST", 0.05),   "SK": ("GST", 0.05),
     "YT": ("GST", 0.05),   "NT": ("GST", 0.05),   "NU": ("GST", 0.05),
-    "SK": ("GST+PST", 0.11),
     "ON": ("HST", 0.13),
     "NB": ("HST", 0.15),   "NL": ("HST", 0.15),   "PE": ("HST", 0.15),
     "NS": ("HST", 0.14),   # config sets NS at 14% — trust the config

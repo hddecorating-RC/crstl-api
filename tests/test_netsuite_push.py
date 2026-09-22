@@ -452,7 +452,7 @@ def test_skips_on_external_id_type_conflict():
 
 
 def test_reconcile_flag_ignores_penny_rounding():
-    """A <=1c delta (compound-tax component rounding: QC GST+QST, SK GST+PST) is NOT
+    """A <=1c delta (compound-tax component rounding: QC GST+QST) is NOT
     flagged; only structural (>1c) mismatches are."""
     inv = {"transaction_id": "T-1C", "source_document_id": "S-1C", "invoice_number": "INV1C",
            "product": "Drape Panel", "status": "Accepted", "po_number": "PO1C",
