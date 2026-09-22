@@ -84,7 +84,10 @@ def build_csv(invoices: list[dict], ids: list[str] | None = None) -> bytes:
         # pivot by tax kind without post-processing the CSV.
         tb = inv.get("tax_breakdown") or {}
         row["Tax GST"]     = tb.get("GST", "")
-        row["Tax HST/QST"] = tb.get("HST_QST", "")
+        # One combined column, as before, so the CSV layout does not change; the
+        # classifier now tells HST (H770) and QST (H680) apart.
+        hst_qst = round((tb.get("HST") or 0) + (tb.get("QST") or 0), 2)
+        row["Tax HST/QST"] = hst_qst if ("HST" in tb or "QST" in tb) else ""
         row["Tax Eco"]     = tb.get("ECO", "")
         # Suggested-tax columns — blank unless the residual matched a province rate.
         ts = inv.get("tax_suggestion")

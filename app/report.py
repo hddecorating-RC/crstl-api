@@ -17,7 +17,7 @@ reach the total:
 
 Tax reaches us by two routes depending on the flavor, and both are read:
 
-    Dropship / Wholesale   tax_information (TXI)   CG=GST  ST=QST  VA=HST
+    Dropship / Wholesale   tax_information (TXI)   CG=GST  VA=HST  ST=QST in QC, PST elsewhere
     DSD                    SAC codes               D360=GST  H680=QST
                                                    H770=HST  H850=ECO
 
@@ -56,6 +56,13 @@ num = CrstlClient._parse_float             # strips thousands separators
 # GST On Goods"; these readings come from Crstl and from HD, not from matching
 # amounts against province rates.
 TXI_KIND = {"CG": "GST", "ST": "QST", "VA": "HST"}
+# ST is provincial sales tax generically: QST in Quebec, PST anywhere else (it was
+# read at 7% on BC and 6% on SK -- both PST HD does not pay; CMP doc p.13/p.23).
+
+
+def txi_kind(code, province):
+    kind = TXI_KIND.get(code) or code or "(no code)"
+    return "PST" if kind == "QST" and province != "QC" else kind
 SAC_KIND = {"D360": "GST", "H680": "QST", "H770": "HST",
             "H850": "ECO", "F240": "ECO", "G090": "ECO", "G100": "ECO"}
 
@@ -175,7 +182,7 @@ def extract(detail, po_index):
             unknown[code] = round(unknown.get(code, 0) + amt, 2)
 
     for entry in summary.get("tax_information", []) or []:
-        kind = TXI_KIND.get(entry.get("tax_type_code")) or entry.get("tax_type_code") or "(no code)"
+        kind = txi_kind(entry.get("tax_type_code"), province)
         taxes[kind] = round(taxes.get(kind, 0) + num(entry.get("monetary_amount")), 2)
 
     # metadata.value is Crstl's canonical total (app/crstl.py says so); fall

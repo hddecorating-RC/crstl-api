@@ -1107,7 +1107,7 @@ function dashboard() {
     taxBreakdownRows(inv) {
       const tb = inv && inv.tax_breakdown;
       if (!tb) return [];
-      const labels = { GST: 'GST', HST_QST: 'HST / QST', ECO: 'BC Eco Tax', OTHER: 'Other tax' };
+      const labels = { GST: 'GST', HST: 'HST', QST: 'QST', PST: 'PST', ECO: 'BC Eco Tax', OTHER: 'Other tax' };
       return Object.entries(tb)
         .filter(([, v]) => v)
         .map(([k, v]) => ({ label: labels[k] || k, amount: v }));

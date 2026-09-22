@@ -119,3 +119,17 @@ def test_build_csv_emits_per_code_columns():
     assert rows[1]["Special Allowance (H000)"] == "-128.42"
     assert rows[1]["GST Tax (D360)"] == "484.14"
     assert rows[1]["Discount (C300)"] == ""
+
+
+def _tax_column(tax_breakdown):
+    inv = dict(INVOICES[0], tax_breakdown=tax_breakdown)
+    rows = list(csv.DictReader(io.StringIO(build_csv([inv]).decode("utf-8"))))
+    return rows[0]["Tax HST/QST"], rows[0]["Tax GST"]
+
+
+def test_hst_and_qst_still_fill_the_combined_column():
+    """The classifier now tells HST (H770) and QST (H680) apart; the CSV keeps its one
+    combined column so its layout does not change under anyone reading it."""
+    assert _tax_column({"HST": 1658.73}) == ("1658.73", "")
+    assert _tax_column({"GST": 5.0, "QST": 9.98}) == ("9.98", "5.0")
+    assert _tax_column({"GST": 447.93}) == ("", "447.93")

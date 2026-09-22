@@ -84,8 +84,8 @@ def test_extract_invoice_fields():
 
 
 def test_extract_categorizes_sac_codes_per_hd_spec():
-    """Real HD Canada 810 (Ontario dropship): subtotal $48, discount C300 $0.60,
-    HST tax H680 $6.16, total $53.56. Tax comes from the H680 SAC entry
+    """Real HD Canada 810 shape (Ontario): subtotal $48, discount C300 $0.60,
+    HST tax H770 $6.16, total $53.56. Tax comes from the H770 SAC entry
     directly, not derived from total-minus-net."""
     detail = {
         "metadata": {"id": "x", "reference_id": "INV1", "value": 53.56, "state": {"value": "Accepted"}},
@@ -100,7 +100,7 @@ def test_extract_categorizes_sac_codes_per_hd_spec():
                     {"service_promotion_allowance_or_charge_information": {
                         "allowance_or_charge_indicator": "A", "service_promotion_allowance_or_charge_code": "C300", "amount": 0.60}},
                     {"service_promotion_allowance_or_charge_information": {
-                        "allowance_or_charge_indicator": "C", "service_promotion_allowance_or_charge_code": "H680", "amount": 6.16}},
+                        "allowance_or_charge_indicator": "C", "service_promotion_allowance_or_charge_code": "H770", "amount": 6.16}},
                 ],
             },
         }},
@@ -110,8 +110,8 @@ def test_extract_categorizes_sac_codes_per_hd_spec():
     assert result["subtotal"] == 48.0
     assert result["discount_amount"] == 0.60      # C300 classified as discount
     assert result["allowance_amount"] == 0.0
-    assert result["tax_amount"] == 6.16           # H680 classified as HST/QST tax
-    assert result["tax_breakdown"] == {"HST_QST": 6.16}
+    assert result["tax_amount"] == 6.16           # H770 classified as HST tax
+    assert result["tax_breakdown"] == {"HST": 6.16}
     assert result["discrepancy"] == 0.0           # reconciles cleanly
     assert result["freight_amount"] == 0.0
     assert result["fee_amount"] == 0.0
@@ -120,7 +120,7 @@ def test_extract_categorizes_sac_codes_per_hd_spec():
     ac = result["allowances_charges"]
     assert len(ac) == 2
     assert ac[0]["code"] == "C300" and ac[0]["category"] == "discount" and ac[0]["label"] == "Discount"
-    assert ac[1]["code"] == "H680" and ac[1]["category"] == "tax"      and ac[1]["label"] == "HST/QST Tax"
+    assert ac[1]["code"] == "H770" and ac[1]["category"] == "tax"      and ac[1]["label"] == "HST Tax"
 
 
 def test_extract_wholesale_invoice_multiple_categories():
@@ -337,3 +337,44 @@ def test_a_few_missing_pos_are_looked_up_by_po_not_by_listing_every_850():
         listing.assert_not_called()
         client.fetch_po_provinces(only_pos=[f"PO-{i}" for i in range(25)])     # many: one listing is cheaper
         listing.assert_called_once_with(transaction_type="850")
+
+
+def _sac_detail(total, lines, sacs):
+    """A minimal 810 detail: lines = [(qty, price)], sacs = [(indicator, code, amount)]."""
+    return {
+        "metadata": {"id": "x", "reference_id": "INV1", "value": total, "state": {"value": "Accepted"}},
+        "file": {"generic_json_edi": {
+            "heading": {"invoice_date": "2026-09-15"},
+            "detail": {"baseline_item_data_invoice_loop": [
+                {"baseline_item_data_invoice": {"line_item_number": str(10 * (n + 1)), "quantity_invoiced": str(q), "unit_price": str(p)}}
+                for n, (q, p) in enumerate(lines)]},
+            "summary": {
+                "total_monetary_value_summary": {"total_amount": total},
+                "service_promotion_allowance_or_charge_information_loop": [
+                    {"service_promotion_allowance_or_charge_information": {
+                        "allowance_or_charge_indicator": ind, "service_promotion_allowance_or_charge_code": code, "amount": amt}}
+                    for ind, code, amt in sacs],
+            },
+        }},
+    }
+
+
+def test_vaughan_hst_h770_is_tax_not_a_fee():
+    """INV40864289 (Vaughan DSD, 2026-09-15): gross 13,601.24, allowances 841.75, H770 HST
+    1,658.73, total 14,418.22. H770 was unmapped until 2026-09-22 and landed under Fees."""
+    detail = _sac_detail(14418.22, [(1, 13601.24)], [
+        ("A", "I170", 68.01), ("A", "H000", 170.02), ("A", "E210", 467.71), ("A", "H090", 136.01),
+        ("C", "H770", 1658.73)])
+    result = CrstlClient(base_url="https://api.crstl.so/v2", api_key="ct_live_test")._extract_invoice_fields(detail)
+    assert result["tax_amount"] == 1658.73
+    assert result["tax_breakdown"] == {"HST": 1658.73}
+    assert result["fee_amount"] == 0.0
+    assert result["discrepancy"] == 0.0
+
+
+def test_quebec_splits_into_gst_and_qst():
+    """Quebec is the one two-line province: D360 GST 5% + H680 QST 9.975% on the net."""
+    detail = _sac_detail(114.98, [(1, 100.0)], [("C", "D360", 5.0), ("C", "H680", 9.98)])
+    result = CrstlClient(base_url="https://api.crstl.so/v2", api_key="ct_live_test")._extract_invoice_fields(detail)
+    assert result["tax_breakdown"] == {"GST": 5.0, "QST": 9.98}
+    assert result["tax_amount"] == 14.98

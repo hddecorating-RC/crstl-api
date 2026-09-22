@@ -5,7 +5,9 @@ def test_known_tax_codes_classified_as_tax_with_kind():
     assert classify("D360", "C")["category"] == "tax"
     assert classify("D360", "C")["tax_kind"] == "GST"
     assert classify("H680", "C")["category"] == "tax"
-    assert classify("H680", "C")["tax_kind"] == "HST_QST"
+    assert classify("H680", "C")["tax_kind"] == "QST"
+    assert classify("H770", "C")["category"] == "tax"
+    assert classify("H770", "C")["tax_kind"] == "HST"
     assert classify("H850", "C")["category"] == "tax"
     assert classify("H850", "C")["tax_kind"] == "ECO"
 

@@ -1,8 +1,10 @@
 """EDI 810 SAC (Service/Promotion/Allowance/Charge) code classification.
 
 Source of truth: Home Depot Canada 810 Invoice Specification v6.10 (2010-06-21),
-pages 32–33. Where HD annotates a standard X12 code with a specific business use
-(e.g. D360 = "GST Charge" for AB/MB/QC/SK/etc.), we use HD's business name.
+pages 32–33, EXCEPT the tax codes: those follow HD's current VAT matrix, CMP Vendor
+Best Practice Document v9-12-2025 p.23 (reference/). The 2010 spec's province lists
+predate BC leaving HST and PEI joining it, and it had no H770. Where HD annotates a
+standard X12 code with a specific business use, we use HD's business name.
 
 Categories:
   allowance — indicator "A", reduces invoice net (deductions we grant HD)
@@ -45,10 +47,15 @@ CODE_META: dict[str, dict] = {
     "H400": {"label": "Drop Charge",               "category": "fee"},
 
     # ── Taxes (indicator C) — HD-annotated meanings ─────────────────────────
-    # D360: GST charge for AB, MB, NT, NU, PE, QC, SK, YT (5% GST)
+    # D360: GST 5% -- AB, BC, MB, NT, NU, SK, YT, and the GST line on Quebec invoices.
+    #       No PST anywhere: HD is PST-exempt on resale (CMP doc p.13, reject ED41P).
     "D360": {"label": "GST Tax",                   "category": "tax", "tax_kind": "GST"},
-    # H680: QST/HST charge for QC, BC, NB, NL, NS, ON (varies 12-15%)
-    "H680": {"label": "HST/QST Tax",               "category": "tax", "tax_kind": "HST_QST"},
+    # H770: HST -- ON 13%, NB/NL/PE 15%, NS 14% (since 2025-04-01). Until 2026-09-22 this
+    #       was unmapped and read as a FEE, so Vaughan's HST showed under Fees.
+    "H770": {"label": "HST Tax",                   "category": "tax", "tax_kind": "HST"},
+    # H680: QST 9.975%, Quebec ONLY, always alongside D360. Anywhere else HD rejects the
+    #       invoice (E995) -- which is how SK PST sent as H680 was caught.
+    "H680": {"label": "QST Tax",                   "category": "tax", "tax_kind": "QST"},
     # H850, F240, G090, G100: BC ECO Tax at different container sizes
     "F240": {"label": "BC Eco Tax (≤250ml)",       "category": "tax", "tax_kind": "ECO"},
     "G090": {"label": "BC Eco Tax (250ml–1L)",     "category": "tax", "tax_kind": "ECO"},
