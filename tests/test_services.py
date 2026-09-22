@@ -229,7 +229,7 @@ def test_the_finale_worker_registers_its_poll_and_its_own_cache_refresh():
     sched = MagicMock()
     schedule.register(sched, schedule.WORKERS["finale"])
     ids = {c.kwargs["id"]: c.args[1] for c in sched.add_job.call_args_list}
-    assert ids == {"finale_push": "interval", "finale_cache_refresh": "cron"}
+    assert ids == {"finale_push": "cron", "finale_cache_refresh": "cron"}
 
 
 def test_a_worker_exits_for_systemd_to_retry_while_another_process_has_its_job():
@@ -310,3 +310,37 @@ def test_only_the_poll_uses_the_invoicing_read_shortcut(monkeypatch):
         fin.list_shipments.side_effect = RuntimeError("429")
         finale_jobs._run_finale_push(True, ["t"], None, prefilter=True)
         assert push.call_args.kwargs["shipped_pos"] is None and push.call_args.kwargs["order_status"] is None
+
+
+def test_polls_run_in_warehouse_hours_only():
+    """Ritchie 2026-09-22: the warehouse closes at 5 PM and on weekends, so the Finale
+    poll runs Mon-Fri 06:00-18:45 ET and the order alerts Mon-Fri 07:07-17:52 ET.
+    Checked against APScheduler's own fire times, not just the kwargs."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from apscheduler.triggers.cron import CronTrigger
+    from app import schedule
+
+    et = ZoneInfo("America/Toronto")
+
+    def fires(job_id, start, count):
+        _, kind, opts = schedule.JOBS[job_id]
+        assert kind == "cron"
+        trig = CronTrigger(**{k: v for k, v in opts.items() if k not in ("misfire_grace_time", "coalesce")})
+        out, prev, now = [], None, start
+        for _ in range(count):
+            nxt = trig.get_next_fire_time(prev, now)
+            out.append(nxt.astimezone(et))
+            prev, now = nxt, nxt
+        return out
+
+    # Friday 2026-09-25: the Finale poll's last run is 18:45, the next is Monday 06:00.
+    finale = fires("finale_push", datetime(2026, 9, 25, 18, 40, tzinfo=et), 2)
+    assert [f.strftime("%a %H:%M") for f in finale] == ["Fri 18:45", "Mon 06:00"]
+    # A weekday: 52 runs (06:00 to 18:45 every 15 min), all inside the window.
+    day = fires("finale_push", datetime(2026, 9, 22, 0, 0, tzinfo=et), 52)
+    assert day[0].strftime("%H:%M") == "06:00" and day[-1].strftime("%H:%M") == "18:45"
+    assert {f.date() for f in day} == {datetime(2026, 9, 22).date()}
+
+    alerts = fires("order_alerts", datetime(2026, 9, 25, 17, 50, tzinfo=et), 2)
+    assert [f.strftime("%a %H:%M") for f in alerts] == ["Fri 17:52", "Mon 07:07"]

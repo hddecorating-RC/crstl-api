@@ -34,12 +34,12 @@ AUTOMATION_JOBS = [
     {"id": "daily_refresh", "label": "Invoice sync (Crstl)", "schedule": "Daily · 4:45 AM ET",   "setting": AUTO_SYNC_SETTING,    "default": "true"},
     {"id": "netsuite_push", "label": "NetSuite auto-push",   "schedule": "Mon–Fri · 5:00 AM ET", "setting": AUTO_NS_PUSH_SETTING, "default": "false"},
     {"id": "daily_digest",  "label": "Daily digest email",   "schedule": "Mon–Fri · 7:15 AM ET", "setting": AUTO_DIGEST_SETTING,  "default": "true"},
-    {"id": "finale_push",   "label": "Finale invoicing",     "schedule": "Every 15 min",         "setting": AUTO_FINALE_SETTING,  "default": "false"},
+    {"id": "finale_push",   "label": "Finale invoicing",     "schedule": "Mon–Fri · every 15 min · 6:00 AM–6:45 PM ET", "setting": AUTO_FINALE_SETTING,  "default": "false"},
     # Not its own scheduler job: it is the third pass of finale_push (runs_with),
     # so its next run is that job's, and it is silent whenever that job is off.
-    {"id": "finale_dsd",    "label": "DSD pickup numbers → Finale (PRO / RTS)", "schedule": "Every 15 min · inside Finale invoicing",
+    {"id": "finale_dsd",    "label": "DSD pickup numbers → Finale (PRO / RTS)", "schedule": "Mon–Fri · 6:00 AM–6:45 PM ET · inside Finale invoicing",
      "setting": AUTO_DSD_SETTING, "default": "false", "runs_with": "finale_push"},
-    {"id": "order_alerts",  "label": "Order alerts email",   "schedule": "Mon–Fri · every 15 min", "setting": AUTO_ALERTS_SETTING, "default": "true"},
+    {"id": "order_alerts",  "label": "Order alerts email",   "schedule": "Mon–Fri · every 15 min · 7:07 AM–5:52 PM ET", "setting": AUTO_ALERTS_SETTING, "default": "true"},
 ]
 _JOB_BY_ID = {j["id"]: j for j in AUTOMATION_JOBS}
 

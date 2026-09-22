@@ -1249,7 +1249,8 @@ def test_alerts_job_skips_weekends_but_the_endpoint_still_runs(client):
 def test_alerts_job_is_scheduled_on_its_own(monkeypatch, tmp_path):
     jobs = _scheduled_jobs(monkeypatch, tmp_path)
     job = jobs["order_alerts"]
-    assert job["trigger"] == "interval" and job["minutes"] == 15
+    assert job["trigger"] == "cron" and job["day_of_week"] == "mon-fri"
+    assert (job["hour"], job["minute"], job["timezone"]) == ("7-17", "7,22,37,52", "America/Toronto")
     from app.alert_jobs import _run_alerts_job
     from app.automation import AUTOMATION_JOBS
     assert any(j["id"] == "order_alerts" and j["default"] == "true" and "runs_with" not in j for j in AUTOMATION_JOBS)

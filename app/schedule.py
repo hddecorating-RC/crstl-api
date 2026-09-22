@@ -20,7 +20,6 @@ digest once went out twice (07:15 and 07:19).
 import fcntl
 import importlib
 import os
-from datetime import datetime, timedelta, timezone
 
 from app import tracking
 
@@ -50,16 +49,25 @@ JOBS: dict[str, tuple[str, str, dict]] = {
     "daily_digest": ("app.accounting:_run_daily_digest_job", "cron",
                      dict(day_of_week="mon-fri", hour=7, minute=15, timezone=TORONTO,
                           misfire_grace_time=3600, coalesce=True)),
-    # Finale invoicing poll -- every 15 minutes. HD accepts the 810 a median 6 min
-    # after the ship, so this lands the Finale invoice + order completion ~15-20 min
-    # after shipping with exact 810 cents. Cheap when idle (one CRSTL list call). OFF
-    # unless config finale.enabled AND the dashboard toggle are both on.
-    "finale_push": ("app.finale_jobs:_run_finale_push_job", "interval",
-                    dict(minutes=15, misfire_grace_time=600, coalesce=True)),
-    # Order alerts -- every 15 minutes, its own job (see alert_jobs._run_alerts_job).
-    # Offset 7 minutes from the Finale poll so the two don't hit CRSTL and Finale at once.
-    "order_alerts": ("app.alert_jobs:_run_alerts_job", "interval",
-                     dict(minutes=15, misfire_grace_time=600, coalesce=True, offset_minutes=7)),
+    # Finale invoicing poll -- every 15 minutes, WAREHOUSE HOURS ONLY (Ritchie,
+    # 2026-09-22): Mon-Fri 06:00-18:45 ET. Every pass reacts to warehouse work (a
+    # shipment, a label, an 810 minutes after a ship) and the warehouse closes at 5 PM
+    # and on weekends, so off-hours polls had nothing to do -- and automated writes to
+    # Finale/ShipStation now only happen while someone is around. The tail to 18:45
+    # catches the end-of-day Ship clicks and the 810s that follow (HD accepts a median
+    # 6 min after the ship; pickups are requested before 4 PM). 06:00 clears overnight
+    # CRSTL work before the 7:15 digest and before any DSD truck can arrive. Weekend and
+    # overnight gaps are safe: every lookback is days (3-9), and the first run of the
+    # day catches up. OFF unless config finale.enabled AND the dashboard toggle are on.
+    "finale_push": ("app.finale_jobs:_run_finale_push_job", "cron",
+                    dict(day_of_week="mon-fri", hour="6-18", minute="0,15,30,45", timezone=TORONTO,
+                         misfire_grace_time=600, coalesce=True)),
+    # Order alerts -- every 15 minutes while someone can act on them: Mon-Fri
+    # 07:07-17:52 ET, its own job (see alert_jobs._run_alerts_job). The :07 offset keeps
+    # it off the Finale poll's minute so the two don't hit CRSTL and Finale at once.
+    "order_alerts": ("app.alert_jobs:_run_alerts_job", "cron",
+                     dict(day_of_week="mon-fri", hour="7-17", minute="7,22,37,52", timezone=TORONTO,
+                          misfire_grace_time=600, coalesce=True)),
     # The Finale worker's own 4:45 refresh: its CRSTL cache is its own, not the web
     # app's. Not an Automation-panel job (daily_refresh is the one shown).
     "finale_cache_refresh": ("app.crstl_cache:_run_worker_refresh", "cron",
@@ -126,15 +134,10 @@ def release(held: dict[str, int]) -> None:
     held.clear()
 
 
-def register(scheduler, job_ids, now: datetime | None = None) -> None:
+def register(scheduler, job_ids) -> None:
     """Add these jobs to the scheduler, resolving each function only now -- a worker
     imports just the modules its own jobs need."""
-    now = now or datetime.now(timezone.utc)
     for jid in job_ids:
         target, trigger, options = JOBS[jid]
-        options = dict(options)
-        offset = options.pop("offset_minutes", None)
-        if offset:
-            options["next_run_time"] = now + timedelta(minutes=offset)
         module, name = target.split(":")
-        scheduler.add_job(getattr(importlib.import_module(module), name), trigger, id=jid, **options)
+        scheduler.add_job(getattr(importlib.import_module(module), name), trigger, id=jid, **dict(options))
