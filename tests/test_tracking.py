@@ -164,6 +164,7 @@ def test_write_health_captures_failure_and_clears_on_recovery(db_path, monkeypat
     def broken_connect():
         raise sqlite3.OperationalError("disk I/O error")
     import sqlite3
+    real_connect = tracking._connect
     monkeypatch.setattr(tracking, "_connect", broken_connect)
 
     record_events(["tx-001"], "emailed")  # must not raise
@@ -173,8 +174,11 @@ def test_write_health_captures_failure_and_clears_on_recovery(db_path, monkeypat
     assert h["last_error"].startswith("emailed:")
     assert h["last_error_at"] is not None
 
-    # Recovery — undo the monkeypatch and write again
-    monkeypatch.undo()
+    # Recovery -- put back ONLY the real connection. monkeypatch.undo() also undid the
+    # fixtures' throwaway TRACKING_DB, so this write went to the default .tmp/tracking.db:
+    # into the developer's own database on every run (265 "tx-002 emailed" rows by
+    # 2026-09-22), or failing outright on a clean checkout with no .tmp/.
+    monkeypatch.setattr(tracking, "_connect", real_connect)
     record_events(["tx-002"], "emailed")
     h = write_health()
     assert h["ok"] is True
