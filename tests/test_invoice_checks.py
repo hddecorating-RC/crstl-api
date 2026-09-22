@@ -236,3 +236,23 @@ def test_preview_endpoint_is_read_only(checks_on):
     data = r.json()
     assert data["enabled"] is True and [row["invoice_number"] for row in data["rows"]] == ["INV538909096"]
     assert "current" not in data and tracking.get_invoice_checks() == {}
+
+
+def test_real_config_reaches_the_digest():
+    """No stand-in: the section's settings must come through load_refs(). They once did
+    not, and the live preview checked all history instead of from Sep 11."""
+    from app import accounting
+    cfg = accounting._invoice_checks_config()
+    assert cfg.get("created_after") == "2026-09-11"
+    assert cfg.get("enabled") is False
+
+
+def test_no_start_date_checks_nothing():
+    from app import accounting, tracking
+    from app.crstl_cache import _cache
+    tracking.init_db()
+    with patch("app.accounting._invoice_checks_config", return_value={"enabled": True}), \
+         patch.dict(_cache, {"invoices": [_sk_pst()], "status": "ok"}):
+        chk = accounting._invoice_check_data()
+    assert chk["unavailable"] and chk["rows"] == [] and chk["current"] is None
+    assert "no start date" in accounting._invoice_check_html(chk)

@@ -408,6 +408,10 @@ def _invoice_check_data() -> dict:
     gone away since the last digest is listed as cleared."""
     cfg = _invoice_checks_config()
     floor = str(cfg.get("created_after") or "")
+    if not floor:
+        # Positive scope only: no start date means check nothing, never "all history".
+        return {"unavailable": True, "reason": "no start date (invoice_checks.created_after) configured",
+                "rows": [], "cleared": [], "current": None, "created_after": floor}
     if not crstl_cache._cache_loaded():
         # Never compare against an empty list: that would read as "everything cleared".
         return {"unavailable": True, "rows": [], "cleared": [], "current": None, "created_after": floor}
@@ -454,7 +458,8 @@ def _invoice_check_html(chk: dict) -> str:
             "For reference: invoices to watch in HD's portal</h3>")
     muted = 'style="color:#555;font-size:13px;margin:4px 0 8px"'
     if chk.get("unavailable"):
-        return head + f"<p {muted}>Not checked today: the invoice data did not load.</p>"
+        why = chk.get("reason") or "the invoice data did not load"
+        return head + f"<p {muted}>Not checked today: {html.escape(why)}.</p>"
     rows, cleared = chk["rows"], chk["cleared"]
     n_new = sum(1 for r in rows if r["new"])
     h = head

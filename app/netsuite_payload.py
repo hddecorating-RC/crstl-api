@@ -63,6 +63,8 @@ def load_refs() -> dict:
         "alerts": cfg.get("alerts", {}),
         # Dropship pre-fill (app.dropship): store id, floor, cap, enabled flag.
         "dropship_prefill": cfg.get("dropship_prefill", {}),
+        # Digest invoice checks (app.invoice_checks): enabled flag + created_after floor.
+        "invoice_checks": cfg.get("invoice_checks", {}),
     }
 
 
