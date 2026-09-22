@@ -244,7 +244,7 @@ def test_real_config_reaches_the_digest():
     from app import accounting
     cfg = accounting._invoice_checks_config()
     assert cfg.get("created_after") == "2026-09-11"
-    assert cfg.get("enabled") is False
+    assert cfg.get("enabled") is True         # Ritchie, 2026-09-22, after the preview email
 
 
 def test_no_start_date_checks_nothing():
