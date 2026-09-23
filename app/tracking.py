@@ -82,6 +82,14 @@ def _create_or_migrate(conn: sqlite3.Connection) -> None:
             sent_at     TEXT NOT NULL,
             resolved_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS push_snapshots (
+            key            TEXT PRIMARY KEY,
+            transaction_id TEXT NOT NULL,
+            invoice_number TEXT,
+            target         TEXT NOT NULL,
+            hd_total       REAL,
+            recorded_at    TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS invoice_checks (
             key            TEXT PRIMARY KEY,
             invoice_number TEXT NOT NULL,
@@ -508,6 +516,47 @@ def open_alert_receipts() -> list[dict]:
     except Exception as exc:
         print(f"WARNING: alerts read failed: {exc}")
         return []
+
+
+def record_push_snapshot(transaction_id: str, invoice_number: str | None, target: str, hd_total) -> None:
+    """What the 810 was worth when we sent it to `target` ("netsuite" / "finale").
+
+    CRSTL can edit an ACCEPTED invoice in place, reusing the transaction id (proven
+    2026-09-22: six SK invoices lost their PST that way, after we had pushed them). The
+    push then skips them as already done and NetSuite/Finale keep the old figures
+    silently. This snapshot is what makes that divergence visible. Best-effort."""
+    if not transaction_id or hd_total is None:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with contextlib.closing(_connect()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO push_snapshots (key, transaction_id, invoice_number, target, hd_total, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET hd_total = excluded.hd_total, "
+                    "recorded_at = excluded.recorded_at",
+                    (f"{transaction_id}:{target}", transaction_id, invoice_number, target, float(hd_total), now))
+    except Exception as exc:
+        print(f"ERROR: push_snapshots write failed for {transaction_id}/{target}: {exc}")
+
+
+def get_push_snapshots(transaction_ids: list[str]) -> dict[str, dict]:
+    """{transaction_id: {target: {"hd_total", "recorded_at"}}} for these transactions."""
+    ids = [str(t) for t in transaction_ids if t]
+    if not ids:
+        return {}
+    out: dict[str, dict] = {}
+    try:
+        with contextlib.closing(_connect()) as conn:
+            for chunk in (ids[i:i + 500] for i in range(0, len(ids), 500)):
+                rows = conn.execute(
+                    f"SELECT transaction_id, target, hd_total, recorded_at FROM push_snapshots "
+                    f"WHERE transaction_id IN ({','.join('?' * len(chunk))})", chunk).fetchall()
+                for tx, target, total, at in rows:
+                    out.setdefault(tx, {})[target] = {"hd_total": total, "recorded_at": at}
+    except Exception as exc:
+        print(f"WARNING: push_snapshots read failed: {exc}")
+    return out
 
 
 def get_invoice_checks() -> dict[str, dict]:

@@ -418,6 +418,21 @@ def _invoice_check_data() -> dict:
     with _cache_lock:
         invoices = list(_cache["invoices"])
     result = invoice_checks.check_all(invoices, floor)
+    # Divergence from what we pushed is money in OUR books, so it is checked on every
+    # accepted invoice we ever pushed, not only those inside the HD-rules floor.
+    latest_all = {}
+    for i in invoices:
+        if i.get("status") != "Accepted" or invoice_checks.channel_of(i) is None:
+            continue
+        num = str(i.get("invoice_number") or "")
+        if num and (num not in latest_all or str(i.get("created_at") or "") > str(latest_all[num].get("created_at") or "")):
+            latest_all[num] = i
+    snaps = tracking.get_push_snapshots([str(i["transaction_id"]) for i in latest_all.values()])
+    for num, i in latest_all.items():
+        drift = invoice_checks.changed_after_push(i, snaps.get(str(i["transaction_id"]), {}))
+        if drift:
+            entry = result["results"].setdefault(num, {"invoice": i, "issues": [], "draft_at": None})
+            entry["issues"].extend(drift)
     existing = tracking.get_invoice_checks()
     since_iso = _last_digest_sent_at()
     since = _parse_iso(since_iso)
@@ -484,7 +499,7 @@ def _invoice_check_html(chk: dict) -> str:
               'style="border-collapse:collapse;font-size:12px;border-color:#d0d7e2;margin:6px 0 10px">'
               '<tr style="background:#eef2f7;color:#1f3a5f"><th align="left">Invoice</th><th align="left">PO</th>'
               '<th align="left">Channel</th><th align="left">Sent</th><th align="right">Total</th>'
-              "<th align=\"left\">What's different</th><th align=\"left\">HD may</th><th align=\"left\">Noted</th></tr>"
+              "<th align=\"left\">What's different</th><th align=\"left\">What to do</th><th align=\"left\">Noted</th></tr>"
               + body + "</table>")
     if cleared:
         h += f"<p {muted}>Cleared since the last digest (now match HD's rules): {html.escape(', '.join(cleared))}.</p>"
@@ -584,7 +599,7 @@ def _so_digest_workbook(new_sos: list[dict], so_map: dict, finale_map: dict | No
         fs.auto_filter.ref = f"A1:I{max(fs.max_row, 1)}"
     if check_rows:
         cs = wb.create_sheet("Invoices to watch")
-        heads = ["Invoice", "PO", "Channel", "Province", "Sent", "Total", "What's different", "HD may", "Noted"]
+        heads = ["Invoice", "PO", "Channel", "Province", "Sent", "Total", "What's different", "What to do", "Noted"]
         cs.append(heads)
         for c in range(1, len(heads) + 1):
             hc = cs.cell(row=1, column=c)

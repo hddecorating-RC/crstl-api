@@ -278,6 +278,9 @@ def push_invoices(
                 row["action"] = result.get("action") if isinstance(result, dict) else None
                 if isinstance(result, dict) and eid:
                     tracking.record_netsuite_push(eid, result.get("netsuite_id"), result.get("last_modified"))
+                # What CRSTL said this invoice was worth at push time (see record_push_snapshot).
+                tracking.record_push_snapshot(row["transaction_id"], row.get("invoice_number"),
+                                              "netsuite", row.get("hd_total"))
                 sent += 1
                 pushed_ids.append(row["transaction_id"])
             except NetSuiteNoBaseline as exc:

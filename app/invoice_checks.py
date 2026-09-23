@@ -163,6 +163,32 @@ def check_invoice(inv: dict) -> list[dict]:
     return issues
 
 
+BOOKS = "Our books to correct"
+
+
+def changed_after_push(inv: dict, snaps: dict) -> list[dict]:
+    """The invoice is worth something different now than when we sent it to NetSuite or
+    Finale. CRSTL edits an ACCEPTED invoice in place, keeping the transaction id, so the
+    push sees it as already done and the two systems drift apart in silence -- which is
+    how six SK invoices kept their PST in NetSuite after CRSTL removed it (2026-09-22).
+
+    `snaps` is {target: {"hd_total": float}} for this invoice's transaction."""
+    now = round(float(inv.get("total_amount") or 0), 2)
+    # round the difference itself: 107.15 - 107.14 is a hair over 0.01 in binary floats,
+    # and a cent of rounding is not a change worth reporting.
+    stale = {t: s for t, s in (snaps or {}).items()
+             if s.get("hd_total") is not None and round(abs(round(float(s["hd_total"]), 2) - now), 2) > 0.01}
+    if not stale:
+        return []
+    was = round(float(next(iter(stale.values()))["hd_total"]), 2)
+    where = {"netsuite": "NetSuite", "finale": "Finale"}
+    names = [where.get(t, t) for t in sorted(stale)]
+    listed = " and ".join(names)
+    return [_issue("changed_after_push", f"Amount changed after it was sent to {listed}: "
+                                         f"{_money(was)} -> {_money(now)}",
+                   f"{' + '.join(names)} entr{'ies' if len(names) > 1 else 'y'} to correct")]
+
+
 def _created(inv: dict) -> str:
     return str(inv.get("created_at") or "")
 

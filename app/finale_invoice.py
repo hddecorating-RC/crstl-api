@@ -386,6 +386,7 @@ def push_finale_invoices(
                     tracking.record_finale_invoice(tid, str(row["po_number"]), ext["invoice_id"], ext["invoice_url"],
                                                    ext["invoice_id_user"], "external", created_by=ext["created_by"],
                                                    finale_total=ext["finale_total"], delta=ext["delta"])
+                    tracking.record_push_snapshot(tid, row.get("invoice_number"), "finale", row.get("hd_total"))
                     external_ids.append(tid)
                 return None
             # A lone un-posted draft with no receipt: ours from a half-failed run, or
@@ -493,6 +494,7 @@ def push_finale_invoices(
                                                row["invoice_id_user"], row["status"],
                                                created_by=(created_by(adopt_rec) if adopt_rec is not None else API_LOGIN),
                                                finale_total=row.get("total"), delta=row.get("delta"))
+                tracking.record_push_snapshot(tid, row.get("invoice_number"), "finale", row.get("hd_total"))
                 created_ids.append(tid)
             except Exception as exc:   # one bad invoice must not stop the batch
                 row["status"] = "failed"

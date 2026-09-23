@@ -256,3 +256,59 @@ def test_no_start_date_checks_nothing():
         chk = accounting._invoice_check_data()
     assert chk["unavailable"] and chk["rows"] == [] and chk["current"] is None
     assert "no start date" in accounting._invoice_check_html(chk)
+
+
+# ── an invoice CRSTL changed after we pushed it downstream ─────────────────────
+
+def test_changed_after_push_is_reported_against_what_we_sent():
+    """CRSTL edits an ACCEPTED invoice in place, keeping the transaction id, so the push
+    skips it as already done: six SK invoices lost their PST that way on 2026-09-22 while
+    NetSuite kept the old figure. The snapshot taken at push time is what catches it."""
+    inv = _good("dropship", "SK", 101.40, number="INV538909096", transaction_id="tx-sk")
+    inv["total_amount"] = 101.56
+    assert ic.changed_after_push(inv, {}) == []                                  # never pushed: nothing to say
+    assert ic.changed_after_push(inv, {"netsuite": {"hd_total": 101.56}}) == []   # unchanged since the push
+    one = ic.changed_after_push(inv, {"netsuite": {"hd_total": 107.36}})
+    assert [i["issue"] for i in one] == ["changed_after_push"]
+    assert "sent to NetSuite: $107.36 -> $101.56" in one[0]["problem"]
+    assert one[0]["outcome"] == "NetSuite entry to correct"
+    both = ic.changed_after_push(inv, {"netsuite": {"hd_total": 107.36}, "finale": {"hd_total": 107.36}})
+    assert "sent to Finale and NetSuite" in both[0]["problem"]
+    assert both[0]["outcome"] == "Finale + NetSuite entries to correct"
+
+
+def test_a_cent_of_rounding_is_not_a_change():
+    inv = _good("dropship", "ON", 100.0, transaction_id="tx-1")
+    assert ic.changed_after_push(inv, {"netsuite": {"hd_total": inv["total_amount"] + 0.01}}) == []
+    assert ic.changed_after_push(inv, {"netsuite": {"hd_total": inv["total_amount"] + 0.02}}) != []
+
+
+def test_digest_reports_a_changed_invoice_even_from_before_the_floor(checks_on):
+    """The floor bounds HD's rules; our own books are checked on every pushed invoice,
+    however old -- INV538740348 (Sep 9) is before the Sep 11 floor and still counts."""
+    from app import accounting, tracking
+    from app.crstl_cache import _cache
+    old = _good("dropship", "SK", 55.50, number="INV538740348",
+                created="2026-09-09T15:09:00Z", transaction_id="tx-old")
+    tracking.record_push_snapshot("tx-old", "INV538740348", "netsuite", 60.53)
+    with patch.dict(_cache, {"invoices": [old], "status": "ok"}):
+        chk = accounting._invoice_check_data()
+    row = next(r for r in chk["rows"] if r["invoice_number"] == "INV538740348")
+    assert "changed after it was sent to NetSuite" in row["problems"][0]
+    assert row["outcomes"] == ["NetSuite entry to correct"]
+    html = accounting._invoice_check_html(chk)
+    assert "What to do" in html and "HD may</th>" not in html
+
+
+def test_snapshot_survives_a_repush_and_reads_back_per_target():
+    from app import tracking
+    tracking.init_db()
+    tracking.record_push_snapshot("tx-9", "INV9", "netsuite", 100.00)
+    tracking.record_push_snapshot("tx-9", "INV9", "finale", 100.00)
+    tracking.record_push_snapshot("tx-9", "INV9", "netsuite", 95.00)     # pushed again, newer value wins
+    snaps = tracking.get_push_snapshots(["tx-9", "tx-absent"])
+    assert snaps["tx-9"]["netsuite"]["hd_total"] == 95.00
+    assert snaps["tx-9"]["finale"]["hd_total"] == 100.00
+    assert "tx-absent" not in snaps
+    tracking.record_push_snapshot("tx-10", "INV10", "netsuite", None)    # nothing to record
+    assert "tx-10" not in tracking.get_push_snapshots(["tx-10"])
