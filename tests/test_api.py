@@ -752,10 +752,16 @@ def test_finale_poll_job_gates_refreshes_and_invoices_only_unfinaled(monkeypatch
     from app.crstl_cache import _cache
     from app import tracking
     tracking.init_db()
+    # Dates must be RELATIVE: the poll only auto-pushes invoices created within the last
+    # created_within_days (7), so hardcoded dates silently stop being pushed once they age
+    # out -- this test started failing on 2026-09-23 with fixtures dated 2026-09-15.
+    from datetime import datetime, timedelta, timezone
+    recent = (datetime.now(timezone.utc) - timedelta(days=1))
+    created, inv_date = recent.strftime("%Y-%m-%dT%H:%M:%SZ"), recent.strftime("%Y-%m-%d")
     invs = [{"transaction_id": "a", "source_document_id": "sa", "status": "Accepted", "subtotal": 10,
-             "created_at": "2026-09-15T10:00:00Z", "invoice_date": "2026-09-15"},
+             "created_at": created, "invoice_date": inv_date},
             {"transaction_id": "b", "source_document_id": "sb", "status": "Accepted", "subtotal": 10,
-             "created_at": "2026-09-15T10:00:00Z", "invoice_date": "2026-09-15"}]
+             "created_at": created, "invoice_date": inv_date}]
     with patch("app.finale_jobs._finale_enabled", return_value=False), patch("app.finale_jobs._run_finale_push") as run:
         _run_finale_push_job()
     run.assert_not_called()
