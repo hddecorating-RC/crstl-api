@@ -246,6 +246,36 @@ class CrstlClient:
         """The 850 for this PO number (its reference_id), exactly -- [] if CRSTL has none."""
         return self._fetch_all_transactions("850", reference_id=str(po_number))
 
+    def find_by_reference(self, transaction_type: str, reference_id: str) -> dict | None:
+        """The metadata of the transaction of this type with exactly this reference_id
+        -- an 856's is its ASN number, an 810's its invoice number -- or None. Both
+        carry the 850 they came from in source_document_id, which is what turns a
+        rejected document back into a PO."""
+        rows = self._fetch_all_transactions(transaction_type, reference_id=str(reference_id))
+        return (rows[0].get("metadata") or rows[0]) if rows else None
+
+    def fetch_rejections(self, created_after: str | None = None) -> list[dict]:
+        """HD's 864 error messages -- the ASN and invoice rejections -- as
+        [{"id", "created_at", "detail"}], newest first, for the window.
+
+        `detail` is None when CRSTL has no mapping for the document (it answers 400,
+        as it still does for the 846 inventory feed and the oldest 864). The caller
+        reports an unreadable rejection rather than dropping it: a rejection nobody
+        sees is exactly what this watches for."""
+        out = []
+        for tx in self._fetch_all_transactions("864", created_after=created_after):
+            m = tx.get("metadata") or tx
+            tid = str(m.get("id") or tx.get("id") or "")
+            if not tid:
+                continue
+            try:
+                detail = self._fetch_transaction_detail(tid)
+            except requests.HTTPError as exc:
+                print(f"WARNING: CRSTL 864 {tid} detail unreadable: {exc}")
+                detail = None
+            out.append({"id": tid, "created_at": str(m.get("created_at") or ""), "detail": detail})
+        return out
+
     def _fetch_all_transactions(self, transaction_type: str = "810", created_after: str | None = None,
                                 **filters) -> list:
         """Every transaction of this type, paged 20 at a time. Filters narrow it server-

@@ -399,6 +399,38 @@ def _invoice_checks_config() -> dict:
     return load_refs().get("invoice_checks") or {}
 
 
+def _hd_rejections(floor: str) -> tuple[dict, str | None]:
+    """HD's 864 invoice rejections since `floor` (YYYY-MM-DD, its date in Toronto), as
+    {invoice number: [{"id", "at", "errors"}]}, plus a reason when they could not be read.
+
+    Positive scope: no floor means nothing is read, so turning this on never reports the
+    backlog. A CRSTL failure returns the reason rather than {} -- silence would read as
+    "HD rejected nothing", which is the failure the reporting rule exists to stop."""
+    if not floor:
+        return {}, None
+    from zoneinfo import ZoneInfo
+    from app import edi_rejects
+    try:
+        start = (datetime.fromisoformat(f"{floor}T00:00:00").replace(tzinfo=ZoneInfo("America/Toronto"))
+                 .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        records = crstl_cache._get_client().fetch_rejections(created_after=start)
+    except Exception as exc:  # noqa: BLE001 -- the rest of the digest still goes out
+        print(f"WARNING: digest could not read HD's 864 rejections: {exc}")
+        return {}, str(exc)[:200]
+    out: dict[str, list[dict]] = {}
+    unreadable = 0
+    for rec in records:
+        parsed = edi_rejects.parse_864(rec.get("detail"))
+        if not parsed["documents"]:
+            unreadable += 1
+            continue
+        if parsed["kind"] != edi_rejects.INVOICE:
+            continue                      # ASN rejects go to the warehouse, not the digest
+        for doc, errors in parsed["documents"].items():
+            out.setdefault(doc, []).append({"id": rec["id"], "at": rec["created_at"], "errors": errors})
+    return out, (f"{unreadable} message(s) HD sent could not be read" if unreadable else None)
+
+
 def _invoice_check_data() -> dict:
     """The digest's 'invoices to watch in HD's portal' section, computed READ-ONLY:
     today's findings (app.invoice_checks) set against the tracking.db record, which
@@ -417,7 +449,9 @@ def _invoice_check_data() -> dict:
         return {"unavailable": True, "rows": [], "cleared": [], "current": None, "created_after": floor}
     with _cache_lock:
         invoices = list(_cache["invoices"])
-    result = invoice_checks.check_all(invoices, floor)
+    rejects_floor = str(cfg.get("rejects_after") or "")
+    rejections, rejects_error = _hd_rejections(rejects_floor)
+    result = invoice_checks.check_all(invoices, floor, rejections=rejections)
     # Divergence from what we pushed is money in OUR books, so it is checked on every
     # accepted invoice we ever pushed, not only those inside the HD-rules floor.
     latest_all = {}
@@ -463,7 +497,10 @@ def _invoice_check_data() -> dict:
     recent = [i for i in result["latest"] if since is None or (_parse_iso(i.get("created_at")) or since) > since]
     return {"unavailable": False, "rows": rows, "cleared": cleared, "current": current,
             "checked": result["checked"], "sent_since_last": len(recent), "since": since_iso,
-            "dropship_without_gst": result["dropship_without_gst"], "created_after": floor}
+            "dropship_without_gst": result["dropship_without_gst"], "created_after": floor,
+            "rejects_after": rejects_floor, "rejects_error": rejects_error,
+            "returned": sorted({r["invoice_number"] for r in rows
+                                if invoice_checks.RETURNED in r["outcomes"]})}
 
 
 def _invoice_check_html(chk: dict) -> str:
@@ -476,15 +513,31 @@ def _invoice_check_html(chk: dict) -> str:
         why = chk.get("reason") or "the invoice data did not load"
         return head + f"<p {muted}>Not checked today: {html.escape(why)}.</p>"
     rows, cleared = chk["rows"], chk["cleared"]
-    n_new = sum(1 for r in rows if r["new"])
+    returned = chk.get("returned") or []
     h = head
+    # HD's own rejections are stated plainly and first: they have already happened,
+    # unlike the rules below them, which are still only "may". Same muted section.
+    if returned:
+        h += (f'<p {muted}><strong style="font-weight:600">HD has returned '
+              f'{len(returned)} invoice{"s" if len(returned) > 1 else ""}</strong> '
+              f'({html.escape(", ".join(returned))}) &mdash; HD\'s own reason is on the row. '
+              "Each stays listed until that PO is billed again and the new invoice is accepted.</p>")
+    if chk.get("rejects_error"):
+        h += (f"<p {muted}>HD's reject messages could not all be read today "
+              f"({html.escape(str(chk['rejects_error']))}), so this list may be short.</p>")
     if not rows:
+        since = f" and no rejections from HD since {html.escape(str(chk.get('rejects_after')))}" if chk.get("rejects_after") else ""
         h += (f"<p {muted}>{chk['sent_since_last']} invoice(s) sent since the last digest, checked against HD's "
-              "invoicing rules: nothing to flag.</p>")
+              f"invoicing rules: nothing to flag{since}.</p>")
     else:
-        h += (f"<p {muted}>These invoices differ from HD's invoicing rules. Nothing to do now &mdash; if one shows up "
-              "as returned or on hold in HD's portal, this is likely why. "
-              f"{n_new} noted for the first time in this digest, {len(rows) - n_new} noted earlier.</p>")
+        # The "may" paragraph is about our own rule checks. A row that is only HD's
+        # rejection is not a guess, so it must not be described as one.
+        guesses = [r for r in rows if invoice_checks.RETURNED not in r["outcomes"]]
+        if guesses:
+            g_new = sum(1 for r in guesses if r["new"])
+            h += (f"<p {muted}>These invoices differ from HD's invoicing rules. Nothing to do now &mdash; if one shows up "
+                  "as returned or on hold in HD's portal, this is likely why. "
+                  f"{g_new} noted for the first time in this digest, {len(guesses) - g_new} noted earlier.</p>")
         cell = lambda v: f'<td valign="top">{html.escape(str(v if v not in (None, "") else "—"))}</td>'
         body = ""
         for r in rows:

@@ -7,8 +7,9 @@ from app import tracking
 from app.crstl import created_since
 from app.mail import send_mail
 from app.shipstation import ShipStationClient
-from app.alerts import (alert_day, alert_recipients, find_asn_missing, packed_sales_pos, run_alerts,
-                        sent_asn_pos)
+from app.alerts import (after_go_live, alert_day, alert_recipients, find_asn_missing, packed_sales_pos,
+                        run_alerts, sent_asn_pos)
+from app.edi_rejects import parse_864
 from app.netsuite_payload import load_refs
 from app.automation import AUTO_ALERTS_SETTING
 from app import automation, crstl_cache
@@ -79,6 +80,45 @@ def _fill_older_pos(crstl, cfg: dict, shipments: list[dict], finale_shipments: l
             asn_pos.update(sent_asn_pos(crstl.list_transaction_states("856", source_document_ids=po_ids[po])))
 
 
+# The 850 behind a rejected ASN / invoice, kept for the life of the process: the same
+# 864 sits in the window for days and the answer never changes.
+_DOC_SOURCE: dict[str, dict | None] = {}
+
+
+def _lookup_source(crstl, doc: str) -> dict | None:
+    """{"po_number", "id"} for the document HD rejected, so the alert links to the PO:
+    an ASN number is an 856's reference_id, an invoice number an 810's, and both carry
+    their 850 in source_document_id. None when CRSTL has no such document."""
+    if doc not in _DOC_SOURCE:
+        meta = crstl.find_by_reference("810" if doc.upper().startswith("INV") else "856", doc)
+        _DOC_SOURCE[doc] = {"po_number": str(meta.get("source_document_reference_id") or ""),
+                            "id": str(meta.get("source_document_id") or "")} if meta else None
+    return _DOC_SOURCE[doc]
+
+
+def _rejections(crstl, cfg: dict) -> tuple[list[dict], dict]:
+    """HD's 864 rejections for the alert window, and the source document of each one
+    (for the PO link). No go-live date configured = nothing read and nothing reported,
+    so switching this on never emails the backlog that predates it; the lookups are
+    done only for the 864s that clear that floor."""
+    go_live = str(cfg.get("edi_reject_go_live_after") or "")
+    if not go_live:
+        return [], {}
+    rejections = crstl.fetch_rejections(created_after=created_since(int(cfg.get("lookback_days") or 7) + 2))
+    sources = {}
+    for rec in rejections:
+        if not after_go_live(rec.get("created_at"), go_live):
+            continue
+        parsed = parse_864(rec.get("detail"))
+        if parsed["kind"] == "invoice":
+            continue                      # the digest reports those, not the warehouse
+        for doc in parsed["documents"]:
+            found = _lookup_source(crstl, doc)
+            if found:
+                sources[doc] = found
+    return rejections, sources
+
+
 def _product_count() -> int | None:
     """Finale's product count, read at most once a day (one list request) and kept in
     the settings table -- the catalogue only grows when a product line is onboarded.
@@ -120,9 +160,11 @@ def _run_alerts(live: bool) -> dict:
     from app.finale import FinaleClient
     finale_shipments = FinaleClient().list_shipments() if FinaleClient.configured() else []
     _fill_older_pos(crstl, cfg, shipments, finale_shipments, asn_pos, po_ids, dropship_pos)
+    rejections, doc_sources = _rejections(crstl, cfg)
     result = run_alerts(shipments, asn_pos, po_ids, config=cfg, live=live, recipients=alert_recipients(),
                         send=send_mail, finale_shipments=finale_shipments, dropship_pos=dropship_pos,
-                        product_count=_product_count(), product_limit=FinaleClient.PAGE_LIMIT)
+                        product_count=_product_count(), product_limit=FinaleClient.PAGE_LIMIT,
+                        rejections=rejections, doc_sources=doc_sources)
     # The dashboard's "last alerts run" (read back by finale_jobs.finale_state()).
     tracking.set_json("finale_state:alerts", {"last_run": datetime.now(timezone.utc).isoformat(),
                                               **{k: v for k, v in result.items() if k != "body_html"}})

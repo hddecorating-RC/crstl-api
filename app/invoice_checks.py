@@ -16,12 +16,19 @@ keeps the first-seen / cleared record in tracking.db.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 GST_ONLY = {"AB", "BC", "MB", "SK", "NT", "NU", "YT"}
 HST_RATES = {"ON": 0.13, "NB": 0.15, "NL": 0.15, "PE": 0.15, "NS": 0.14}
 
 # What HD may do with an invoice like this. Worded as an FYI for accounting to keep an
 # eye on in HD's portal, not an alarm (Ritchie, 2026-09-22): "may", never "will".
+# HD's own verdict, not a prediction: its 864 error message names the invoice and the
+# reason. Stated plainly (no "may") because it has already happened -- but still an FYI
+# in the same muted section, not an alarm. The wording is HD's own rule for a rejected
+# invoice (CMP doc: fix and retransmit the SAME number; a new number is a duplicate and
+# is deleted). Clears when that PO is billed again and the new invoice is accepted.
+RETURNED = "Correct and resend the same invoice number"
 REJECT = "May be returned by HD"
 PARK = "May be held for review"
 UNDERPAID = "HD may pay slightly less"
@@ -193,15 +200,47 @@ def _created(inv: dict) -> str:
     return str(inv.get("created_at") or "")
 
 
-def check_all(invoices: list[dict], created_after: str) -> dict:
+def hd_reject_issues(rejects: list[dict], po_number: str, accepted_by_po: dict) -> list[dict]:
+    """HD's 864 rejections for one invoice, as issues -- unless the PO has since been
+    billed again and accepted, which is the only thing that settles a rejection.
+
+    `rejects` = [{"id", "at", "errors"}] (app.edi_rejects); `accepted_by_po` =
+    {po: [created_at, ...]} over every accepted invoice, so a replacement created after
+    the rejection clears it. Rejections of an invoice we never re-billed stay listed."""
+    out = []
+    for rej in sorted(rejects, key=lambda r: str(r.get("at") or "")):
+        at = str(rej.get("at") or "")
+        if any(c > at for c in accepted_by_po.get(str(po_number), [])):
+            continue
+        when = _et_date(at)
+        errors = "; ".join(str(e) for e in (rej.get("errors") or [])) or "no reason given"
+        out.append(_issue(f"hd_reject:{rej.get('id')}", f"HD returned it on {when}: {errors}", RETURNED))
+    return out
+
+
+def _et_date(iso: str) -> str:
+    from zoneinfo import ZoneInfo
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(ZoneInfo("America/Toronto")).strftime("%d %b")
+    except (TypeError, ValueError):
+        return "an unknown date"
+
+
+def check_all(invoices: list[dict], created_after: str, rejections: dict | None = None) -> dict:
     """Check what HD has: the latest ACCEPTED version of each invoice number created on
     or after `created_after` (YYYY-MM-DD). A Draft of the same number created later is
     reported: a correction exists but was never sent (HD still has the old one).
+
+    `rejections` = {invoice number: [{"id", "at", "errors"}]}, HD's 864s, already floored
+    at the go-live date by the caller. Those are reported whenever HD sent one, even for
+    an invoice older than `created_after`: HD's verdict is news whenever it arrives.
 
     Returns {"checked": n, "latest": [invoice, ...], "results": {invoice_number:
              {"invoice", "issues", "draft_at"}}, "dropship_without_gst": n}."""
     latest: dict[str, dict] = {}
     drafts: dict[str, str] = {}
+    accepted: dict[str, dict] = {}          # every accepted invoice, no date floor
+    accepted_by_po: dict[str, list[str]] = {}
     for inv in invoices:
         num = str(inv.get("invoice_number") or "")
         if not num or channel_of(inv) is None:
@@ -209,7 +248,12 @@ def check_all(invoices: list[dict], created_after: str) -> dict:
         if inv.get("status") == "Draft":
             drafts[num] = max(drafts.get(num, ""), _created(inv))
             continue
-        if inv.get("status") != "Accepted" or _created(inv)[:10] < created_after:
+        if inv.get("status") != "Accepted":
+            continue
+        accepted_by_po.setdefault(str(inv.get("po_number") or ""), []).append(_created(inv))
+        if num not in accepted or _created(inv) > _created(accepted[num]):
+            accepted[num] = inv
+        if _created(inv)[:10] < created_after:
             continue
         if num not in latest or _created(inv) > _created(latest[num]):
             latest[num] = inv
@@ -222,5 +266,15 @@ def check_all(invoices: list[dict], created_after: str) -> dict:
         draft_at = drafts.get(num) if drafts.get(num, "") > _created(inv) else None
         if issues:
             results[num] = {"invoice": inv, "issues": issues, "draft_at": draft_at}
+    for num, rejects in (rejections or {}).items():
+        inv = accepted.get(num)
+        if inv is None:      # HD named an invoice CRSTL has no accepted 810 for
+            continue
+        issues = hd_reject_issues(rejects, str(inv.get("po_number") or ""), accepted_by_po)
+        if not issues:
+            continue
+        entry = results.setdefault(num, {"invoice": inv, "issues": [],
+                                         "draft_at": drafts.get(num) if drafts.get(num, "") > _created(inv) else None})
+        entry["issues"] = issues + entry["issues"]      # HD's verdict reads before our guesses
     return {"checked": len(latest), "latest": list(latest.values()), "results": results,
             "dropship_without_gst": no_gst}
