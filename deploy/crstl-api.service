@@ -10,7 +10,7 @@ User=crstl
 Group=crstl
 WorkingDirectory=/opt/crstl-api
 EnvironmentFile=/opt/crstl-api/.env
-# APScheduler cron jobs run in this TZ (07:00 refresh, 07:15 digest, 04:00 NetSuite CSV).
+# APScheduler cron jobs run in this TZ (4:45 refresh, 5:00 NetSuite push + the day's digest email).
 # Set here rather than relying on /etc/timezone so the service is self-contained.
 Environment="TZ=America/Toronto"
 # Python block-buffers stdout when it is a pipe (the journal), so print()
@@ -21,7 +21,7 @@ Environment="PYTHONUNBUFFERED=1"
 # The web app's scheduled jobs. The Finale poll runs in crstl-finale-worker and order
 # alerts in crstl-order-watch (app/schedule.py). Unset = the web app runs every job
 # itself, as before the split -- the rollback: remove this line, stop both workers.
-Environment="SCHEDULER_JOBS=daily_refresh,netsuite_push,daily_digest"
+Environment="SCHEDULER_JOBS=daily_refresh,netsuite_push"
 # Bind loopback only. Tailscale runs in userspace-networking mode here, so
 # there is no tailscale0 interface to bind to -- inbound tailnet traffic
 # arrives through `tailscale serve`, which proxies

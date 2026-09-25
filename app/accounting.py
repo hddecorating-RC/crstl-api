@@ -4,6 +4,7 @@ import html
 import os
 import pathlib
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -242,7 +243,7 @@ def _so_digest_data() -> dict:
     # Excel column and the issues list. Empty when Finale invoicing is off.
     fin_cfg = finale_jobs._finale_config()
     # Non-EDI receipts since the last digest that was actually SENT (a digest fires
-    # after each push as well as at 7:15), so a figure is never re-reported as new.
+    # after each push, and a manual send can follow), so a figure is never re-reported as new.
     since = _last_digest_sent_at() or (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     nonedi = [r for r in tracking.recent_finale_invoices(since) if str(r.get("key", "")).startswith("order:")]
     # The reconciliation runs FIRST: it may refresh a draft receipt that has since
@@ -674,7 +675,7 @@ def _so_digest_workbook(new_sos: list[dict], so_map: dict, finale_map: dict | No
     return buf.getvalue()
 
 
-def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
+def _send_daily_digest(selected_ids: list[str] | None = None, push_problem: str | None = None) -> dict:
     """The daily accounting digest: the sales orders created in NetSuite since the
     last digest (ready for invoice generation), a summary (total / province /
     product), and an issues callout. Sourced from durable push receipts, not
@@ -697,7 +698,13 @@ def _send_daily_digest(selected_ids: list[str] | None = None) -> dict:
     n_issues = len(data["gaps"]) + sum(1 for r in rows if r.get("reconcile_flag"))
     if n_issues:
         subject += f" · {n_issues} issue(s)"
+    if push_problem:
+        subject += " · NetSuite push did not complete"
     body_html = _so_digest_html(data, rows)
+    if push_problem:   # first thing they read: why today's SOs may be missing
+        body_html = (f'<p style="padding:8px 10px;background:#fff4e5;border-left:4px solid #e08a00">'
+                     f'<strong>Today\'s NetSuite push did not complete.</strong> {html.escape(push_problem)}</p>'
+                     + body_html)
     # FYI section at the BOTTOM, subject untouched (config invoice_checks.enabled).
     checks = _invoice_check_data() if _invoice_checks_config().get("enabled") else None
     if checks is not None:
@@ -738,7 +745,10 @@ def _auto_digest_enabled() -> bool:
     return tracking.get_setting(AUTO_DIGEST_SETTING, "true").lower() != "false"
 
 
-def _send_digest_safe(reason: str) -> bool:
+DIGEST_RETRY_SECONDS = 60
+
+
+def _send_digest_safe(reason: str, push_problem: str | None = None) -> bool:
     """Send the accounting digest and update digest state; never raises (best-effort).
     Returns True if it sent. The _digest_lock guard stops a post-push send and the
     scheduled run from overlapping. `reason` is logged so the run history shows what
@@ -748,7 +758,14 @@ def _send_digest_safe(reason: str) -> bool:
             return False
         _digest_state["sending"] = True
     try:
-        result = _send_daily_digest()
+        try:
+            result = _send_daily_digest(push_problem=push_problem)
+        except MailConfigError:
+            raise
+        except Exception as exc:   # one retry: a mail blip must not cost the day's only email
+            print(f"WARNING: digest send failed ({reason}), retrying in {DIGEST_RETRY_SECONDS}s: {exc}")
+            time.sleep(DIGEST_RETRY_SECONDS)
+            result = _send_daily_digest(push_problem=push_problem)
         with _digest_lock:
             _digest_state["last_sent"] = datetime.now(timezone.utc).isoformat()
             _digest_state["count"] = result["count"]
@@ -768,43 +785,29 @@ def _send_digest_safe(reason: str) -> bool:
             _digest_state["sending"] = False
 
 
-def _run_daily_digest_job() -> None:
-    """Scheduled SAFETY-NET for the accounting digest. The digest normally fires the
-    moment a push completes (see _run_netsuite_push) -- no waiting for a fixed time.
-    This daily run only sends when something is still unreported: newly-pushed SOs a
-    post-push send missed (e.g. mail was down), or invoiced-but-no-SO gaps. Quiet days
-    send nothing. Honors the auto-digest toggle."""
+def _digest_after_scheduled_push(started_at: str, push_problem: str | None) -> None:
+    """The day's ONE accounting email, decided at the end of the 5:00 push job (the
+    7:15 safety-net job was removed 2026-09-25: it re-sent a standing gap every day).
+    A push that created SOs has already sent it (post-push, with a retry). Otherwise
+    send only when there is something to say: SOs a failed send left unreported,
+    invoices with no SO, or a push that was blocked or failed -- that one must never be
+    silent. Nothing to report = no email. Honors the auto-digest toggle."""
     if not _auto_digest_enabled():
-        print("Digest: auto-send disabled via settings, skipping scheduled run")
         tracking.record_job_run("daily_digest", "skipped", "disabled")
         return
+    sent = _parse_iso(_last_digest_sent_at())
+    if sent and sent >= _parse_iso(started_at):
+        return                                        # the post-push email went out
     try:
         data = _so_digest_data()
     except Exception as exc:
         print(f"WARNING: digest data build failed: {exc}")
         tracking.record_job_run("daily_digest", "error", str(exc)[:200])
         return
-    if not data["new_sos"] and not data["gaps"]:
+    if not push_problem and not data["new_sos"] and not data["gaps"]:
         tracking.record_job_run("daily_digest", "ok", "nothing to report")
         return
-    # Gaps are standing, not new: a gap nobody resolves (INV538596153, 2026-09-24)
-    # would otherwise re-send the digest every morning. Once a digest has gone out
-    # today (ET) it already listed them, so only unreported SOs justify a second.
-    if not data["new_sos"] and _sent_today_et(_last_digest_sent_at()):
-        tracking.record_job_run("daily_digest", "ok",
-                                f"nothing to report ({len(data['gaps'])} gap(s) already in today's digest)")
-        return
-    _send_digest_safe("scheduled")
-
-
-def _sent_today_et(iso: str | None) -> bool:
-    """True when `iso` (a UTC job_runs stamp) falls on today's date in ET."""
-    from zoneinfo import ZoneInfo
-    dt = _parse_iso(iso)
-    if not dt:
-        return False
-    et = ZoneInfo("America/Toronto")
-    return dt.astimezone(et).date() == datetime.now(et).date()
+    _send_digest_safe("after push", push_problem)
 
 
 def _run_ns_export_job() -> None:
@@ -837,6 +840,19 @@ def _run_netsuite_push_job() -> None:
     app are NOT subject to any of these."""
     if not automation._job_enabled(AUTO_NS_PUSH_SETTING, default="false"):
         tracking.record_job_run("netsuite_push", "skipped", "disabled"); return
+    started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        problem = _netsuite_push_scheduled()
+    except Exception as exc:
+        print(f"ERROR: scheduled NetSuite push failed: {exc}")
+        tracking.record_job_run("netsuite_push", "error", str(exc)[:200])
+        problem = "It stopped with an error, so some or all of today's SOs may not have been created. Details are in the server log."
+    _digest_after_scheduled_push(started_at, problem)
+
+
+def _netsuite_push_scheduled() -> str | None:
+    """The guarded push itself. Returns a plain-words problem for the day's email
+    when the push was blocked or nothing went through, else None."""
     auto = load_refs().get("automation") or {}
     cutoff = str(auto.get("go_live_after") or "") or None
     within = auto.get("created_within_days")
@@ -853,24 +869,28 @@ def _run_netsuite_push_job() -> None:
     if blocked:
         tracking.record_job_run("netsuite_push", "blocked",
                                 f"{blocked} -- refusing; run manually from the app to override")
-        return
+        return f"It was held back because {blocked}, so no SOs were created. Someone needs to review it and push from the dashboard."
     if not to_push:
         window = f" (created on/after {cutoff}" if cutoff else ""
         if within is not None:
             window = f"{window or ' (created'}, within {within}d"
         window = f"{window})" if window else ""
         tracking.record_job_run("netsuite_push", "ok", f"nothing new to push{window}")
-        return
+        return None
     # _run_netsuite_push reads the cache, pushes just these ids, sanitizes, and
     # updates _netsuite_push_state (so the dashboard's last-push panel reflects it).
     result = _run_netsuite_push(True, [str(i["transaction_id"]) for i in to_push], None)
     s = result["summary"]
     if result.get("blocked"):
         tracking.record_job_run("netsuite_push", "blocked", "unresolved ids: " + ", ".join(result["unresolved"]))
+        return "It stopped before sending because some invoices could not be found. No SOs were created."
     else:
         status = "ok" if s["failed"] == 0 else "partial"
         tracking.record_job_run("netsuite_push", status,
                                 f"{s['sent']} sent, {s['failed']} failed, {s['skipped_no_map']} skipped")
+        if s["failed"] and not s["sent"]:
+            return f"All {s['failed']} invoice(s) failed to go through, so no SOs were created."
+    return None
 
 
 def _netsuite_customer(inv: dict) -> dict | None:

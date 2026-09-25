@@ -62,7 +62,7 @@
              x-text="digest.last_sent ? ('Digest ' + fmtTime(digest.last_sent)) : 'Digest —'"></div>
         <div class="text-xs mt-1"
              :class="digest.auto_enabled ? 'text-gray-400' : 'text-amber-600 font-medium'"
-             x-text="digest.auto_enabled ? 'Auto-send on · Mon–Fri 07:15' : 'Auto-send OFF'"></div>
+             x-text="digest.auto_enabled ? 'Auto-send on · Mon–Fri after the 5:00 push' : 'Auto-send OFF'"></div>
         <div class="text-xs text-red-500 mt-1 truncate"
              x-show="digest.error" :title="digest.error" x-text="digest.error"></div>
         <div class="flex gap-2 mt-2">
@@ -778,7 +778,7 @@ function dashboard() {
           return;
         }
         this.digest.auto_enabled = newState;
-        this.showToast(newState ? 'Auto-digest enabled — Mon–Fri 07:15' : 'Auto-digest disabled — Mon–Fri 07:15 job will skip');
+        this.showToast(newState ? 'Auto-digest enabled — Mon–Fri after the 5:00 push' : 'Auto-digest disabled — no email after the 5:00 push');
       } catch {
         this.showToast('Toggle failed');
       } finally {

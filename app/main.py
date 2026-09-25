@@ -402,7 +402,7 @@ class AutoDigestToggle(BaseModel):
 
 @app.post("/api/email/auto-digest")
 def set_auto_digest(body: AutoDigestToggle) -> dict:
-    """Enable or disable the scheduled weekday digest (Mon–Fri 07:15 Toronto).
+    """Enable or disable the weekday digest sent after the 5:00 push (Toronto).
     Persisted in tracking.db so the setting survives restarts. Manual sends are
     always available, including on weekends."""
     tracking.set_setting(AUTO_DIGEST_SETTING, "true" if body.enabled else "false")

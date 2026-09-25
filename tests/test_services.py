@@ -134,8 +134,8 @@ def test_web_jobs_default_to_everything_and_reject_a_typo(monkeypatch):
     from app import schedule
     monkeypatch.delenv("SCHEDULER_JOBS", raising=False)
     assert schedule.web_jobs() == schedule.WEB_DEFAULT
-    monkeypatch.setenv("SCHEDULER_JOBS", "daily_refresh, netsuite_push,daily_digest")
-    assert schedule.web_jobs() == ["daily_refresh", "netsuite_push", "daily_digest"]
+    monkeypatch.setenv("SCHEDULER_JOBS", "daily_refresh, netsuite_push")
+    assert schedule.web_jobs() == ["daily_refresh", "netsuite_push"]
     monkeypatch.setenv("SCHEDULER_JOBS", "daily_refresh,finale_psuh")
     with pytest.raises(ValueError, match="finale_psuh"):
         schedule.web_jobs()

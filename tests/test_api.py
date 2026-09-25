@@ -328,14 +328,15 @@ def _scheduled_jobs(monkeypatch, tmp_path):
     return jobs
 
 
-def test_digest_scheduled_weekdays_only(monkeypatch, tmp_path):
-    """The digest must not fire Sat/Sun — Friday's late invoices ride along
-    with Monday's send because tracking.db still lists them as unemailed."""
+def test_digest_rides_the_weekday_push_no_separate_job(monkeypatch, tmp_path):
+    """No 7:15 digest job (removed 2026-09-25): the day's one email is sent by the
+    5:00 push job, which is weekdays only -- so no weekend email."""
     jobs = _scheduled_jobs(monkeypatch, tmp_path)
-    digest = jobs["daily_digest"]
-    assert digest["day_of_week"] == "mon-fri"
-    assert (digest["hour"], digest["minute"]) == (7, 15)
-    assert digest["timezone"] == "America/Toronto"
+    assert "daily_digest" not in jobs
+    push = jobs["netsuite_push"]
+    assert push["day_of_week"] == "mon-fri"
+    assert (push["hour"], push["minute"]) == (5, 0)
+    assert push["timezone"] == "America/Toronto"
 
 
 def test_refresh_runs_every_day(monkeypatch, tmp_path):
@@ -482,7 +483,8 @@ def test_resubmission_of_a_pre_go_live_invoice_is_not_a_gap_or_pushed(client, mo
         data = _so_digest_data()
         assert [g["transaction_id"] for g in data["gaps"]] == ["so-1"]        # so-2 is not a gap
         monkeypatch.setattr("app.automation._job_enabled", lambda *a, **k: True)
-        with patch("app.accounting._run_netsuite_push", return_value={"summary": {"sent": 1, "failed": 0, "skipped": 0, "skipped_no_map": 0}}) as push:
+        with patch("app.accounting._run_netsuite_push", return_value={"summary": {"sent": 1, "failed": 0, "skipped": 0, "skipped_no_map": 0}}) as push, \
+             patch("app.accounting._digest_after_scheduled_push"):
             _run_netsuite_push_job()
     assert push.call_args.args[1] == ["so-1"]                                   # so-2 is not pushed
 
@@ -1121,30 +1123,60 @@ def test_digest_drops_a_held_draft_once_someone_posts_it(client, monkeypatch):
     assert tracking.get_finale_invoices(["so-1"])["so-1"]["created_by"] == "edward.schiavon"
 
 
-def test_scheduled_digest_does_not_resend_standing_gaps(client, monkeypatch):
-    """The 7:15 safety-net: a gap already in today's post-push digest does not send
-    a second email (INV538596153 did, every day from 2026-09-24); unreported SOs,
-    or gaps with no digest yet today, still send."""
-    from datetime import datetime, timedelta, timezone
-    from app.accounting import _run_daily_digest_job
+def _push_job(monkeypatch, *, problem=None, raises=None, post_push_sent=False, data=None):
+    """Run the 5:00 job with the push itself faked; return the (reason, problem) the
+    day's email was sent with, or None when no email went out."""
+    from app.accounting import _run_netsuite_push_job
     from app import tracking
     tracking.init_db()
+    monkeypatch.setattr("app.automation._job_enabled", lambda *a, **k: True)
     monkeypatch.setattr("app.accounting._auto_digest_enabled", lambda: True)
-    now = datetime.now(timezone.utc).isoformat()
-    gap = {"new_sos": [], "gaps": [{"transaction_id": "g"}]}
 
-    def run(data, last_sent):
-        with patch("app.accounting._so_digest_data", return_value=data), \
-             patch("app.accounting._last_digest_sent_at", return_value=last_sent), \
-             patch("app.accounting._send_digest_safe") as send:
-            _run_daily_digest_job()
-        return send.called
+    def fake_push():
+        if post_push_sent:
+            tracking.record_job_run("daily_digest", "ok", "3 SO(s), 0 issue(s) [post-push]")
+        if raises:
+            raise raises
+        return problem
+    with patch("app.accounting._netsuite_push_scheduled", side_effect=fake_push), \
+         patch("app.accounting._so_digest_data", return_value=data or {"new_sos": [], "gaps": []}), \
+         patch("app.accounting._send_digest_safe") as send:
+        _run_netsuite_push_job()
+    return send.call_args.args if send.called else None
 
-    assert not run(gap, now)                                    # gap already sent today: quiet
-    assert tracking.recent_job_runs(1, "daily_digest")[0]["detail"].startswith("nothing to report")
-    assert run(gap, None)                                       # no digest yet: the gap is reported
-    assert run(gap, (datetime.now(timezone.utc) - timedelta(days=2)).isoformat())
-    assert run({"new_sos": [{"transaction_id": "s"}], "gaps": []}, now)   # unreported SOs always send
+
+def test_push_job_sends_one_email_only_when_there_is_something_to_say(monkeypatch):
+    """The 5:00 job sends the day's ONE email: none when the push already sent it,
+    none on a quiet day; a gap, or a blocked/failed push, sends it."""
+    assert _push_job(monkeypatch, post_push_sent=True,
+                     data={"new_sos": [], "gaps": [{"transaction_id": "g"}]}) is None   # post-push email covered it
+    assert _push_job(monkeypatch) is None                                                # quiet day: no email
+    assert _push_job(monkeypatch, data={"new_sos": [], "gaps": [{"transaction_id": "g"}]}) == ("after push", None)
+    assert _push_job(monkeypatch, problem="It was held back")[1] == "It was held back"   # blocked: never silent
+    reason, problem = _push_job(monkeypatch, raises=RuntimeError("NetSuite 503"))
+    assert "error" in problem and "503" not in problem                                   # no raw error text in the email
+
+
+def test_digest_send_retries_once(monkeypatch, client):
+    from app.accounting import _send_digest_safe
+    monkeypatch.setattr("app.accounting.DIGEST_RETRY_SECONDS", 0)
+    with patch("app.accounting._send_daily_digest",
+               side_effect=[OSError("smtp down"), {"count": 2, "sent_to": ["a"], "gaps": 0}]) as send:
+        assert _send_digest_safe("after push") is True
+    assert send.call_count == 2
+
+
+def test_push_problem_leads_the_email(client, monkeypatch):
+    from app.crstl_cache import _cache
+    from app.accounting import _send_daily_digest
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    with patch.dict(_cache, {"invoices": []}), patch("app.accounting.send_mail") as mail:
+        _send_daily_digest(push_problem="It was held back because 80 to push exceeds max_per_run 75.")
+    kw = mail.call_args.kwargs
+    assert kw["subject"].endswith("NetSuite push did not complete")
+    assert kw["body_html"].index("did not complete") < kw["body_html"].index("sales order(s)")
 
 
 def test_digest_nonedi_window_starts_at_the_last_sent_digest(client):

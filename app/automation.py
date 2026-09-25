@@ -33,7 +33,9 @@ AUTO_ALERTS_SETTING = "auto_alerts_enabled"
 AUTOMATION_JOBS = [
     {"id": "daily_refresh", "label": "Invoice sync (Crstl)", "schedule": "Daily · 4:45 AM ET",   "setting": AUTO_SYNC_SETTING,    "default": "true"},
     {"id": "netsuite_push", "label": "NetSuite auto-push",   "schedule": "Mon–Fri · 5:00 AM ET", "setting": AUTO_NS_PUSH_SETTING, "default": "false"},
-    {"id": "daily_digest",  "label": "Daily digest email",   "schedule": "Mon–Fri · 7:15 AM ET", "setting": AUTO_DIGEST_SETTING,  "default": "true"},
+    # Sent from the 5:00 push job since 2026-09-25 (the 7:15 job is gone), so it runs with it.
+    {"id": "daily_digest",  "label": "Daily digest email",   "schedule": "Mon–Fri · after the 5:00 AM push", "setting": AUTO_DIGEST_SETTING,  "default": "true",
+     "runs_with": "netsuite_push"},
     {"id": "finale_push",   "label": "Finale invoicing",     "schedule": "Mon–Fri · every 15 min · 6:00 AM–6:45 PM ET", "setting": AUTO_FINALE_SETTING,  "default": "false"},
     # Not its own scheduler job: it is the third pass of finale_push (runs_with),
     # so its next run is that job's, and it is silent whenever that job is off.

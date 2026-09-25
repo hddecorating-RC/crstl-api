@@ -149,7 +149,7 @@ One repo, three processes, one systemd unit each (since 2026-09-21). They share
 
 | Unit | Runs | Scheduled jobs |
 |---|---|---|
-| `crstl-api` | the dashboard + every manual endpoint (`uvicorn app.main:app`) | invoice sync 4:45, NetSuite push 5:00, digest 7:15 (its `SCHEDULER_JOBS`) |
+| `crstl-api` | the dashboard + every manual endpoint (`uvicorn app.main:app`) | invoice sync 4:45, NetSuite push 5:00 + the day's digest email (its `SCHEDULER_JOBS`) |
 | `crstl-finale-worker` | `python -m app.worker finale` | the 15-min Finale poll, Mon–Fri 6:00 AM–6:45 PM ET (EDI + non-EDI invoicing, DSD + dropship pre-fill, ShipStation close), plus its own 4:45 CRSTL cache refresh |
 | `crstl-order-watch` | `python -m app.worker alerts` | order alerts, every 15 min, Mon–Fri 7:07 AM–5:52 PM ET |
 

@@ -37,18 +37,12 @@ JOBS: dict[str, tuple[str, str, dict]] = {
                       dict(hour=4, minute=45, timezone=TORONTO, misfire_grace_time=3600, coalesce=True)),
     # NetSuite auto-push -- 5:00 AM ET, before anyone in accounting is entering
     # invoices, so our writes never collide with a manual entry. Runs after the 4:45
-    # refresh (fresh data) and before the 7:15 digest (which reports it). OFF by
-    # default until accounting turns it on.
+    # refresh (fresh data). OFF by default until accounting turns it on. The day's
+    # one accounting email is sent from this job (after the push), weekdays only --
+    # Monday's carries Friday's late invoices plus anything Crstl added over the weekend.
     "netsuite_push": ("app.accounting:_run_netsuite_push_job", "cron",
                       dict(day_of_week="mon-fri", hour=5, minute=0, timezone=TORONTO,
                            misfire_grace_time=3600, coalesce=True)),
-    # Weekdays only -- nobody works the digest queue on Sat/Sun, so a weekend send is
-    # just two emails to ignore. Skipping them loses nothing: the digest sends
-    # whatever tracking.db still has unemailed, so Monday 07:15 carries Friday's late
-    # invoices plus anything Crstl added over the weekend.
-    "daily_digest": ("app.accounting:_run_daily_digest_job", "cron",
-                     dict(day_of_week="mon-fri", hour=7, minute=15, timezone=TORONTO,
-                          misfire_grace_time=3600, coalesce=True)),
     # Finale invoicing poll -- every 15 minutes, WAREHOUSE HOURS ONLY (Ritchie,
     # 2026-09-22): Mon-Fri 06:00-18:45 ET. Every pass reacts to warehouse work (a
     # shipment, a label, an 810 minutes after a ship) and the warehouse closes at 5 PM
@@ -56,7 +50,7 @@ JOBS: dict[str, tuple[str, str, dict]] = {
     # Finale/ShipStation now only happen while someone is around. The tail to 18:45
     # catches the end-of-day Ship clicks and the 810s that follow (HD accepts a median
     # 6 min after the ship; pickups are requested before 4 PM). 06:00 clears overnight
-    # CRSTL work before the 7:15 digest and before any DSD truck can arrive. Weekend and
+    # CRSTL work before any DSD truck can arrive. Weekend and
     # overnight gaps are safe: every lookback is days (3-9), and the first run of the
     # day catches up. OFF unless config finale.enabled AND the dashboard toggle are on.
     "finale_push": ("app.finale_jobs:_run_finale_push_job", "cron",
@@ -75,7 +69,7 @@ JOBS: dict[str, tuple[str, str, dict]] = {
 }
 
 # What the web app runs when SCHEDULER_JOBS is unset: everything, as before the split.
-WEB_DEFAULT = ["daily_refresh", "netsuite_push", "daily_digest", "finale_push", "order_alerts"]
+WEB_DEFAULT = ["daily_refresh", "netsuite_push", "finale_push", "order_alerts"]
 # python -m app.worker <service> -> the jobs that service runs.
 WORKERS = {"finale": ["finale_push", "finale_cache_refresh"], "alerts": ["order_alerts"]}
 

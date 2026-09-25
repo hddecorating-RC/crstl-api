@@ -40,7 +40,7 @@ class CrstlClient:
         self.session.headers.update({"x-crstl-api-key": api_key, "Accept": "application/json"})
         # Retry transient CRSTL failures (429 rate-limit, 5xx) with exponential
         # backoff so a blip during the startup / 7am sync doesn't leave the cache
-        # empty for the day (and the 07:15 digest empty). Honors the server's
+        # empty for the day (and the digest empty). Honors the server's
         # Retry-After on a 429. Only idempotent GETs are retried (urllib3's
         # default allowed_methods), which is all our CRSTL reads. raise_on_status
         # is False so a persistent failure still surfaces via resp.raise_for_status()
