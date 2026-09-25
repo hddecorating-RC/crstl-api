@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 # Event types the app writes. Enforced in application code, not via a DB CHECK
 # constraint — SQLite can't ALTER a CHECK, and letting the schema outlive the
 # app's event vocabulary made adding 'emailed' painful.
-EVENT_TYPES = ("exported", "netsuite", "emailed", "so_digest", "finale")
+# gap_digest: an 810 with no SO was listed in a sent digest (reported once, 2026-09-25).
+EVENT_TYPES = ("exported", "netsuite", "emailed", "so_digest", "finale", "gap_digest")
 
 # Last write failure — surfaced via `write_health()` so the /api/health endpoint
 # can report "digest ran but couldn't record — expect re-sends tomorrow".

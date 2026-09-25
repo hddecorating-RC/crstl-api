@@ -165,7 +165,7 @@ def test_section_new_then_noted_then_cleared(checks_on):
         assert accounting._invoice_check_data()["rows"][0]["new"]          # a preview writes nothing
         tracking.sync_invoice_checks(first["current"])                     # the digest went out
         again = accounting._invoice_check_data()
-        assert not again["rows"][0]["new"] and again["rows"][0]["first_seen"]
+        assert again["rows"] == [] and again["current"]                    # reported once: tracked, not shown
     fixed = _good("dropship", "SK", 101.40, number="INV538909096", created="2026-09-19T15:00:00Z", transaction_id="t2")
     with patch.dict(_cache, {"invoices": [bad, fixed], "status": "ok"}):
         cleared = accounting._invoice_check_data()
@@ -347,10 +347,11 @@ def test_an_expected_chargeback_is_reported_once_then_never_repeated(checks_on):
     assert "HD chargebacks to expect" not in accounting._invoice_check_html(again)
 
 
-def test_met_off_its_formula_is_reported_once_other_rules_repeat():
+def test_every_finding_is_reported_once_except_hd_rejections():
     from app import invoice_checks as ic2
-    assert ic2.reported_once("discount_off:E210") and ic2.reported_once("changed_after_push")
-    assert not ic2.reported_once("discount_off:I170") and not ic2.reported_once("hd_reject:abc")
+    for key in ("discount_off:E210", "discount_off:I170", "changed_after_push", "tax_rate", "vendor_missing"):
+        assert ic2.reported_once(key)
+    assert not ic2.reported_once("hd_reject:abc")               # someone must re-bill: repeats until cleared
 
 
 def test_snapshot_survives_a_repush_and_reads_back_per_target():

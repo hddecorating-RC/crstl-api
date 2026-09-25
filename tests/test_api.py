@@ -407,12 +407,34 @@ def test_explicit_id_selection_is_honoured_even_for_a_draft(client):
     assert _invoice_numbers(content) == ["INV-tx-dr1"]
 
 
+_LAST_DIGEST = {}
+
+
+@pytest.fixture(autouse=True)
+def _remember_digest_data(monkeypatch):
+    """Keep the last _so_digest_data() result: the Finale sheet is no longer in the
+    email (2026-09-25), so tests read it from the dashboard download built from it."""
+    from app import accounting
+    real = accounting._so_digest_data
+
+    def spy(*a, **k):
+        _LAST_DIGEST["data"] = real(*a, **k)
+        return _LAST_DIGEST["data"]
+    _LAST_DIGEST.clear()
+    monkeypatch.setattr("app.accounting._so_digest_data", spy)
+
+
 def _finale_sheet(mail):
-    """Rows of the attached Excel's 'Finale' sheet (header first), or None."""
+    """Rows of the 'Finale' reconciliation sheet for the digest just sent (header
+    first), or None. Asserts it is NOT in accounting's email any more."""
+    from app import accounting
     att = mail.call_args.kwargs.get("attachments")
-    if not att:
+    if att:
+        assert "Finale" not in load_workbook(io.BytesIO(att[0][1])).sheetnames
+    content = accounting._finale_workbook(_LAST_DIGEST["data"])
+    if content is None:
         return None
-    wb = load_workbook(io.BytesIO(att[0][1]))
+    wb = load_workbook(io.BytesIO(content))
     if "Finale" not in wb.sheetnames:
         return None
     return [[c.value for c in r] for r in wb["Finale"].iter_rows()]
@@ -463,8 +485,13 @@ def test_so_digest_lists_pushed_sos_gaps_and_marks_reported(client, monkeypatch)
     assert "INV-SO-1" not in body                              # created-SO detail lives in the Excel, not the email
     # reported SO is marked so it won't repeat in the next digest
     assert tracking.get_latest_events(["so-1"])["so-1"]["so_digest_at"] is not None
-    # the gap is NOT marked (still needs an SO)
+    # the gap is NOT marked as an SO (still needs one) -- but it is marked as reported,
+    # so it is listed once and never triggers a daily email on its own
     assert tracking.get_latest_events(["so-2"])["so-2"]["so_digest_at"] is None
+    assert tracking.get_latest_events(["so-2"])["so-2"]["gap_digest_at"] is not None
+    from app.accounting import _so_digest_data
+    with patch.dict(_cache, {"invoices": _so_ready_invoices()}):
+        assert _so_digest_data()["gaps"] == []
 
 
 def test_resubmission_of_a_pre_go_live_invoice_is_not_a_gap_or_pushed(client, monkeypatch):

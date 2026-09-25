@@ -400,6 +400,16 @@ class AutoDigestToggle(BaseModel):
     enabled: bool
 
 
+@app.get("/api/finale/reconciliation.xlsx")
+async def finale_reconciliation_download():
+    """The Finale reconciliation sheet that used to ride on accounting's email."""
+    content = await asyncio.to_thread(accounting._finale_workbook)
+    if content is None:
+        return JSONResponse({"detail": "Finale reconciliation is off"}, status_code=404)
+    return Response(content=content, media_type=XLSX_MEDIA_TYPE,
+                    headers={"Content-Disposition": 'attachment; filename="finale_reconciliation.xlsx"'})
+
+
 @app.post("/api/email/auto-digest")
 def set_auto_digest(body: AutoDigestToggle) -> dict:
     """Enable or disable the weekday digest sent after the 5:00 push (Toronto).

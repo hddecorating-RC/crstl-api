@@ -220,7 +220,9 @@ def _so_digest_data() -> dict:
     def accepted_after_push(i) -> bool:
         created = _parse_iso(i.get("created_at"))
         return bool(push_dt and created and created >= push_dt)
-    gaps = [i for i in gaps_all if not accepted_after_push(i)]
+    # Reported ONCE (Ritchie, 2026-09-25): a gap already listed in a sent digest is not
+    # listed again, and so can't trigger a daily email on its own.
+    gaps = [i for i in gaps_all if not accepted_after_push(i) and not ev(i, "gap_digest_at")]
     gaps_waiting = [i for i in gaps_all if accepted_after_push(i)]
     dry = (push_invoices(invoices, live=False,
                          only=[str(i["transaction_id"]) for i in new_sos])["results"]
@@ -616,9 +618,6 @@ def _invoice_check_html(chk: dict) -> str:
         h += table(others)
     if cleared:
         h += f"<p {muted}>Cleared since the last digest (now match HD's rules): {html.escape(', '.join(cleared))}.</p>"
-    if chk.get("dropship_without_gst"):
-        h += (f"<p {muted}>Also: dropship invoices don't include our GST/HST registration number yet, "
-              "so HD may hold the tax on them.</p>")
     return h
 
 
@@ -769,8 +768,9 @@ def _send_daily_digest(selected_ids: list[str] | None = None, push_problem: str 
     check_rows = (checks or {}).get("rows") or None
 
     attachments = None
-    finale_rows = recon.get("rows") if data.get("finale_enabled") else None
-    if data["new_sos"] or finale_rows or data.get("nonedi") or check_rows:
+    # No Finale sheet (Ritchie, 2026-09-25): a rolling list of every SO since Finale's
+    # go-live, repeated in every email, is for the other teams, not accounting.
+    if data["new_sos"] or check_rows:
         finale_by_inv = {str(i.get("invoice_number")): (f.get("invoice_id_user") or f.get("invoice_id") or "", f.get("status") or "",
                                                         f.get("created_by"), f.get("delta"))
                          for i in data["new_sos"]
@@ -778,8 +778,7 @@ def _send_daily_digest(selected_ids: list[str] | None = None, push_problem: str 
         attachments = [(f"hd_sales_orders_{today}.xlsx",
                         _so_digest_workbook(data["new_sos"], data["so_map"],
                                             finale_by_inv if (data.get("finale_enabled") or finale_by_inv) else None,
-                                            finale_rows=(finale_rows if (finale_rows is not None or data.get("nonedi")) else None),
-                                            nonedi=data.get("nonedi"), check_rows=check_rows),
+                                            check_rows=check_rows),
                         XLSX_MEDIA_TYPE)]
 
     # Send FIRST; only mark reported once the mail is away, so a send failure leaves
@@ -788,12 +787,28 @@ def _send_daily_digest(selected_ids: list[str] | None = None, push_problem: str 
     reported_ids = [str(i["transaction_id"]) for i in data["new_sos"]]
     if reported_ids:
         tracking.record_events(reported_ids, "so_digest")
+    gap_ids = [str(i["transaction_id"]) for i in data["gaps"]]
+    if gap_ids:
+        tracking.record_events(gap_ids, "gap_digest")
     # Only now that the digest showing them is away: today's findings become "noted".
     if checks is not None and not checks.get("unavailable"):
         tracking.sync_invoice_checks(checks["current"])
 
     return {"sent_to": recipients, "count": n, "gaps": len(data["gaps"]),
             "to_watch": len(check_rows or []), "subject": subject, "mode": "so_digest"}
+
+
+def _finale_workbook(data: dict | None = None) -> bytes | None:
+    """The rolling Finale reconciliation (every SO since Finale's go-live: missing,
+    off the 810, held as draft) plus recent non-EDI receipts, as an Excel with a
+    'Finale' sheet -- or None when Finale is off and there is nothing to list. Out of
+    accounting's email since 2026-09-25 (it repeated every day); downloaded from the
+    dashboard at /api/finale/reconciliation.xlsx instead."""
+    data = data or _so_digest_data()
+    finale_rows = (data.get("recon") or _EMPTY_RECON).get("rows") if data.get("finale_enabled") else None
+    if finale_rows is None and not data.get("nonedi"):
+        return None
+    return _so_digest_workbook([], {}, None, finale_rows=finale_rows or [], nonedi=data.get("nonedi"))
 
 
 def _auto_digest_enabled() -> bool:
