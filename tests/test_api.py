@@ -466,6 +466,27 @@ def test_so_digest_lists_pushed_sos_gaps_and_marks_reported(client, monkeypatch)
     assert tracking.get_latest_events(["so-2"])["so-2"]["so_digest_at"] is None
 
 
+def test_resubmission_of_a_pre_go_live_invoice_is_not_a_gap_or_pushed(client, monkeypatch):
+    """INV538596153: original created 09-01 (before the 09-11 go-live, invoiced in
+    NetSuite by hand), resubmitted 09-15 with a new invoice_date. It is neither a
+    "No SO in NetSuite" gap nor a push candidate -- an SO would duplicate that invoice."""
+    from app.crstl_cache import _cache
+    from app.accounting import _so_digest_data, _run_netsuite_push_job
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setattr("app.accounting.load_refs", lambda: {"automation": {"go_live_after": "2026-09-11", "created_within_days": 3650}})
+    invs = _so_ready_invoices()
+    original = {**invs[1], "transaction_id": "so-2-orig", "invoice_date": "2026-09-01", "created_at": "2026-09-01T12:03:38Z"}
+    with patch.dict(_cache, {"invoices": invs + [original]}), \
+         patch("app.finale_jobs._finale_enabled", return_value=False):
+        data = _so_digest_data()
+        assert [g["transaction_id"] for g in data["gaps"]] == ["so-1"]        # so-2 is not a gap
+        monkeypatch.setattr("app.automation._job_enabled", lambda *a, **k: True)
+        with patch("app.accounting._run_netsuite_push", return_value={"summary": {"sent": 1, "failed": 0, "skipped": 0, "skipped_no_map": 0}}) as push:
+            _run_netsuite_push_job()
+    assert push.call_args.args[1] == ["so-1"]                                   # so-2 is not pushed
+
+
 def test_so_digest_workbook_adds_linked_so_column(monkeypatch):
     """The digest Excel is the export workbook (Invoices sheet) plus a
     'Netsuite SO created' column whose cell links straight to the SO."""

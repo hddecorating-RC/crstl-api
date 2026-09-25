@@ -11,7 +11,7 @@ from app import tracking
 from app.mail import send_mail, MailConfigError
 from app.netsuite import transform_invoice, resolve_customer, external_id_for
 from app.netsuite_csv import build_netsuite_csv
-from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation
+from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation, predates_go_live
 from app.netsuite_payload import load_refs
 from app.report import (
     XLSX_MEDIA_TYPE, dates_for, flavor_of, product_for, rows_for_transactions, window_label,
@@ -200,8 +200,10 @@ def _so_digest_data() -> dict:
     with _cache_lock:
         invoices = list(_cache["invoices"])
     cutoff = str((load_refs().get("automation") or {}).get("go_live_after") or "")
+    handled = predates_go_live(invoices, cutoff)
     scoped = [i for i in eligible_for_push(invoices)
-              if str(i.get("invoice_date") or "")[:10] >= cutoff]
+              if str(i.get("invoice_date") or "")[:10] >= cutoff
+              and str(i.get("source_document_id")) not in handled]
     events = tracking.get_latest_events([str(i["transaction_id"]) for i in scoped])
 
     def ev(i, k):
@@ -841,7 +843,8 @@ def _run_netsuite_push_job() -> None:
     cap = auto.get("max_per_run")
     with _cache_lock:
         invoices = list(_cache["invoices"])
-    candidates = eligible_for_push(invoices)
+    handled = predates_go_live(invoices, cutoff)
+    candidates = [i for i in eligible_for_push(invoices) if str(i.get("source_document_id")) not in handled]
     unpushed = tracking.get_unpushed_ids([str(i["transaction_id"]) for i in candidates])
     to_push, blocked = select_for_automation(candidates, unpushed,
                                               created_after=cutoff,

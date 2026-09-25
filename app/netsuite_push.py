@@ -72,6 +72,20 @@ def select_latest_accepted(invoices: list[dict]) -> list[dict]:
     return list(best.values())
 
 
+def predates_go_live(invoices: list[dict], cutoff: str | None) -> set[str]:
+    """source_document_ids of logical invoices with ANY version created before the
+    go-live cutoff. Those were invoiced in NetSuite outside this tool (by hand or
+    import, not under our externalId), so a later resubmission -- which CRSTL
+    re-dates, e.g. INV538596153: 09-01 original, 09-15 resubmission -- is neither
+    pushed (it would duplicate that invoice) nor a "No SO" gap. All versions count,
+    not only Accepted ones. Keyed on created_at, like the automation floor."""
+    if not cutoff:
+        return set()
+    return {str(i.get("source_document_id")) for i in invoices
+            if i.get("source_document_id") and str(i.get("created_at") or "")[:10] < cutoff
+            and i.get("created_at")}
+
+
 def eligible_for_push(invoices: list[dict]) -> list[dict]:
     """The SINGLE definition of what the connector may push: Accepted, one (latest)
     version per logical invoice (source_document_id), non-zero gross. Enforced

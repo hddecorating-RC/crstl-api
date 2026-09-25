@@ -461,3 +461,13 @@ def test_reconcile_flag_ignores_penny_rounding():
            "store": "VAUGHAN", "province": "ON"}
     r = push_invoices([inv], live=False, refs=REFS_FULL)["results"][0]
     assert round(r["delta"], 2) == -0.01 and r["reconcile_flag"] is None
+
+
+def test_predates_go_live_takes_any_version_created_before_the_cutoff():
+    from app.netsuite_push import predates_go_live
+    invs = [{"source_document_id": "a", "created_at": "2026-09-01T12:00:00Z", "status": "Draft"},
+            {"source_document_id": "a", "created_at": "2026-09-15T07:31:51Z", "status": "Accepted"},
+            {"source_document_id": "b", "created_at": "2026-09-15T07:31:51Z", "status": "Accepted"},
+            {"source_document_id": "c", "created_at": "", "status": "Accepted"}]
+    assert predates_go_live(invs, "2026-09-11") == {"a"}     # missing created_at is not evidence
+    assert predates_go_live(invs, None) == set()
