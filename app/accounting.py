@@ -785,7 +785,24 @@ def _run_daily_digest_job() -> None:
     if not data["new_sos"] and not data["gaps"]:
         tracking.record_job_run("daily_digest", "ok", "nothing to report")
         return
+    # Gaps are standing, not new: a gap nobody resolves (INV538596153, 2026-09-24)
+    # would otherwise re-send the digest every morning. Once a digest has gone out
+    # today (ET) it already listed them, so only unreported SOs justify a second.
+    if not data["new_sos"] and _sent_today_et(_last_digest_sent_at()):
+        tracking.record_job_run("daily_digest", "ok",
+                                f"nothing to report ({len(data['gaps'])} gap(s) already in today's digest)")
+        return
     _send_digest_safe("scheduled")
+
+
+def _sent_today_et(iso: str | None) -> bool:
+    """True when `iso` (a UTC job_runs stamp) falls on today's date in ET."""
+    from zoneinfo import ZoneInfo
+    dt = _parse_iso(iso)
+    if not dt:
+        return False
+    et = ZoneInfo("America/Toronto")
+    return dt.astimezone(et).date() == datetime.now(et).date()
 
 
 def _run_ns_export_job() -> None:

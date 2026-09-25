@@ -1100,6 +1100,32 @@ def test_digest_drops_a_held_draft_once_someone_posts_it(client, monkeypatch):
     assert tracking.get_finale_invoices(["so-1"])["so-1"]["created_by"] == "edward.schiavon"
 
 
+def test_scheduled_digest_does_not_resend_standing_gaps(client, monkeypatch):
+    """The 7:15 safety-net: a gap already in today's post-push digest does not send
+    a second email (INV538596153 did, every day from 2026-09-24); unreported SOs,
+    or gaps with no digest yet today, still send."""
+    from datetime import datetime, timedelta, timezone
+    from app.accounting import _run_daily_digest_job
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setattr("app.accounting._auto_digest_enabled", lambda: True)
+    now = datetime.now(timezone.utc).isoformat()
+    gap = {"new_sos": [], "gaps": [{"transaction_id": "g"}]}
+
+    def run(data, last_sent):
+        with patch("app.accounting._so_digest_data", return_value=data), \
+             patch("app.accounting._last_digest_sent_at", return_value=last_sent), \
+             patch("app.accounting._send_digest_safe") as send:
+            _run_daily_digest_job()
+        return send.called
+
+    assert not run(gap, now)                                    # gap already sent today: quiet
+    assert tracking.recent_job_runs(1, "daily_digest")[0]["detail"].startswith("nothing to report")
+    assert run(gap, None)                                       # no digest yet: the gap is reported
+    assert run(gap, (datetime.now(timezone.utc) - timedelta(days=2)).isoformat())
+    assert run({"new_sos": [{"transaction_id": "s"}], "gaps": []}, now)   # unreported SOs always send
+
+
 def test_digest_nonedi_window_starts_at_the_last_sent_digest(client):
     from app.accounting import _last_digest_sent_at
     from app import tracking
