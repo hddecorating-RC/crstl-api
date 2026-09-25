@@ -489,17 +489,27 @@ def _invoice_check_data() -> dict:
             "total": inv.get("total_amount"), "problems": [], "outcomes": [], "issues": [], "new": False,
             "first_seen": None})
         for x in v["issues"]:
-            entry["issues"].append(x["issue"])
             key = f"{num}:{x['issue']}"
+            # Still tracked when not shown: dropping it from `current` would mark it
+            # resolved, and it would come back as "new" the next day.
             current.append({"key": key, "invoice_number": num, "issue": x["issue"], "problem": x["problem"]})
+            row = existing.get(key)
+            is_new = not row or row.get("resolved_at")
+            if x["issue"] == "changed_after_push" and not is_new:
+                # An expected chargeback is reported ONCE (Ritchie, 2026-09-25: "report it
+                # once so accounting is made aware, but don't repeat"). Nothing on our side
+                # sees the chargeback land -- dropship chargebacks reach only HD's portal,
+                # never CRSTL's 812 feed -- so there is no later event to wait for.
+                continue
+            entry["issues"].append(x["issue"])
             entry["problems"].append(x["problem"])
             if x["outcome"] not in entry["outcomes"]:
                 entry["outcomes"].append(x["outcome"])
-            row = existing.get(key)
-            if not row or row.get("resolved_at"):
+            if is_new:
                 entry["new"] = True
             else:
                 entry["first_seen"] = min(entry["first_seen"] or row["first_seen"], row["first_seen"])
+    by_inv = {k: r for k, r in by_inv.items() if r["problems"]}
     keys = {c["key"] for c in current}
     cleared = sorted({r["invoice_number"] for k, r in existing.items()
                       if not r.get("resolved_at") and k not in keys} - set(by_inv))

@@ -323,6 +323,30 @@ def test_digest_reports_a_changed_invoice_even_from_before_the_floor(checks_on):
     assert "draft" not in html.lower()
 
 
+def test_an_expected_chargeback_is_reported_once_then_never_repeated(checks_on):
+    """Shown in the first digest that goes out, then silent -- but still tracked, so it
+    is not marked resolved and can't come back as 'new'."""
+    from app import accounting, tracking
+    from app.crstl_cache import _cache
+    inv = _good("dropship", "SK", 101.40, number="INV538909096", transaction_id="tx-sk")
+    tracking.record_push_snapshot("tx-sk", "INV538909096", "netsuite", inv["total_amount"] + 5.80)
+
+    def check():
+        with patch.dict(_cache, {"invoices": [inv], "status": "ok"}), \
+             patch("app.accounting._netsuite_reader", return_value=False):
+            return accounting._invoice_check_data()
+    first = check()
+    assert [r["invoice_number"] for r in first["rows"]] == ["INV538909096"]
+    assert check()["rows"]                                   # digest not sent yet: still shown
+    tracking.sync_invoice_checks(first["current"])           # the digest showing it went out
+    for _ in range(2):
+        again = check()
+        assert again["rows"] == [] and again["cleared"] == []
+        assert "INV538909096:changed_after_push" in {c["key"] for c in again["current"]}
+        tracking.sync_invoice_checks(again["current"])
+    assert "HD chargebacks to expect" not in accounting._invoice_check_html(again)
+
+
 def test_snapshot_survives_a_repush_and_reads_back_per_target():
     from app import tracking
     tracking.init_db()
