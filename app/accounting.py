@@ -495,10 +495,9 @@ def _invoice_check_data() -> dict:
             current.append({"key": key, "invoice_number": num, "issue": x["issue"], "problem": x["problem"]})
             row = existing.get(key)
             is_new = not row or row.get("resolved_at")
-            if x["issue"] == "changed_after_push" and not is_new:
-                # An expected chargeback is reported ONCE (Ritchie, 2026-09-25: "report it
-                # once so accounting is made aware, but don't repeat"). Nothing on our side
-                # sees the chargeback land -- dropship chargebacks reach only HD's portal,
+            if invoice_checks.reported_once(x["issue"]) and not is_new:
+                # Reported once already (invoice_checks.REPORT_ONCE). Nothing on our side
+                # sees a chargeback land -- dropship chargebacks reach only HD's portal,
                 # never CRSTL's 812 feed -- so there is no later event to wait for.
                 continue
             entry["issues"].append(x["issue"])

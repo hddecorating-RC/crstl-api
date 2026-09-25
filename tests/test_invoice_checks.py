@@ -347,6 +347,12 @@ def test_an_expected_chargeback_is_reported_once_then_never_repeated(checks_on):
     assert "HD chargebacks to expect" not in accounting._invoice_check_html(again)
 
 
+def test_met_off_its_formula_is_reported_once_other_rules_repeat():
+    from app import invoice_checks as ic2
+    assert ic2.reported_once("discount_off:E210") and ic2.reported_once("changed_after_push")
+    assert not ic2.reported_once("discount_off:I170") and not ic2.reported_once("hd_reject:abc")
+
+
 def test_snapshot_survives_a_repush_and_reads_back_per_target():
     from app import tracking
     tracking.init_db()

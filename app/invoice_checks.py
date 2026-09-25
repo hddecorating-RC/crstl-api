@@ -173,6 +173,17 @@ def check_invoice(inv: dict) -> list[dict]:
 BOOKS = "Our books to correct"
 
 
+# Findings reported in ONE sent digest, then tracked but not shown (Ritchie,
+# 2026-09-25: "report it once so accounting is made aware, but don't repeat. it just
+# becomes noise"): an expected chargeback, and MET off its formula. Both are on an
+# accepted invoice that can't be re-sent, so repeating them changes nothing.
+REPORT_ONCE = ("changed_after_push", "discount_off:E210")
+
+
+def reported_once(issue: str) -> bool:
+    return issue in REPORT_ONCE
+
+
 def changed_after_push(inv: dict, snaps: dict, netsuite_total: float | None = None) -> list[dict]:
     """HD was billed a different amount from what the invoice now says. CRSTL edits an
     ACCEPTED invoice in place, keeping the transaction id (six SK invoices lost their PST
