@@ -260,21 +260,38 @@ def test_no_start_date_checks_nothing():
 
 # ── an invoice CRSTL changed after we pushed it downstream ─────────────────────
 
-def test_changed_after_push_is_reported_against_what_we_sent():
-    """CRSTL edits an ACCEPTED invoice in place, keeping the transaction id, so the push
-    skips it as already done: six SK invoices lost their PST that way on 2026-09-22 while
-    NetSuite kept the old figure. The snapshot taken at push time is what catches it."""
+def test_changed_after_push_is_an_expected_chargeback_not_an_edit():
+    """CRSTL edits an ACCEPTED invoice in place (six SK invoices lost their PST on
+    2026-09-22), but HD keeps what it accepted and it can't be re-sent: HD charges the
+    difference back. Accounting sees NetSuite, not CRSTL, so the row speaks of that."""
     inv = _good("dropship", "SK", 101.40, number="INV538909096", transaction_id="tx-sk")
     inv["total_amount"] = 101.56
     assert ic.changed_after_push(inv, {}) == []                                  # never pushed: nothing to say
     assert ic.changed_after_push(inv, {"netsuite": {"hd_total": 101.56}}) == []   # unchanged since the push
-    one = ic.changed_after_push(inv, {"netsuite": {"hd_total": 107.36}})
+    one = ic.changed_after_push(inv, {"netsuite": {"hd_total": 107.36}}, netsuite_total=107.36)
     assert [i["issue"] for i in one] == ["changed_after_push"]
-    assert "sent to NetSuite: $107.36 -> $101.56" in one[0]["problem"]
-    assert one[0]["outcome"] == "NetSuite entry to correct"
-    both = ic.changed_after_push(inv, {"netsuite": {"hd_total": 107.36}, "finale": {"hd_total": 107.36}})
-    assert "sent to Finale and NetSuite" in both[0]["problem"]
-    assert both[0]["outcome"] == "Finale + NetSuite entries to correct"
+    assert one[0]["problem"].startswith("HD was billed $107.36; the correct amount is $101.56")
+    assert "chargeback of about $5.80" in one[0]["outcome"] and "match it to this invoice" in one[0]["outcome"]
+    assert "not checked" not in one[0]["outcome"]
+    unread = ic.changed_after_push(inv, {"netsuite": {"hd_total": 107.36}})
+    assert unread[0]["outcome"].endswith("(NetSuite not checked today)")
+    for x in one + unread:
+        assert "draft" not in (x["problem"] + x["outcome"]).lower() and "crstl" not in (x["problem"] + x["outcome"]).lower()
+
+
+def test_netsuite_already_corrected_says_not_to_apply_the_chargeback_twice():
+    """INV538740348: HD billed $60.53 with PST, NetSuite already holds $55.25 without it."""
+    inv = _good("dropship", "SK", 55.50, number="INV538740348", transaction_id="tx-old")
+    inv["total_amount"] = 55.35
+    x = ic.changed_after_push(inv, {"netsuite": {"hd_total": 60.53}}, netsuite_total=55.25)[0]
+    assert "NetSuite already has $55.25" in x["problem"]
+    assert "chargeback of about $5.18" in x["outcome"] and "don't reduce this entry again" in x["outcome"]
+
+
+def test_under_billed_says_hd_will_not_pay_the_difference():
+    inv = _good("dropship", "ON", 100.0, transaction_id="tx-u")
+    x = ic.changed_after_push(inv, {"netsuite": {"hd_total": inv["total_amount"] - 3}})[0]
+    assert "more)" in x["problem"] and "claimed in HD's portal" in x["outcome"]
 
 
 def test_a_cent_of_rounding_is_not_a_change():
@@ -285,19 +302,25 @@ def test_a_cent_of_rounding_is_not_a_change():
 
 def test_digest_reports_a_changed_invoice_even_from_before_the_floor(checks_on):
     """The floor bounds HD's rules; our own books are checked on every pushed invoice,
-    however old -- INV538740348 (Sep 9) is before the Sep 11 floor and still counts."""
+    however old -- INV538740348 (Sep 9) is before the Sep 11 floor and still counts. It
+    reads NetSuite's real entry and lists the row under chargebacks, not 'nothing to do'."""
     from app import accounting, tracking
     from app.crstl_cache import _cache
     old = _good("dropship", "SK", 55.50, number="INV538740348",
                 created="2026-09-09T15:09:00Z", transaction_id="tx-old")
+    old["total_amount"] = 55.35
     tracking.record_push_snapshot("tx-old", "INV538740348", "netsuite", 60.53)
-    with patch.dict(_cache, {"invoices": [old], "status": "ok"}):
+    with patch.dict(_cache, {"invoices": [old], "status": "ok"}), \
+         patch("app.accounting._netsuite_reader", return_value=object()), \
+         patch("app.accounting._netsuite_total", return_value=55.25) as ns:
         chk = accounting._invoice_check_data()
+    ns.assert_called_once()
     row = next(r for r in chk["rows"] if r["invoice_number"] == "INV538740348")
-    assert "changed after it was sent to NetSuite" in row["problems"][0]
-    assert row["outcomes"] == ["NetSuite entry to correct"]
+    assert "NetSuite already has $55.25" in row["problems"][0]
+    assert "don't reduce this entry again" in row["outcomes"][0]
     html = accounting._invoice_check_html(chk)
-    assert "What to do" in html and "HD may</th>" not in html
+    assert "HD chargebacks to expect" in html and "Nothing to do now" not in html
+    assert "draft" not in html.lower()
 
 
 def test_snapshot_survives_a_repush_and_reads_back_per_target():

@@ -173,13 +173,20 @@ def check_invoice(inv: dict) -> list[dict]:
 BOOKS = "Our books to correct"
 
 
-def changed_after_push(inv: dict, snaps: dict) -> list[dict]:
-    """The invoice is worth something different now than when we sent it to NetSuite or
-    Finale. CRSTL edits an ACCEPTED invoice in place, keeping the transaction id, so the
-    push sees it as already done and the two systems drift apart in silence -- which is
-    how six SK invoices kept their PST in NetSuite after CRSTL removed it (2026-09-22).
+def changed_after_push(inv: dict, snaps: dict, netsuite_total: float | None = None) -> list[dict]:
+    """HD was billed a different amount from what the invoice now says. CRSTL edits an
+    ACCEPTED invoice in place, keeping the transaction id (six SK invoices lost their PST
+    that way on 2026-09-22) -- but HD keeps what it accepted, and an accepted invoice can
+    never be re-sent (HD CMP payables doc p.8, p.9 E336, p.15). HD settles the difference
+    with a chargeback (812; taxes are a chargeback type, p.18-19).
 
-    `snaps` is {target: {"hd_total": float}} for this invoice's transaction."""
+    Worded for ACCOUNTING, who see NetSuite and HD's portal, never CRSTL (Ritchie,
+    2026-09-25): no drafts or versions, and the action is about the chargeback, not an
+    edit. `snaps` is {target: {"hd_total": float}} -- the 810's value when we pushed it,
+    i.e. what HD was billed. `netsuite_total` is NetSuite's CURRENT total for the entry
+    (None = not read / not found): when it no longer matches what HD was billed, NetSuite
+    already reflects the correction (INV538740348) and the chargeback must not be applied
+    to it a second time."""
     now = round(float(inv.get("total_amount") or 0), 2)
     # round the difference itself: 107.15 - 107.14 is a hair over 0.01 in binary floats,
     # and a cent of rounding is not a change worth reporting.
@@ -187,13 +194,20 @@ def changed_after_push(inv: dict, snaps: dict) -> list[dict]:
              if s.get("hd_total") is not None and round(abs(round(float(s["hd_total"]), 2) - now), 2) > 0.01}
     if not stale:
         return []
-    was = round(float(next(iter(stale.values()))["hd_total"]), 2)
-    where = {"netsuite": "NetSuite", "finale": "Finale"}
-    names = [where.get(t, t) for t in sorted(stale)]
-    listed = " and ".join(names)
-    return [_issue("changed_after_push", f"Amount changed after it was sent to {listed}: "
-                                         f"{_money(was)} -> {_money(now)}",
-                   f"{' + '.join(names)} entr{'ies' if len(names) > 1 else 'y'} to correct")]
+    billed = round(float((stale.get("netsuite") or next(iter(stale.values())))["hd_total"]), 2)
+    diff = round(billed - now, 2)
+    if diff < 0:
+        return [_issue("changed_after_push",
+                       f"HD was billed {_money(billed)}; the correct amount is {_money(now)} ({_money(-diff)} more)",
+                       "HD won't pay the difference unless it is claimed in HD's portal")]
+    problem = f"HD was billed {_money(billed)}; the correct amount is {_money(now)}"
+    if netsuite_total is not None and abs(round(float(netsuite_total), 2) - billed) > 0.05:
+        return [_issue("changed_after_push", f"{problem}. NetSuite already has {_money(netsuite_total)}",
+                       f"Expect an HD chargeback of about {_money(diff)}. NetSuite already reflects it: "
+                       "don't reduce this entry again")]
+    checked = "" if netsuite_total is not None else " (NetSuite not checked today)"
+    return [_issue("changed_after_push", f"{problem}. Accepted invoices can't be re-sent",
+                   f"Expect an HD chargeback of about {_money(diff)}. It is valid: match it to this invoice{checked}")]
 
 
 def _created(inv: dict) -> str:

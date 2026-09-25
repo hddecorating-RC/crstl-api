@@ -465,8 +465,14 @@ def _invoice_check_data() -> dict:
         if num and (num not in latest_all or str(i.get("created_at") or "") > str(latest_all[num].get("created_at") or "")):
             latest_all[num] = i
     snaps = tracking.get_push_snapshots([str(i["transaction_id"]) for i in latest_all.values()])
+    ns_client = None
     for num, i in latest_all.items():
-        drift = invoice_checks.changed_after_push(i, snaps.get(str(i["transaction_id"]), {}))
+        snap = snaps.get(str(i["transaction_id"]), {})
+        drift = invoice_checks.changed_after_push(i, snap)
+        if drift and "netsuite" in snap:
+            # Read NetSuite's real entry before telling accounting what to do with it.
+            ns_client = ns_client or _netsuite_reader()
+            drift = invoice_checks.changed_after_push(i, snap, _netsuite_total(ns_client, i))
         if drift:
             entry = result["results"].setdefault(num, {"invoice": i, "issues": [], "draft_at": None})
             entry["issues"].extend(drift)
@@ -480,9 +486,10 @@ def _invoice_check_data() -> dict:
             "invoice_number": num, "po_number": inv.get("po_number"),
             "channel": "DSD" if invoice_checks.channel_of(inv) == "dsd" else "Dropship",
             "province": inv.get("province") or "", "sent": _et(inv.get("created_at"))[:10],
-            "total": inv.get("total_amount"), "problems": [], "outcomes": [], "new": False, "first_seen": None,
-            "draft_note": (f"A corrected version was drafted {_et(v['draft_at'])[:10]} but not sent" if v["draft_at"] else "")})
+            "total": inv.get("total_amount"), "problems": [], "outcomes": [], "issues": [], "new": False,
+            "first_seen": None})
         for x in v["issues"]:
+            entry["issues"].append(x["issue"])
             key = f"{num}:{x['issue']}"
             current.append({"key": key, "invoice_number": num, "issue": x["issue"], "problem": x["problem"]})
             entry["problems"].append(x["problem"])
@@ -504,6 +511,35 @@ def _invoice_check_data() -> dict:
             "rejects_after": rejects_floor, "rejects_error": rejects_error,
             "returned": sorted({r["invoice_number"] for r in rows
                                 if invoice_checks.RETURNED in r["outcomes"]})}
+
+
+def _netsuite_reader():
+    """A NetSuite client for read-only lookups, or False when it can't be built."""
+    try:
+        from app.netsuite_client import NetSuiteClient
+        return NetSuiteClient()
+    except Exception as exc:
+        print(f"WARNING: NetSuite reader unavailable for the digest: {exc}")
+        return False
+
+
+def _netsuite_total(client, inv: dict) -> float | None:
+    """NetSuite's current total for this invoice's entry (the SO, or an invoice imported
+    under our externalId before the SO pivot), or None if it can't be read."""
+    if not client:
+        return None
+    from app.netsuite_client import NetSuiteExternalIdConflict
+    try:
+        eid = external_id_for(inv)
+        try:
+            rec = client.get_by_external_id("salesOrder", eid)
+        except NetSuiteExternalIdConflict:
+            rec = None
+        rec = rec or client.get_by_external_id("invoice", eid)
+        return float(rec["total"]) if rec and rec.get("total") is not None else None
+    except Exception as exc:
+        print(f"WARNING: NetSuite read failed for {inv.get('invoice_number')}: {exc}")
+        return None
 
 
 def _invoice_check_html(chk: dict) -> str:
@@ -528,35 +564,47 @@ def _invoice_check_html(chk: dict) -> str:
     if chk.get("rejects_error"):
         h += (f"<p {muted}>HD's reject messages could not all be read today "
               f"({html.escape(str(chk['rejects_error']))}), so this list may be short.</p>")
-    if not rows:
-        since = f" and no rejections from HD since {html.escape(str(chk.get('rejects_after')))}" if chk.get("rejects_after") else ""
-        h += (f"<p {muted}>{chk['sent_since_last']} invoice(s) sent since the last digest, checked against HD's "
-              f"invoicing rules: nothing to flag{since}.</p>")
+    cell = lambda v: f'<td valign="top">{html.escape(str(v if v not in (None, "") else "—"))}</td>'
+
+    def table(rs):
+        body = ""
+        for r in rs:
+            what = "<br>".join(html.escape(p) for p in r["problems"])
+            noted = "New" if r["new"] else f"Since {_et(r['first_seen'])[:10]}"
+            body += ("<tr>" + cell(r["invoice_number"]) + cell(r["po_number"]) + cell(f"{r['channel']} · {r['province']}")
+                     + cell(r["sent"]) + f'<td valign="top" align="right">${(r["total"] or 0):,.2f}</td>'
+                     + f'<td valign="top">{what}</td>' + cell("; ".join(r["outcomes"])) + cell(noted) + "</tr>")
+        return ('<table cellpadding="5" cellspacing="0" border="1" '
+                'style="border-collapse:collapse;font-size:12px;border-color:#d0d7e2;margin:6px 0 10px">'
+                '<tr style="background:#eef2f7;color:#1f3a5f"><th align="left">Invoice</th><th align="left">PO</th>'
+                '<th align="left">Channel</th><th align="left">Sent</th><th align="right">Total</th>'
+                "<th align=\"left\">What's different</th><th align=\"left\">What to do</th><th align=\"left\">Noted</th></tr>"
+                + body + "</table>")
+
+    # An accepted invoice billed at the wrong amount is not a "maybe": HD keeps what it
+    # accepted and settles the difference by chargeback. Its own short list, so it is
+    # never read under "nothing to do now".
+    billed = [r for r in rows if "changed_after_push" in r.get("issues", [])]
+    others = [r for r in rows if r not in billed]
+    if billed:
+        h += (f"<p {muted}><strong style=\"font-weight:600\">HD chargebacks to expect.</strong> HD accepted these "
+              "invoices at a different amount from the correct one. An accepted invoice can't be re-sent, so HD "
+              "settles the difference with a chargeback.</p>") + table(billed)
+    if not others:
+        if not billed:
+            since = f" and no rejections from HD since {html.escape(str(chk.get('rejects_after')))}" if chk.get("rejects_after") else ""
+            h += (f"<p {muted}>{chk['sent_since_last']} invoice(s) sent since the last digest, checked against HD's "
+                  f"invoicing rules: nothing to flag{since}.</p>")
     else:
         # The "may" paragraph is about our own rule checks. A row that is only HD's
         # rejection is not a guess, so it must not be described as one.
-        guesses = [r for r in rows if invoice_checks.RETURNED not in r["outcomes"]]
+        guesses = [r for r in others if invoice_checks.RETURNED not in r["outcomes"]]
         if guesses:
             g_new = sum(1 for r in guesses if r["new"])
             h += (f"<p {muted}>These invoices differ from HD's invoicing rules. Nothing to do now &mdash; if one shows up "
                   "as returned or on hold in HD's portal, this is likely why. "
                   f"{g_new} noted for the first time in this digest, {len(guesses) - g_new} noted earlier.</p>")
-        cell = lambda v: f'<td valign="top">{html.escape(str(v if v not in (None, "") else "—"))}</td>'
-        body = ""
-        for r in rows:
-            what = "<br>".join(html.escape(p) for p in r["problems"])
-            if r["draft_note"]:
-                what += f'<br><span style="color:#777">{html.escape(r["draft_note"])}</span>'
-            noted = "New" if r["new"] else f"Since {_et(r['first_seen'])[:10]}"
-            body += ("<tr>" + cell(r["invoice_number"]) + cell(r["po_number"]) + cell(f"{r['channel']} · {r['province']}")
-                     + cell(r["sent"]) + f'<td valign="top" align="right">${(r["total"] or 0):,.2f}</td>'
-                     + f'<td valign="top">{what}</td>' + cell("; ".join(r["outcomes"])) + cell(noted) + "</tr>")
-        h += ('<table cellpadding="5" cellspacing="0" border="1" '
-              'style="border-collapse:collapse;font-size:12px;border-color:#d0d7e2;margin:6px 0 10px">'
-              '<tr style="background:#eef2f7;color:#1f3a5f"><th align="left">Invoice</th><th align="left">PO</th>'
-              '<th align="left">Channel</th><th align="left">Sent</th><th align="right">Total</th>'
-              "<th align=\"left\">What's different</th><th align=\"left\">What to do</th><th align=\"left\">Noted</th></tr>"
-              + body + "</table>")
+        h += table(others)
     if cleared:
         h += f"<p {muted}>Cleared since the last digest (now match HD's rules): {html.escape(', '.join(cleared))}.</p>"
     if chk.get("dropship_without_gst"):
@@ -661,7 +709,7 @@ def _so_digest_workbook(new_sos: list[dict], so_map: dict, finale_map: dict | No
             hc = cs.cell(row=1, column=c)
             hc.fill = PatternFill("solid", fgColor="EEF2F7"); hc.font = Font(bold=True, color="1F3A5F", size=10)
         for r in check_rows:
-            what = "; ".join(r["problems"]) + (f" ({r['draft_note']})" if r.get("draft_note") else "")
+            what = "; ".join(r["problems"])
             cs.append([r["invoice_number"], r["po_number"], r["channel"], r["province"], r["sent"], r["total"], what,
                        "; ".join(r["outcomes"]), "New" if r["new"] else f"Since {_et(r['first_seen'])[:10]}"])
         for c, w in zip("ABCDEFGHI", (16, 12, 10, 9, 11, 12, 70, 28, 14)):

@@ -198,7 +198,7 @@ def test_digest_reports_no_rejections_and_an_unreadable_feed_rather_than_silence
                                                        "channel": "DSD", "province": "ON", "sent": "2026-09-24",
                                                        "total": 23193.72, "problems": ["HD returned it on 24 Sep: ED44"],
                                                        "outcomes": ["Correct and resend the same invoice number"],
-                                                       "new": True, "first_seen": None, "draft_note": ""}]})
+                                                       "new": True, "first_seen": None, "issues": []}]})
     assert "HD has returned 1 invoice</strong> (INV40856494)" in listed
 
 
