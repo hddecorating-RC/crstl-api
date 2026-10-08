@@ -39,6 +39,13 @@ ISSUES = {
         "detail": "packed over {packed_hours}h ago",
         "fix": "Ship Selected Sales if it went",
     },
+    # Ritchie, 2026-10-08: 539011943 was shipped in Finale with no tracking -- built,
+    # packed and shipped between two pre-fill polls -- and nothing said so for 12 days.
+    "shipped_no_tracking": {
+        "title": "Shipped without tracking",
+        "detail": "shipped in Finale over {untracked_minutes} min ago with no tracking number",
+        "fix": "copy the tracking from ShipStation onto the Finale shipment",
+    },
     # HD's own verdict, from the 864 error messages CRSTL mapped on 2026-09-24
     # (app.edi_rejects). Reported as events, not open conditions -- see EVENT_ISSUES.
     "asn_rejected": {
@@ -194,6 +201,64 @@ def find_packed_unshipped(shipments: list[dict], po_ids: dict, dropship_pos: set
     return out
 
 
+SHIPPED = "SHIPMENT_SHIPPED"
+
+
+def shipped_at(shipment: dict) -> datetime | None:
+    """When a Finale shipment was shipped, from the SHIPMENT_SHIPPED entry in its status
+    history (the listing carries it; shipDate is a date the warehouse may set)."""
+    for e in shipment.get("statusIdHistoryList") or []:
+        if isinstance(e, dict) and e.get("statusId") == SHIPPED and e.get("txStamp"):
+            try:
+                return datetime.fromtimestamp(int(e["txStamp"]), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                return None
+    return None
+
+
+def _untracked_dropship(shipments: list[dict], dropship_pos: set):
+    """(po, shipment) for every SHIPPED dropship sale shipment with no tracking number,
+    test orders excluded. The shipment LISTING carries trackingCode (checked 2026-10-08:
+    present on all 209 dropship shipments shipped since 2026-09-18), so this needs no
+    per-shipment read. DSD is excluded: it ships by freight, not a courier number."""
+    for s in shipments:
+        if str(s.get("statusId") or "") != SHIPPED or s.get("shipmentTypeId") != "SALES_SHIPMENT":
+            continue
+        po = str(s.get("primaryOrderUrl") or "").rstrip("/").rsplit("/", 1)[-1]
+        if po and po in dropship_pos and not po.upper().startswith("TEST_") and not str(s.get("trackingCode") or "").strip():
+            yield po, s
+
+
+def untracked_keys(shipments: list[dict], dropship_pos: set) -> set:
+    """Every untracked shipped dropship shipment's alert key, whatever its age -- what
+    decides whether an earlier alert has cleared."""
+    return {f"shipped_no_tracking:{s.get('shipmentId')}" for _, s in _untracked_dropship(shipments, dropship_pos)}
+
+
+def find_shipped_no_tracking(shipments: list[dict], po_ids: dict, dropship_pos: set, *, after_minutes: int,
+                             shipped_after: str | None = None, now: datetime | None = None) -> list[dict]:
+    """Rows for issue 'shipped_no_tracking': a dropship shipment shipped in Finale more than
+    `after_minutes` ago (time for the pre-fill to backfill it) that still has no tracking
+    number. `shipped_after` is a positive floor on the ship stamp (ET date)."""
+    now = now or datetime.now(timezone.utc)
+    out = []
+    for po, s in _untracked_dropship(shipments, dropship_pos):
+        when = shipped_at(s)
+        if when is None or (now - when).total_seconds() < after_minutes * 60:
+            continue
+        if shipped_after and when.astimezone(ET).strftime("%Y-%m-%d") < shipped_after:
+            continue
+        out.append({"issue": "shipped_no_tracking", "key": f"shipped_no_tracking:{s.get('shipmentId')}",
+                    "po_number": po, "url": crstl_po_url(po_ids.get(po)),
+                    "note": f"{s.get('shipmentIdUser') or s.get('shipmentId')}, shipped {when.astimezone(ET).strftime('%d %b %H:%M ET')}"})
+    return out
+
+
+def resolved_shipped_no_tracking(open_receipts: list[dict], still_untracked: set) -> list[dict]:
+    """Earlier 'shipped_no_tracking' receipts whose shipment now has tracking (or is gone)."""
+    return [r for r in open_receipts if r.get("issue") == "shipped_no_tracking" and r.get("key") not in still_untracked]
+
+
 # A rejection is an event, not a state: HD tells us it bounced a document, and nothing
 # on our side ever says it was put right -- CRSTL does not update the 856's own state
 # when HD's 864 arrives (proven: the March 864 rejects are not the two Rejected 856s).
@@ -317,7 +382,8 @@ def alert_email(new_rows: list[dict], still_open: list[dict], config: dict) -> t
     for issue, rows in by_issue.items():
         meta = ISSUES[issue]
         detail = meta["detail"].format(minutes=config.get("asn_missing_after_minutes", 60),
-                                       packed_hours=config.get("packed_unshipped_after_hours", 24))
+                                       packed_hours=config.get("packed_unshipped_after_hours", 24),
+                                       untracked_minutes=config.get("shipped_no_tracking_after_minutes", 45))
         h += (f'<p style="margin:0 0 4px"><strong>{html.escape(meta["title"])}</strong> — '
               f'{html.escape(detail)}. <em>{html.escape(meta["fix"])}.</em></p>'
               f'<ul style="margin:0 0 14px">'
@@ -345,6 +411,11 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
     found += find_packed_unshipped(finale_shipments, po_ids, dropship_pos or set(),
                                    after_hours=int(config.get("packed_unshipped_after_hours") or 24),
                                    packed_after=(str(config.get("packed_go_live_after") or "") or None), now=now)
+    # Off until shipped_no_tracking_go_live_after is set: switching it on never alerts history.
+    if config.get("shipped_no_tracking_go_live_after"):
+        found += find_shipped_no_tracking(finale_shipments, po_ids, dropship_pos or set(),
+                                          after_minutes=int(config.get("shipped_no_tracking_after_minutes") or 45),
+                                          shipped_after=str(config["shipped_no_tracking_go_live_after"]), now=now)
     rejected_rows = find_edi_rejected(rejections or [], doc_sources,
                                       go_live_after=(str(config.get("edi_reject_go_live_after") or "") or None))
     found += rejected_rows
@@ -360,6 +431,7 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
     hd_rejected_pos = {str(r["po_number"]) for r in rejected_rows if r["issue"] == "asn_rejected"}
     resolved = resolved_asn_missing(open_all, asn_pos, voided_keys, hd_rejected_pos)
     resolved += resolved_packed_unshipped(open_all, packed_keys)
+    resolved += resolved_shipped_no_tracking(open_all, untracked_keys(finale_shipments, dropship_pos or set()))
     resolved += resolved_catalogue(open_all, product_count, warn_at)
     still_open = [{**r, "url": crstl_po_url(po_ids.get(str(r.get("po_number")))),
                    "sent_et": (datetime.fromisoformat(r["sent_at"]).astimezone(ET).strftime("%d %b %H:%M ET") if r.get("sent_at") else "")}

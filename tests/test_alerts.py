@@ -338,3 +338,63 @@ def test_the_product_count_is_read_at_most_once_a_day(monkeypatch):
     stale = {"count": 5384, "checked_at": "2026-09-01T00:00:00+00:00"}
     tracking.set_json("finale_product_count", stale)
     assert alert_jobs._product_count() == 10000                                      # a full list counts as the limit
+
+
+# --- shipped with no tracking (539011943, Ritchie 2026-10-08) ------------------------
+SHIPPED_AT = 1790355090         # 2026-09-25 12:51:30 ET, when 539011943-1 was shipped
+def sship(po="539011943", sid=100714, tracking=None, shipped=SHIPPED_AT, status="SHIPMENT_SHIPPED"):
+    hist = [{"statusId": "SHIPMENT_SHIPPED", "txStamp": shipped}] if shipped else []
+    return {"shipmentId": sid, "shipmentIdUser": f"{po}-1", "statusId": status, "shipmentTypeId": "SALES_SHIPMENT",
+            "primaryOrderUrl": f"/hddecorating/api/order/{po}", "trackingCode": tracking, "statusIdHistoryList": hist}
+
+SDROP = {"539011943"}
+AN_HOUR_ON = datetime.fromtimestamp(SHIPPED_AT, tz=timezone.utc) + timedelta(hours=1)
+
+
+def test_find_shipped_no_tracking_reports_a_dropship_shipment_shipped_without_it():
+    from app.alerts import find_shipped_no_tracking
+    rows = find_shipped_no_tracking([sship()], {"539011943": "xyz"}, SDROP, after_minutes=45, now=AN_HOUR_ON)
+    assert len(rows) == 1 and rows[0]["issue"] == "shipped_no_tracking" and rows[0]["key"] == "shipped_no_tracking:100714"
+    assert rows[0]["po_number"] == "539011943" and rows[0]["note"] == "539011943-1, shipped 25 Sep 12:51 ET"
+    assert rows[0]["url"].endswith("/xyz/xyz")
+
+
+def test_find_shipped_no_tracking_leaves_out_what_is_fine_or_not_ours_to_judge():
+    from app.alerts import find_shipped_no_tracking
+    ships = [sship(sid=1, tracking="520770166533"),            # has tracking
+             sship(po="40865972", sid=2),                      # DSD: no courier tracking
+             sship(po="TEST_0005", sid=3),                     # fixture
+             sship(sid=4, status="SHIPMENT_PACKED"),           # not shipped yet
+             sship(sid=5, shipped=None)]                       # no ship stamp
+    assert find_shipped_no_tracking(ships, {}, SDROP | {"TEST_0005"}, after_minutes=45, now=AN_HOUR_ON) == []
+    # the pre-fill gets a few polls to fill it in first
+    assert find_shipped_no_tracking([sship()], {}, SDROP, after_minutes=90, now=AN_HOUR_ON) == []
+    # the floor keeps history out when the check is switched on
+    assert find_shipped_no_tracking([sship()], {}, SDROP, after_minutes=45, shipped_after="2026-10-08", now=AN_HOUR_ON) == []
+
+
+def test_shipped_no_tracking_resolves_once_tracking_is_on_the_shipment():
+    from app.alerts import resolved_shipped_no_tracking
+    open_rows = [{"issue": "shipped_no_tracking", "key": "shipped_no_tracking:100714"},
+                 {"issue": "packed_unshipped", "key": "packed_unshipped:1"}]
+    assert resolved_shipped_no_tracking(open_rows, {"shipped_no_tracking:100714"}) == []
+    assert resolved_shipped_no_tracking(open_rows, set()) == [open_rows[0]]
+
+
+def test_shipped_no_tracking_is_off_until_its_floor_is_set_then_alerts_once_and_clears(tmp_path, monkeypatch):
+    from app import tracking
+    monkeypatch.setenv("TRACKING_DB", str(tmp_path / "t.db")); tracking.init_db()
+    send = MagicMock()
+    ships = [sship()]
+    off = run_alerts([], set(), {}, config=CFG, live=True, recipients=["g@x"], send=send,
+                     finale_shipments=ships, dropship_pos=SDROP, now=AN_HOUR_ON)
+    assert off["new"] == [] and send.call_count == 0
+    on = {**CFG, "shipped_no_tracking_go_live_after": "2026-09-25", "shipped_no_tracking_after_minutes": 45}
+    r = run_alerts([], set(), {}, config=on, live=True, recipients=["g@x"], send=send,
+                   finale_shipments=ships, dropship_pos=SDROP, now=AN_HOUR_ON)
+    assert [x["key"] for x in r["new"]] == ["shipped_no_tracking:100714"] and send.call_count == 1
+    assert "Shipped without tracking" in send.call_args.kwargs["body_html"]
+    # tracking typed in: the alert clears, no email
+    fixed = run_alerts([], set(), {}, config=on, live=True, recipients=["g@x"], send=send,
+                       finale_shipments=[sship(tracking="520770166533")], dropship_pos=SDROP, now=AN_HOUR_ON)
+    assert fixed["resolved"] == ["shipped_no_tracking:100714"] and send.call_count == 1
