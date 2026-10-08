@@ -225,3 +225,78 @@ def test_the_runner_remembers_live_results_and_survives_a_failed_order_listing(m
         fin.list_sale_orders = boom                                        # listing down: per-order reads
         finale_jobs._run_dropship_prefill(False, ["538873472"], None)
         assert ("order", "538873472") in fin.calls
+
+
+# --- Shipped without tracking (539011943, 2026-09-25: built, packed and shipped in 85 s,
+# between two polls, so the packed-only pre-fill never saw it open). Ritchie 2026-10-08.
+
+class BackfillFinale(FakeFinale):
+    def __init__(self, tracking=None, order_status="ORDER_COMPLETED", **kw):
+        super().__init__(full={"shipmentUrl": SURL, "statusId": "SHIPMENT_SHIPPED", "trackingCode": tracking,
+                               "carrierPartyUrl": None}, order_status=order_status, **kw)
+    def complete_order(self, order):
+        self.calls.append(("complete", order.get("orderId"))); self._order_status = "ORDER_COMPLETED"; return order
+
+
+def _backfill(fin, *, live=True, marks=None, order_status=None, **kw):
+    return push_dropship_prefill([fship(status="SHIPMENT_SHIPPED")], [label()], live=live, client=fin,
+                                 carrier_url=PUROLATOR, backfill_shipped=True, marks=marks,
+                                 order_status=order_status, **kw)
+
+
+def test_backfill_is_off_unless_asked_for():
+    fin = BackfillFinale()
+    r = push_dropship_prefill([fship(status="SHIPMENT_SHIPPED")], [label()], live=True, client=fin, carrier_url=PUROLATOR)
+    assert r["results"][0]["status"] == "skipped_shipped" and fin.calls == []
+
+
+def test_a_shipped_shipment_with_no_tracking_gets_it_and_its_order_is_closed_again():
+    fin = BackfillFinale()
+    r = _backfill(fin)
+    row = r["results"][0]
+    assert row["status"] == "backfilled" and r["summary"]["backfilled"] == 1
+    assert ("update", SURL, {"trackingCode": "520756038656", "carrierPartyUrl": PUROLATOR}) in fin.calls
+    # reopened only to write, then completed again: the order ends where it was
+    assert [c[0] for c in fin.calls if c[0] in ("reopen", "update", "complete")] == ["reopen", "update", "complete"]
+    assert row["mark"]["tracking"] == "520756038656"
+
+
+def test_an_open_order_is_written_without_reopening_or_completing():
+    fin = BackfillFinale(order_status="ORDER_LOCKED")
+    r = _backfill(fin, order_status={"538873472": "ORDER_LOCKED"})
+    assert r["results"][0]["status"] == "backfilled"
+    assert [c[0] for c in fin.calls if c[0] in ("reopen", "complete")] == []
+
+
+def test_tracking_already_on_a_shipped_shipment_is_never_overwritten_and_remembered():
+    fin = BackfillFinale(tracking="TYPED-BY-HAND")
+    r = _backfill(fin)
+    row = r["results"][0]
+    assert row["status"] == "skipped_shipped" and not [c for c in fin.calls if c[0] in ("update", "reopen")]
+    assert row["mark"] == {"shipment_url": SURL, "po_number": "538873472", "tracking": "TYPED-BY-HAND", "carrier_url": ""}
+
+
+def test_a_shipped_shipment_checked_before_is_not_read_again():
+    fin = BackfillFinale()
+    r = _backfill(fin, marks={SURL: ("520756038656", PUROLATOR)})
+    assert r["results"][0]["status"] == "skipped_shipped" and fin.calls == []
+
+
+def test_a_dry_run_says_it_would_backfill_and_touches_nothing():
+    fin = BackfillFinale()
+    r = _backfill(fin, live=False)
+    assert r["results"][0]["status"] == "would_backfill"
+    assert [c[0] for c in fin.calls] == ["get"]
+
+
+def test_backfills_count_toward_the_cap():
+    fin = BackfillFinale()
+    r = _backfill(fin, max_per_run=0)
+    assert "blocked" in r and not [c for c in fin.calls if c[0] in ("reopen", "update", "complete")]
+
+
+def test_a_failed_backfill_still_closes_the_order_it_reopened():
+    fin = BackfillFinale(fail_update=True)
+    r = _backfill(fin)
+    assert r["results"][0]["status"] == "failed"
+    assert [c[0] for c in fin.calls if c[0] in ("reopen", "complete")] == ["reopen", "complete"]

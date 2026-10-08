@@ -37,9 +37,20 @@ i.e. when it has to be reopened -- including one the connection closed AFTER we 
 its shipment in, which is why a remembered shipment with a completed order still gets
 the full treatment. A shipment someone edits by hand after we filled it is not
 re-checked (and so not overwritten).
+
+SHIPPED WITHOUT TRACKING (Ritchie, 2026-10-08). 539011943 was built, packed and shipped
+in 85 seconds on 2026-09-25, between two polls: the pass only ever saw it "waiting" (no
+shipment) and then "shipped", so the tracking was never written and Edward typed it in
+by hand twelve days later. With `backfill_shipped` on, a SHIPPED shipment whose full
+record has no tracking gets the label's tracking (and the carrier, if it has none) --
+reopening a completed order only for the write and completing it again straight after,
+so the order ends where it was. Its date is untouched (frozen at ship). A shipped
+shipment that already carries a tracking number is never overwritten, whoever typed it;
+either way it is remembered (dropship_marks) and not read again.
 """
 COMPLETED = "ORDER_COMPLETED"
 OPEN = ("SHIPMENT_INPUT", "SHIPMENT_PACKED")
+SHIPPED = "SHIPMENT_SHIPPED"
 CANCELLED = "SHIPMENT_CANCELLED"
 
 
@@ -86,11 +97,12 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
                           only: list[str] | None = None, limit: int | None = None, client=None,
                           carrier_url: str | None = None, created_after: str | None = None,
                           max_per_run: int | None = None, reopen: bool = True,
-                          order_status: dict | None = None, marks: dict | None = None) -> dict:
+                          order_status: dict | None = None, marks: dict | None = None,
+                          backfill_shipped: bool = False) -> dict:
     """Write carrier + tracking onto the packed Finale shipment of each dropship
     label (live), or report what would be written (dry). One row per PO:
-      status: prefilled | would_prefill | skipped_equal | skipped_shipped |
-              skipped_no_shipment | skipped_ambiguous | skipped_floor | failed
+      status: prefilled | would_prefill | backfilled | would_backfill | skipped_equal |
+              skipped_shipped | skipped_no_shipment | skipped_ambiguous | skipped_floor | failed
     A row also carries `reopened` when the closed order had to be reopened first --
     which is also what makes the shipment actionable for the warehouse's end-of-day
     Ship click, so it happens even when there is nothing to write.
@@ -123,8 +135,9 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
     if limit is not None:
         pos = pos[:limit]
 
-    counts = {k: 0 for k in ("prefilled", "would_prefill", "skipped_equal", "skipped_shipped",
-                             "skipped_no_shipment", "skipped_ambiguous", "skipped_floor", "failed")}
+    counts = {k: 0 for k in ("prefilled", "would_prefill", "backfilled", "would_backfill", "skipped_equal",
+                             "skipped_shipped", "skipped_no_shipment", "skipped_ambiguous", "skipped_floor", "failed")}
+    backfills: list[tuple[dict, str, str]] = []
     results: list[dict] = []
     writers: list[tuple[dict, dict, dict]] = []
 
@@ -152,8 +165,28 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
         listed = ships[0]
         row["shipment_id_user"] = listed.get("shipmentIdUser") or listed.get("shipmentId")
         if str(listed.get("statusId") or "") not in OPEN:
-            finish(row, "skipped_shipped",
-                   error=f"already {str(listed.get('statusId')).replace('SHIPMENT_', '').lower()}"); continue
+            if not (backfill_shipped and str(listed.get("statusId") or "") == SHIPPED):
+                finish(row, "skipped_shipped",
+                       error=f"already {str(listed.get('statusId')).replace('SHIPMENT_', '').lower()}"); continue
+            url = str(listed.get("shipmentUrl"))
+            if marks and url in marks:
+                finish(row, "skipped_shipped", error="shipped; its tracking was checked earlier"); continue
+            try:
+                full = client.get_shipment(url)
+            except Exception as exc:  # noqa: BLE001
+                finish(row, "failed", error=f"Finale read failed: {exc}"); continue
+            have = str(full.get("trackingCode") or "")
+            if str(full.get("statusId") or "") != SHIPPED or have or not row["tracking"]:
+                # Already has a tracking number (never overwritten), or nothing to give it.
+                row["mark"] = {"shipment_url": url, "po_number": po, "tracking": have,
+                               "carrier_url": str(full.get("carrierPartyUrl") or "")}
+                finish(row, "skipped_shipped", error="already shipped" + (f", tracking {have}" if have else "")); continue
+            fields = {"trackingCode": row["tracking"]}
+            if carrier_url and not full.get("carrierPartyUrl"):
+                fields["carrierPartyUrl"] = carrier_url
+            row["fields"] = fields
+            finish(row, "would_backfill")
+            backfills.append((row, url, po)); continue
         url = str(listed.get("shipmentUrl"))
         listed_status = (order_status or {}).get(po) if order_status is not None else None
         wanted = (row["tracking"] or "", carrier_url or "")
@@ -187,8 +220,9 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
         writers.append((row, full, p["fields"]))
 
     blocked = None
-    if max_per_run is not None and len(writers) > max_per_run:
-        blocked = f"{len(writers)} shipments to write exceeds max_per_run {max_per_run} -- nothing written"
+    if max_per_run is not None and len(writers) + len(backfills) > max_per_run:
+        blocked = (f"{len(writers) + len(backfills)} shipments to write exceeds max_per_run {max_per_run}"
+                   " -- nothing written")
     for row, full, fields in (writers if (live and not blocked) else []):
         counts["would_prefill"] -= 1
         try:
@@ -198,6 +232,30 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
                            "tracking": row["tracking"] or "", "carrier_url": carrier_url or ""}
         except Exception as exc:  # noqa: BLE001
             row.update(status="failed", error=str(exc)); counts["failed"] += 1
+
+    for row, url, po in (backfills if (live and not blocked) else []):
+        counts["would_backfill"] -= 1
+        reopened = False
+        try:
+            listed_status = (order_status or {}).get(po) if order_status is not None else None
+            order = client.get_order(po) if listed_status in (None, COMPLETED) else None
+            if order is not None and str(order.get("statusId") or "") == COMPLETED:
+                client.reopen_order(order)       # a closed order's shipment cannot be written
+                reopened = row["reopened"] = True
+            client.update_shipment(url, row["fields"])
+            row["status"] = "backfilled"; counts["backfilled"] += 1
+            row["mark"] = {"shipment_url": url, "po_number": po, "tracking": row["tracking"] or "",
+                           "carrier_url": row["fields"].get("carrierPartyUrl", "")}
+        except Exception as exc:  # noqa: BLE001
+            row.update(status="failed", error=str(exc)); counts["failed"] += 1
+        finally:
+            if reopened:
+                # Back where it was: reopened only for the write.
+                try:
+                    client.complete_order(client.get_order(po))
+                    row["recompleted"] = True
+                except Exception as exc:  # noqa: BLE001
+                    row["error"] = f"{row.get('error') or ''}; could not complete the order again: {exc}".lstrip("; ")
 
     out = {"mode": "live" if live else "dry", "results": results,
            "summary": {"candidates": len(pos), **counts}}

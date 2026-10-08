@@ -429,7 +429,8 @@ def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[
                                        client=client, carrier_url=carrier["url"] if carrier["enabled"] else None,
                                        created_after=(str(cfg.get("go_live_after") or "") or None) if automated else None,
                                        max_per_run=cfg.get("max_per_run") if automated else None,
-                                       order_status=order_status, marks=tracking.get_dropship_marks())
+                                       order_status=order_status, marks=tracking.get_dropship_marks(),
+                                       backfill_shipped=bool(cfg.get("backfill_shipped")))
     if live:
         tracking.record_dropship_marks([r["mark"] for r in result["results"] if r.get("mark")])
     result["carrier"] = {"wanted": carrier["name"], "enabled": carrier["enabled"], "note": carrier["reason"] or None}
@@ -439,6 +440,7 @@ def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[
     tracking.record_job_run("dropship_prefill", "blocked" if blocked else ("ok" if not c.get("failed") else "partial"),
                             (f"{blocked} -- refusing; run manually" if blocked else
                              f"{c['candidates']} label(s): {c.get('prefilled', 0)} prefilled, {c.get('would_prefill', 0)} would, "
+                             f"{c.get('backfilled', 0)} backfilled, {c.get('would_backfill', 0)} would backfill, "
                              f"{c.get('skipped_equal', 0)} already set, {c.get('skipped_no_shipment', 0)} waiting, "
                              f"{c.get('skipped_shipped', 0)} shipped, {c.get('skipped_ambiguous', 0)} ambiguous, "
                              f"{c.get('failed', 0)} failed") + f" [{'live' if live else 'dry'}]")
