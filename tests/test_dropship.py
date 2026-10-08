@@ -300,3 +300,10 @@ def test_a_failed_backfill_still_closes_the_order_it_reopened():
     r = _backfill(fin)
     assert r["results"][0]["status"] == "failed"
     assert [c[0] for c in fin.calls if c[0] in ("reopen", "complete")] == ["reopen", "complete"]
+
+
+def test_a_shipped_shipment_the_listing_shows_tracked_is_not_read_at_all():
+    fin = BackfillFinale()
+    listed = {**fship(status="SHIPMENT_SHIPPED"), "trackingCode": "520770166533"}
+    r = push_dropship_prefill([listed], [label()], live=True, client=fin, carrier_url=PUROLATOR, backfill_shipped=True)
+    assert r["results"][0]["status"] == "skipped_shipped" and fin.calls == []

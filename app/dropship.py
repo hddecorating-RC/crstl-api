@@ -171,6 +171,9 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
             url = str(listed.get("shipmentUrl"))
             if marks and url in marks:
                 finish(row, "skipped_shipped", error="shipped; its tracking was checked earlier"); continue
+            # The listing carries trackingCode (all 856 shipments, 2026-10-08): a tracked one needs no read.
+            if str(listed.get("trackingCode") or "").strip():
+                finish(row, "skipped_shipped", error=f"already shipped, tracking {listed.get('trackingCode')}"); continue
             try:
                 full = client.get_shipment(url)
             except Exception as exc:  # noqa: BLE001
