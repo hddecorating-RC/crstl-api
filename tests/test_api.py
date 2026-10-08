@@ -516,6 +516,35 @@ def test_resubmission_of_a_pre_go_live_invoice_is_not_a_gap_or_pushed(client, mo
     assert push.call_args.args[1] == ["so-1"]                                   # so-2 is not pushed
 
 
+def test_a_do_not_push_po_is_neither_pushed_nor_a_gap(client, monkeypatch):
+    """Ritchie 2026-10-08: four July DSD orders (40850625, 40850642, 40853905, 40853936)
+    shipped with an ASN but no 810. Their 810s are being created now; if accounting
+    already keyed them into NetSuite by hand, an automated SO would duplicate them. A PO
+    on automation.do_not_push_pos is never auto-pushed and never reported as a gap."""
+    from app.crstl_cache import _cache
+    from app.accounting import _so_digest_data, _run_netsuite_push_job
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setattr("app.accounting.load_refs", lambda: {"automation": {
+        "go_live_after": "2026-09-11", "created_within_days": 3650, "do_not_push_pos": ["PO2"]}})
+    with patch.dict(_cache, {"invoices": _so_ready_invoices()}), \
+         patch("app.finale_jobs._finale_enabled", return_value=False):
+        assert [g["transaction_id"] for g in _so_digest_data()["gaps"]] == ["so-1"]
+        monkeypatch.setattr("app.automation._job_enabled", lambda *a, **k: True)
+        with patch("app.accounting._run_netsuite_push", return_value={"summary": {"sent": 1, "failed": 0, "skipped": 0, "skipped_no_map": 0}}) as push, \
+             patch("app.accounting._digest_after_scheduled_push"):
+            _run_netsuite_push_job()
+    assert push.call_args.args[1] == ["so-1"]
+
+
+def test_do_not_push_matches_on_po_number():
+    from app.netsuite_push import held_back
+    invs = [{"source_document_id": "a", "po_number": "40850625"}, {"source_document_id": "b", "po_number": "537006225"},
+            {"source_document_id": "c", "po_number": " 40853905 "}]
+    assert held_back(invs, ["40850625", "40853905"]) == {"a", "c"}
+    assert held_back(invs, None) == set()
+
+
 def test_so_digest_workbook_adds_linked_so_column(monkeypatch):
     """The digest Excel is the export workbook (Invoices sheet) plus a
     'Netsuite SO created' column whose cell links straight to the SO."""

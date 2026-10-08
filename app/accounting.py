@@ -12,7 +12,7 @@ from app import tracking
 from app.mail import send_mail, MailConfigError
 from app.netsuite import transform_invoice, resolve_customer, external_id_for
 from app.netsuite_csv import build_netsuite_csv
-from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation, predates_go_live
+from app.netsuite_push import push_invoices, eligible_for_push, select_for_automation, predates_go_live, held_back
 from app.netsuite_payload import load_refs
 from app.report import (
     XLSX_MEDIA_TYPE, dates_for, flavor_of, product_for, rows_for_transactions, window_label,
@@ -200,8 +200,9 @@ def _so_digest_data() -> dict:
     SO created), plus a dry-run row per new SO for its numbers + reconcile flag."""
     with _cache_lock:
         invoices = list(_cache["invoices"])
-    cutoff = str((load_refs().get("automation") or {}).get("go_live_after") or "")
-    handled = predates_go_live(invoices, cutoff)
+    auto = load_refs().get("automation") or {}
+    cutoff = str(auto.get("go_live_after") or "")
+    handled = predates_go_live(invoices, cutoff) | held_back(invoices, auto.get("do_not_push_pos"))
     scoped = [i for i in eligible_for_push(invoices)
               if str(i.get("invoice_date") or "")[:10] >= cutoff
               and str(i.get("source_document_id")) not in handled]
@@ -931,7 +932,7 @@ def _netsuite_push_scheduled() -> str | None:
     cap = auto.get("max_per_run")
     with _cache_lock:
         invoices = list(_cache["invoices"])
-    handled = predates_go_live(invoices, cutoff)
+    handled = predates_go_live(invoices, cutoff) | held_back(invoices, auto.get("do_not_push_pos"))
     candidates = [i for i in eligible_for_push(invoices) if str(i.get("source_document_id")) not in handled]
     unpushed = tracking.get_unpushed_ids([str(i["transaction_id"]) for i in candidates])
     to_push, blocked = select_for_automation(candidates, unpushed,

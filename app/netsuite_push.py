@@ -86,6 +86,17 @@ def predates_go_live(invoices: list[dict], cutoff: str | None) -> set[str]:
             and i.get("created_at")}
 
 
+def held_back(invoices: list[dict], do_not_push_pos) -> set[str]:
+    """source_document_ids of invoices whose PO is on automation.do_not_push_pos --
+    orders handled in NetSuite another way (keyed by hand before this tool), whose late
+    810s must reach HD but must not become a second NetSuite record. Treated like
+    predates_go_live: never auto-pushed, never a "No SO" gap. Ritchie, 2026-10-08:
+    the July DSD orders 40850625 / 40850642 / 40853905 / 40853936."""
+    pos = {str(p).strip() for p in (do_not_push_pos or []) if str(p).strip()}
+    return {str(i.get("source_document_id")) for i in invoices
+            if i.get("source_document_id") and str(i.get("po_number") or "").strip() in pos}
+
+
 def eligible_for_push(invoices: list[dict]) -> list[dict]:
     """The SINGLE definition of what the connector may push: Accepted, one (latest)
     version per logical invoice (source_document_id), non-zero gross. Enforced
