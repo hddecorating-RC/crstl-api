@@ -436,13 +436,14 @@ def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[
                                        order_status=order_status, marks=tracking.get_dropship_marks(),
                                        backfill_shipped=bool(cfg.get("backfill_shipped")),
                                        left_open=left_open, needs_person=needs_person)
-    if live:
-        tracking.record_dropship_marks([r["mark"] for r in result["results"] if r.get("mark")])
-        # Invoiced orders a backfill reopened and could not close: every run retries them.
-        # Strict: a failed save raises, so the run is recorded as an error, not lost quietly.
-        tracking.set_json_strict("dropship_left_open", result.get("left_open") or {})
-        # Read by the order watch, which emails order.alerts@ until each is closed.
-        tracking.set_json_strict("dropship_needs_person", result.get("needs_person") or {})
+        if live:
+            # Saved inside the lock, so a run waiting for it reads these, not a stale copy.
+            tracking.record_dropship_marks([r["mark"] for r in result["results"] if r.get("mark")])
+            # Invoiced orders a backfill reopened and could not close: every run retries them.
+            # Strict: a failed save raises, so the run is recorded as an error, not lost quietly.
+            tracking.set_json_strict("dropship_left_open", result.get("left_open") or {})
+            # Read by the order watch, which emails order.alerts@ until each is closed.
+            tracking.set_json_strict("dropship_needs_person", result.get("needs_person") or {})
     result["carrier"] = {"wanted": carrier["name"], "enabled": carrier["enabled"], "note": carrier["reason"] or None}
     blocked = result.get("blocked")
     _save_state("dropship", {"last_run": datetime.now(timezone.utc).isoformat(), **result})
