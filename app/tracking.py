@@ -229,6 +229,19 @@ def set_json(key: str, value) -> None:
     set_setting(key, json.dumps(value, default=str))
 
 
+def set_json_strict(key: str, value) -> None:
+    """Like set_json, but a failed WRITE raises. For state that must not be lost quietly
+    (the backfill's left-open / needs-person lists, review 2026-10-09)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with contextlib.closing(_connect()) as conn:
+        with conn:
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, json.dumps(value, default=str), now),
+            )
+
+
 def get_json_strict(key: str, default=None):
     """Like get_json, but a failed READ raises instead of looking like an empty value.
     For state whose absence means "all clear" (review 2026-10-09: a locked DB must not

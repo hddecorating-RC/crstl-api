@@ -424,11 +424,11 @@ def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[
     except Exception as exc:  # noqa: BLE001 -- without it, read each order as before
         print(f"WARNING: dropship pre-fill: sale-order listing failed, reading orders one by one: {exc}")
         order_status = None
-    # Strict: if these cannot be read the run stops here, before any write, rather than
-    # treat them as empty and save that over them.
-    left_open = tracking.get_json_strict("dropship_left_open", {}) or {}
-    needs_person = tracking.get_json_strict("dropship_needs_person", {}) or {}
     with _finale_run("dropship"):
+        # Strict, and inside the lock: if these cannot be read the run stops here, before
+        # any write, rather than treat them as empty and save that over them.
+        left_open = tracking.get_json_strict("dropship_left_open", {}) or {}
+        needs_person = tracking.get_json_strict("dropship_needs_person", {}) or {}
         result = push_dropship_prefill(client.list_shipments(), labels, live=live, only=ids, limit=limit,
                                        client=client, carrier_url=carrier["url"] if carrier["enabled"] else None,
                                        created_after=(str(cfg.get("go_live_after") or "") or None) if automated else None,
@@ -439,9 +439,10 @@ def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[
     if live:
         tracking.record_dropship_marks([r["mark"] for r in result["results"] if r.get("mark")])
         # Invoiced orders a backfill reopened and could not close: every run retries them.
-        tracking.set_json("dropship_left_open", result.get("left_open") or {})
+        # Strict: a failed save raises, so the run is recorded as an error, not lost quietly.
+        tracking.set_json_strict("dropship_left_open", result.get("left_open") or {})
         # Read by the order watch, which emails order.alerts@ until each is closed.
-        tracking.set_json("dropship_needs_person", result.get("needs_person") or {})
+        tracking.set_json_strict("dropship_needs_person", result.get("needs_person") or {})
     result["carrier"] = {"wanted": carrier["name"], "enabled": carrier["enabled"], "note": carrier["reason"] or None}
     blocked = result.get("blocked")
     _save_state("dropship", {"last_run": datetime.now(timezone.utc).isoformat(), **result})
