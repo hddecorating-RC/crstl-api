@@ -489,5 +489,4 @@ def test_the_runner_skips_a_run_whose_lists_cannot_be_read(monkeypatch):
         FC.configured.return_value = True; SC.configured.return_value = True
         with pytest.raises(RuntimeError, match="locked"):
             finale_jobs._run_dropship_prefill(True, None, None)
-    monkeypatch.undo()
     assert tracking.get_json("dropship_needs_person") == {"538873472": "t"}       # not erased
