@@ -51,6 +51,10 @@ either way it is remembered (dropship_marks) and not read again.
 COMPLETED = "ORDER_COMPLETED"
 OPEN = ("SHIPMENT_INPUT", "SHIPMENT_PACKED")
 SHIPPED = "SHIPMENT_SHIPPED"
+CANCELLED_ORDER = "ORDER_CANCELLED"
+CREATED_ORDER = "ORDER_CREATED"
+# An order a backfill left open is retried this many runs (~2 h), then handed to a person.
+MAX_RECLOSE_TRIES = 8
 CANCELLED = "SHIPMENT_CANCELLED"
 
 
@@ -98,7 +102,7 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
                           carrier_url: str | None = None, created_after: str | None = None,
                           max_per_run: int | None = None, reopen: bool = True,
                           order_status: dict | None = None, marks: dict | None = None,
-                          backfill_shipped: bool = False, left_open: list[str] | None = None) -> dict:
+                          backfill_shipped: bool = False, left_open: dict | list | None = None) -> dict:
     """Write carrier + tracking onto the packed Finale shipment of each dropship
     label (live), or report what would be written (dry). One row per PO:
       status: prefilled | would_prefill | backfilled | would_backfill | skipped_equal |
@@ -139,10 +143,15 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
                              "skipped_shipped", "skipped_no_shipment", "skipped_ambiguous", "skipped_floor", "failed")}
     backfills: list[tuple[dict, str, str]] = []
 
-    # Orders a backfill reopened and could not complete again (review 2026-10-09). They are
-    # invoiced but open in Finale; every live run tries to close them until it succeeds,
-    # and counts each one still open as a failure, so the job never reads "ok" meanwhile.
-    still_open = [str(p) for p in (left_open or [])]
+    # Orders a backfill reopened and could not complete again (reviews 2026-10-09): invoiced
+    # but open in Finale. {po: tries}. Every automated live run tries to close each one --
+    # locking it first if a reopen stopped half-way -- and counts it as a failure while it
+    # stays open. A cancelled order is dropped (nothing to close). After MAX_RECLOSE_TRIES
+    # it is handed to a person once (needs_person) and left alone, so a deliberate reopen
+    # is not fought forever and the job does not read "partial" for good.
+    still_open = ({str(k): int(v) for k, v in left_open.items()} if isinstance(left_open, dict)
+                  else {str(p): 0 for p in (left_open or [])})
+    needs_person: list[str] = []
 
     def is_closed(po: str) -> bool:
         try:
@@ -151,17 +160,26 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
             return False
         return o is None or str(o.get("statusId") or "") == COMPLETED
 
-    if live:
+    def reclose_left_open() -> None:
         for po in list(still_open):
             try:
-                if not is_closed(po):
+                o = client.get_order(po)
+                state = str((o or {}).get("statusId") or "")
+                if o is None or state == CANCELLED_ORDER:
+                    del still_open[po]; continue
+                if state != COMPLETED:
+                    if state == CREATED_ORDER and o.get("actionUrlLock"):
+                        o = client.lock_order(o) or client.get_order(po)
                     client.complete_order(client.get_order(po))
-                if is_closed(po):
-                    still_open.remove(po); counts["reclosed"] += 1
-                else:
-                    counts["failed"] += 1
-            except Exception:  # noqa: BLE001
-                counts["failed"] += 1
+            except Exception:  # noqa: BLE001 -- counted below as still open
+                pass
+            if is_closed(po):
+                del still_open[po]; counts["reclosed"] += 1
+                continue
+            counts["failed"] += 1
+            still_open[po] += 1
+            if still_open[po] >= MAX_RECLOSE_TRIES:
+                del still_open[po]; needs_person.append(po)
     results: list[dict] = []
     writers: list[tuple[dict, dict, dict]] = []
 
@@ -260,6 +278,10 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
         except Exception as exc:  # noqa: BLE001
             row.update(status="failed", error=str(exc)); counts["failed"] += 1
 
+    # Only on an automated live run that was not refused.
+    if live and not blocked and only is None:
+        reclose_left_open()
+
     for row, url, po in (backfills if (live and not blocked) else []):
         counts["would_backfill"] -= 1
         reopened = False
@@ -295,12 +317,12 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
                         counts["backfilled"] -= 1; counts["failed"] += 1
                         row["status"] = "failed"
                     row.pop("mark", None)
-                    still_open.append(po)
+                    still_open.setdefault(po, 0)
                     row["error"] = (f"{row.get('error') or ''}; could not complete the order again "
                                     f"(it is open in Finale){why}").lstrip("; ")
 
     out = {"mode": "live" if live else "dry", "results": results,
-           "left_open": sorted(set(still_open)),
+           "left_open": dict(sorted(still_open.items())), "needs_person": needs_person,
            "summary": {"candidates": len(pos), **counts}}
     if blocked:
         out["blocked"] = blocked

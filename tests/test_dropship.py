@@ -358,31 +358,31 @@ def test_a_complete_that_does_nothing_is_caught_by_re_reading_the_order():
     r = _backfill(fin)
     row = r["results"][0]
     assert row["status"] == "failed" and not row.get("mark")
-    assert r["left_open"] == ["538873472"] and "open in Finale" in row["error"]
+    assert r["left_open"] == {"538873472": 0} and "open in Finale" in row["error"]
 
 
 def test_a_failed_re_complete_is_remembered_for_the_next_run():
     r = _backfill(FlakyFinale(fail_complete=True))
-    assert r["left_open"] == ["538873472"]
+    assert r["left_open"] == {"538873472": 0}
 
 
 def test_the_next_run_completes_an_order_left_open_and_forgets_it():
     fin = FlakyFinale(order_status="ORDER_LOCKED")
-    r = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, left_open=["538873472"])
-    assert ("complete", "538873472") in fin.calls and r["left_open"] == []
+    r = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, left_open={"538873472": 0})
+    assert ("complete", "538873472") in fin.calls and r["left_open"] == {}
     assert r["summary"]["reclosed"] == 1
 
 
 def test_an_order_left_open_that_still_will_not_close_stays_on_the_list_and_counts_as_failed():
     fin = FlakyFinale(order_status="ORDER_LOCKED", fail_complete=True)
-    r = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, left_open=["538873472"])
-    assert r["left_open"] == ["538873472"] and r["summary"]["failed"] == 1
+    r = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, left_open={"538873472": 0})
+    assert r["left_open"] == {"538873472": 1} and r["summary"]["failed"] == 1
 
 
 def test_a_dry_run_leaves_the_left_open_list_alone():
     fin = FlakyFinale(order_status="ORDER_LOCKED")
-    r = push_dropship_prefill([], [], live=False, client=fin, backfill_shipped=True, left_open=["538873472"])
-    assert r["left_open"] == ["538873472"] and fin.calls == []
+    r = push_dropship_prefill([], [], live=False, client=fin, backfill_shipped=True, left_open={"538873472": 0})
+    assert r["left_open"] == {"538873472": 0} and fin.calls == []
 
 
 def test_the_runner_keeps_the_left_open_list_between_runs(monkeypatch):
@@ -391,13 +391,55 @@ def test_the_runner_keeps_the_left_open_list_between_runs(monkeypatch):
     fin.carrier_index = lambda: {}
     fin.list_shipments = lambda: []
     fin.list_sale_orders = lambda: []
-    tracking.set_json("dropship_left_open", ["538873472"])
+    tracking.set_json("dropship_left_open", {"538873472": 0})
     monkeypatch.setattr("app.finale_jobs._dropship_config", lambda: {"enabled": True, "store_id": 1, "backfill_shipped": True})
     monkeypatch.setattr("app.finale_jobs._finale_config", lambda: {"carriers": {"enabled": False}})
     with patch("app.finale.FinaleClient", return_value=fin) as FC, patch("app.finale_jobs.ShipStationClient") as SC:
         FC.configured.return_value = True; SC.configured.return_value = True
         SC.return_value = type("SS", (), {"list_shipments": lambda self, store, since: []})()
         finale_jobs._run_dropship_prefill(False, None, None)
-        assert tracking.get_json("dropship_left_open") == ["538873472"]      # a dry run changes nothing
+        assert tracking.get_json("dropship_left_open") == {"538873472": 0}   # a dry run changes nothing
         r = finale_jobs._run_dropship_prefill(True, None, None)
-    assert r["summary"]["reclosed"] == 1 and tracking.get_json("dropship_left_open") == []
+    assert r["summary"]["reclosed"] == 1 and tracking.get_json("dropship_left_open") == {}
+
+
+
+# --- Third review 2026-10-09: the left-open list has limits.
+
+class StatusFinale(FlakyFinale):
+    def get_order(self, po):
+        o = super().get_order(po)
+        # Like Finale: an editable (CREATED) order offers its lock action.
+        return {**o, "actionUrlLock": f"/o/{po}/lock"} if o["statusId"] == "ORDER_CREATED" else o
+    def lock_order(self, order):
+        self.calls.append(("lock", order.get("orderId"))); self._order_status = "ORDER_LOCKED"; return order
+
+
+def test_a_cancelled_order_is_dropped_from_the_list_without_a_write():
+    fin = StatusFinale(order_status="ORDER_CANCELLED")
+    r = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, left_open={"538873472": 2})
+    assert r["left_open"] == {} and not [c for c in fin.calls if c[0] in ("complete", "lock")]
+    assert r["summary"]["failed"] == 0
+
+
+def test_a_half_reopened_order_is_locked_then_completed():
+    fin = StatusFinale(order_status="ORDER_CREATED")
+    r = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, left_open={"538873472": 0})
+    assert [c[0] for c in fin.calls if c[0] in ("lock", "complete")] == ["lock", "complete"]
+    assert r["left_open"] == {} and r["summary"]["reclosed"] == 1
+
+
+def test_after_eight_tries_it_stops_and_asks_for_a_person_once():
+    fin = StatusFinale(order_status="ORDER_LOCKED", fail_complete=True)
+    r = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, left_open={"538873472": 7})
+    assert r["left_open"] == {} and r["needs_person"] == ["538873472"] and r["summary"]["failed"] == 1
+
+
+def test_a_refused_or_targeted_run_leaves_the_list_alone():
+    fin = StatusFinale(order_status="ORDER_LOCKED")
+    blocked = push_dropship_prefill([fship(status="SHIPMENT_SHIPPED")], [label()], live=True, client=fin, backfill_shipped=True,
+                                    carrier_url=PUROLATOR, max_per_run=0, left_open={"538873472": 0})
+    assert "blocked" in blocked and blocked["left_open"] == {"538873472": 0}
+    targeted = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, only=["X"], left_open={"538873472": 0})
+    assert targeted["left_open"] == {"538873472": 0}
+    assert not [c for c in fin.calls if c[0] in ("lock", "complete")]

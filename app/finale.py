@@ -500,6 +500,16 @@ class FinaleClient:
                     break
         return index
 
+    def lock_order(self, order: dict) -> dict | None:
+        """POST the order's actionUrlLock (ORDER_CREATED -> ORDER_LOCKED) and re-read it.
+        None when it offers no lock action. Used to finish a reopen that stopped half-way."""
+        url = order.get("actionUrlLock")
+        if not url:
+            return None
+        resp = self.session.post(self.HOST + url, json={}, timeout=self.TIMEOUT)
+        resp.raise_for_status()
+        return self.get_order(str(order.get("orderId")))
+
     def reopen_order(self, order: dict) -> dict:
         """Reopen a completed order: POST its actionUrlEdit (-> ORDER_CREATED, editable),
         then actionUrlLock (-> ORDER_LOCKED, committed) so it is back exactly where it
