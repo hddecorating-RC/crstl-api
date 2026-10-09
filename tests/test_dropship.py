@@ -307,3 +307,45 @@ def test_a_shipped_shipment_the_listing_shows_tracked_is_not_read_at_all():
     listed = {**fship(status="SHIPMENT_SHIPPED"), "trackingCode": "520770166533"}
     r = push_dropship_prefill([listed], [label()], live=True, client=fin, carrier_url=PUROLATOR, backfill_shipped=True)
     assert r["results"][0]["status"] == "skipped_shipped" and fin.calls == []
+
+
+# --- Review 2026-10-09: an invoiced order must never be left open without saying so.
+
+class FlakyFinale(BackfillFinale):
+    def __init__(self, fail_complete=False, fail_lock=False, complete_returns=True, **kw):
+        super().__init__(**kw)
+        self.fail_complete, self.fail_lock, self.complete_returns = fail_complete, fail_lock, complete_returns
+    def reopen_order(self, order):
+        self.calls.append(("reopen", order.get("orderId")))
+        self._order_status = "ORDER_CREATED"            # the edit went through...
+        if self.fail_lock:
+            raise RuntimeError("lock POST 500")          # ...but the lock did not
+        self._order_status = "ORDER_LOCKED"; return {**order, "statusId": "ORDER_LOCKED"}
+    def complete_order(self, order):
+        self.calls.append(("complete", order.get("orderId")))
+        if self.fail_complete:
+            raise RuntimeError("complete POST 500")
+        if not self.complete_returns:
+            return None
+        self._order_status = "ORDER_COMPLETED"; return order
+
+
+def test_a_failed_re_complete_is_a_failure_and_is_tried_again():
+    fin = FlakyFinale(fail_complete=True)
+    r = _backfill(fin)
+    row = r["results"][0]
+    assert row["status"] == "failed" and r["summary"]["failed"] == 1 and r["summary"]["backfilled"] == 0
+    assert "complete" in row["error"] and not row.get("mark")       # no mark: the next run looks again
+
+
+def test_a_half_done_reopen_is_still_completed_again():
+    fin = FlakyFinale(fail_lock=True)
+    r = _backfill(fin)
+    assert r["results"][0]["status"] == "failed"
+    assert [c[0] for c in fin.calls if c[0] in ("reopen", "complete")] == ["reopen", "complete"]
+
+
+def test_recompleted_only_when_the_complete_action_ran():
+    fin = FlakyFinale(complete_returns=False)
+    r = _backfill(fin)
+    assert not r["results"][0].get("recompleted")

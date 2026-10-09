@@ -366,13 +366,14 @@ class FinaleClient:
         return out
 
     def get_shipment(self, shipment_url: str) -> dict:
-        """One shipment by its API url. The shipment LISTING omits trackingCode and
-        carrierPartyUrl, so a caller deciding whether to write them needs this."""
+        """One shipment by its API url, with every field. (The LISTING does carry
+        trackingCode and carrierPartyUrl -- 856 of 856 shipments, checked 2026-10-08 --
+        which the backfill and the shipped_no_tracking alert rely on.)"""
         return self._get(shipment_url)
 
     def list_shipments(self) -> list[dict]:
-        """Every shipment in one request (statusId, primaryOrderUrl, shipmentUrl --
-        but NOT trackingCode or carrierPartyUrl). Same no-paging caveat as
+        """Every shipment in one request (statusId, primaryOrderUrl, shipmentUrl,
+        trackingCode, carrierPartyUrl -- checked 2026-10-08). Same no-paging caveat as
         fetch_ship_dates: `offset` does not work on this endpoint."""
         rows = self._list("shipment")
         return rows

@@ -243,8 +243,10 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
             listed_status = (order_status or {}).get(po) if order_status is not None else None
             order = client.get_order(po) if listed_status in (None, COMPLETED) else None
             if order is not None and str(order.get("statusId") or "") == COMPLETED:
-                client.reopen_order(order)       # a closed order's shipment cannot be written
+                # Set BEFORE the call: a reopen that fails part-way (edit done, lock not)
+                # has still opened the order, and must still be completed again.
                 reopened = row["reopened"] = True
+                client.reopen_order(order)       # a closed order's shipment cannot be written
             client.update_shipment(url, row["fields"])
             row["status"] = "backfilled"; counts["backfilled"] += 1
             row["mark"] = {"shipment_url": url, "po_number": po, "tracking": row["tracking"] or "",
@@ -253,12 +255,19 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
             row.update(status="failed", error=str(exc)); counts["failed"] += 1
         finally:
             if reopened:
-                # Back where it was: reopened only for the write.
+                # Back where it was: reopened only for the write. If that fails, the order
+                # is invoiced but open -- a failure the run must report, with no mark, so
+                # the next run looks again (review 2026-10-09).
                 try:
-                    client.complete_order(client.get_order(po))
-                    row["recompleted"] = True
+                    if client.complete_order(client.get_order(po)) is not None:
+                        row["recompleted"] = True
                 except Exception as exc:  # noqa: BLE001
-                    row["error"] = f"{row.get('error') or ''}; could not complete the order again: {exc}".lstrip("; ")
+                    if row["status"] == "backfilled":
+                        counts["backfilled"] -= 1; counts["failed"] += 1
+                        row["status"] = "failed"
+                    row.pop("mark", None)
+                    row["error"] = (f"{row.get('error') or ''}; could not complete the order again "
+                                    f"(it is open in Finale): {exc}").lstrip("; ")
 
     out = {"mode": "live" if live else "dry", "results": results,
            "summary": {"candidates": len(pos), **counts}}
