@@ -411,3 +411,16 @@ def test_an_invoiced_order_left_open_is_alerted_until_closed(tmp_path, monkeypat
     tracking.set_json("dropship_needs_person", {})
     r2 = run_alerts([], set(), {}, config=CFG, live=True, recipients=["g@x"], send=send, now=NOW)
     assert r2["resolved"] == ["order_left_open:538873472"]
+
+
+def test_a_failed_read_of_the_left_open_list_resolves_nothing(tmp_path, monkeypatch):
+    from app import tracking
+    monkeypatch.setenv("TRACKING_DB", str(tmp_path / "t.db")); tracking.init_db()
+    send = MagicMock()
+    tracking.set_json("dropship_needs_person", {"538873472": "2026-10-09T15:00:00+00:00"})
+    run_alerts([], set(), {}, config=CFG, live=True, recipients=["g@x"], send=send, now=NOW)
+    def boom(key, default=None):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(tracking, "get_json_strict", boom)
+    r = run_alerts([], set(), {}, config=CFG, live=True, recipients=["g@x"], send=send, now=NOW)
+    assert r["resolved"] == [] and [x["key"] for x in r["still_open"]] == ["order_left_open:538873472"]

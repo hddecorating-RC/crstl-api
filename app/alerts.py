@@ -39,8 +39,6 @@ ISSUES = {
         "detail": "packed over {packed_hours}h ago",
         "fix": "Ship Selected Sales if it went",
     },
-    # Ritchie, 2026-10-08: 539011943 was shipped in Finale with no tracking -- built,
-    # packed and shipped between two pre-fill polls -- and nothing said so for 12 days.
     # Ritchie / review 2026-10-09: the tracking backfill reopened an invoiced order and
     # could not complete it again after 8 tries. Repeats in "still open" until closed.
     "order_left_open": {
@@ -48,6 +46,8 @@ ISSUES = {
         "detail": "the tracking backfill reopened it and could not complete it again",
         "fix": "complete the order in Finale",
     },
+    # Ritchie, 2026-10-08: 539011943 was shipped in Finale with no tracking -- built,
+    # packed and shipped between two pre-fill polls -- and nothing said so for 12 days.
     "shipped_no_tracking": {
         "title": "Shipped without tracking",
         "detail": "shipped in Finale over {untracked_minutes} min ago with no tracking number",
@@ -435,8 +435,13 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
         found += find_shipped_no_tracking(finale_shipments, po_ids, dropship_pos or set(),
                                           after_minutes=int(config.get("shipped_no_tracking_after_minutes") or 45),
                                           shipped_after=str(config["shipped_no_tracking_go_live_after"]), now=now)
-    left_open = tracking.get_json("dropship_needs_person", {}) or {}
-    found += find_order_left_open(left_open, po_ids)
+    # Strict read: a failed read must not look like "all closed" and resolve the alerts.
+    try:
+        left_open = tracking.get_json_strict("dropship_needs_person", {}) or {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: order_left_open not checked this run: {exc}")
+        left_open = None
+    found += find_order_left_open(left_open or {}, po_ids)
     rejected_rows = find_edi_rejected(rejections or [], doc_sources,
                                       go_live_after=(str(config.get("edi_reject_go_live_after") or "") or None))
     found += rejected_rows
@@ -452,7 +457,8 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
     hd_rejected_pos = {str(r["po_number"]) for r in rejected_rows if r["issue"] == "asn_rejected"}
     resolved = resolved_asn_missing(open_all, asn_pos, voided_keys, hd_rejected_pos)
     resolved += resolved_packed_unshipped(open_all, packed_keys)
-    resolved += resolved_order_left_open(open_all, left_open)
+    if left_open is not None:
+        resolved += resolved_order_left_open(open_all, left_open)
     resolved += resolved_shipped_no_tracking(open_all, untracked_keys(finale_shipments, dropship_pos or set()))
     resolved += resolved_catalogue(open_all, product_count, warn_at)
     still_open = [{**r, "url": crstl_po_url(po_ids.get(str(r.get("po_number")))),

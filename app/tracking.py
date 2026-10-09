@@ -229,6 +229,17 @@ def set_json(key: str, value) -> None:
     set_setting(key, json.dumps(value, default=str))
 
 
+def get_json_strict(key: str, default=None):
+    """Like get_json, but a failed READ raises instead of looking like an empty value.
+    For state whose absence means "all clear" (review 2026-10-09: a locked DB must not
+    erase the left-open list or resolve its alerts). A missing key is still `default`."""
+    with contextlib.closing(_connect()) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return default
+    return json.loads(row[0])
+
+
 def get_json(key: str, default=None):
     raw = get_setting(key)
     if raw is None:

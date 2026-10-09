@@ -424,6 +424,10 @@ def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[
     except Exception as exc:  # noqa: BLE001 -- without it, read each order as before
         print(f"WARNING: dropship pre-fill: sale-order listing failed, reading orders one by one: {exc}")
         order_status = None
+    # Strict: if these cannot be read the run stops here, before any write, rather than
+    # treat them as empty and save that over them.
+    left_open = tracking.get_json_strict("dropship_left_open", {}) or {}
+    needs_person = tracking.get_json_strict("dropship_needs_person", {}) or {}
     with _finale_run("dropship"):
         result = push_dropship_prefill(client.list_shipments(), labels, live=live, only=ids, limit=limit,
                                        client=client, carrier_url=carrier["url"] if carrier["enabled"] else None,
@@ -431,8 +435,7 @@ def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[
                                        max_per_run=cfg.get("max_per_run") if automated else None,
                                        order_status=order_status, marks=tracking.get_dropship_marks(),
                                        backfill_shipped=bool(cfg.get("backfill_shipped")),
-                                       left_open=tracking.get_json("dropship_left_open", {}) or {},
-                                       needs_person=tracking.get_json("dropship_needs_person", {}) or {})
+                                       left_open=left_open, needs_person=needs_person)
     if live:
         tracking.record_dropship_marks([r["mark"] for r in result["results"] if r.get("mark")])
         # Invoiced orders a backfill reopened and could not close: every run retries them.

@@ -476,3 +476,18 @@ def test_a_needs_person_order_is_not_backfilled_again():
 def test_a_bad_stored_try_count_does_not_stop_the_job():
     r = push_dropship_prefill([], [], live=False, client=StatusFinale(), backfill_shipped=True, left_open={"538873472": None})
     assert r["left_open"] == {"538873472": 0}
+
+
+def test_the_runner_skips_a_run_whose_lists_cannot_be_read(monkeypatch):
+    from app import finale_jobs, tracking
+    tracking.set_json("dropship_needs_person", {"538873472": "t"})
+    def boom(key, default=None):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(tracking, "get_json_strict", boom)
+    monkeypatch.setattr("app.finale_jobs._dropship_config", lambda: {"enabled": True, "store_id": 1, "backfill_shipped": True})
+    with patch("app.finale.FinaleClient") as FC, patch("app.finale_jobs.ShipStationClient") as SC:
+        FC.configured.return_value = True; SC.configured.return_value = True
+        with pytest.raises(RuntimeError, match="locked"):
+            finale_jobs._run_dropship_prefill(True, None, None)
+    monkeypatch.undo()
+    assert tracking.get_json("dropship_needs_person") == {"538873472": "t"}       # not erased
