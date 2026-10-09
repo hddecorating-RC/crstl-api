@@ -98,7 +98,7 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
                           carrier_url: str | None = None, created_after: str | None = None,
                           max_per_run: int | None = None, reopen: bool = True,
                           order_status: dict | None = None, marks: dict | None = None,
-                          backfill_shipped: bool = False) -> dict:
+                          backfill_shipped: bool = False, left_open: list[str] | None = None) -> dict:
     """Write carrier + tracking onto the packed Finale shipment of each dropship
     label (live), or report what would be written (dry). One row per PO:
       status: prefilled | would_prefill | backfilled | would_backfill | skipped_equal |
@@ -135,9 +135,33 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
     if limit is not None:
         pos = pos[:limit]
 
-    counts = {k: 0 for k in ("prefilled", "would_prefill", "backfilled", "would_backfill", "skipped_equal",
+    counts = {k: 0 for k in ("prefilled", "would_prefill", "backfilled", "would_backfill", "reclosed", "skipped_equal",
                              "skipped_shipped", "skipped_no_shipment", "skipped_ambiguous", "skipped_floor", "failed")}
     backfills: list[tuple[dict, str, str]] = []
+
+    # Orders a backfill reopened and could not complete again (review 2026-10-09). They are
+    # invoiced but open in Finale; every live run tries to close them until it succeeds,
+    # and counts each one still open as a failure, so the job never reads "ok" meanwhile.
+    still_open = [str(p) for p in (left_open or [])]
+
+    def is_closed(po: str) -> bool:
+        try:
+            o = client.get_order(po)
+        except Exception:  # noqa: BLE001 -- unknown is not closed
+            return False
+        return o is None or str(o.get("statusId") or "") == COMPLETED
+
+    if live:
+        for po in list(still_open):
+            try:
+                if not is_closed(po):
+                    client.complete_order(client.get_order(po))
+                if is_closed(po):
+                    still_open.remove(po); counts["reclosed"] += 1
+                else:
+                    counts["failed"] += 1
+            except Exception:  # noqa: BLE001
+                counts["failed"] += 1
     results: list[dict] = []
     writers: list[tuple[dict, dict, dict]] = []
 
@@ -255,21 +279,28 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
             row.update(status="failed", error=str(exc)); counts["failed"] += 1
         finally:
             if reopened:
-                # Back where it was: reopened only for the write. If that fails, the order
-                # is invoiced but open -- a failure the run must report, with no mark, so
-                # the next run looks again (review 2026-10-09).
+                # Back where it was: reopened only for the write -- confirmed by re-reading
+                # the order, not by the complete call's answer. If it is still open it is an
+                # invoiced order left open: a failure now, and remembered so every later run
+                # tries to close it (review 2026-10-09).
+                why = ""
                 try:
-                    if client.complete_order(client.get_order(po)) is not None:
-                        row["recompleted"] = True
+                    client.complete_order(client.get_order(po))
                 except Exception as exc:  # noqa: BLE001
+                    why = f": {exc}"
+                if is_closed(po):
+                    row["recompleted"] = True
+                else:
                     if row["status"] == "backfilled":
                         counts["backfilled"] -= 1; counts["failed"] += 1
                         row["status"] = "failed"
                     row.pop("mark", None)
+                    still_open.append(po)
                     row["error"] = (f"{row.get('error') or ''}; could not complete the order again "
-                                    f"(it is open in Finale): {exc}").lstrip("; ")
+                                    f"(it is open in Finale){why}").lstrip("; ")
 
     out = {"mode": "live" if live else "dry", "results": results,
+           "left_open": sorted(set(still_open)),
            "summary": {"candidates": len(pos), **counts}}
     if blocked:
         out["blocked"] = blocked

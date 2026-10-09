@@ -349,3 +349,55 @@ def test_recompleted_only_when_the_complete_action_ran():
     fin = FlakyFinale(complete_returns=False)
     r = _backfill(fin)
     assert not r["results"][0].get("recompleted")
+
+
+# --- Second review 2026-10-09: "left open" is remembered and retried, not just reported once.
+
+def test_a_complete_that_does_nothing_is_caught_by_re_reading_the_order():
+    fin = FlakyFinale(complete_returns=False)          # complete action missing: order stays LOCKED
+    r = _backfill(fin)
+    row = r["results"][0]
+    assert row["status"] == "failed" and not row.get("mark")
+    assert r["left_open"] == ["538873472"] and "open in Finale" in row["error"]
+
+
+def test_a_failed_re_complete_is_remembered_for_the_next_run():
+    r = _backfill(FlakyFinale(fail_complete=True))
+    assert r["left_open"] == ["538873472"]
+
+
+def test_the_next_run_completes_an_order_left_open_and_forgets_it():
+    fin = FlakyFinale(order_status="ORDER_LOCKED")
+    r = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, left_open=["538873472"])
+    assert ("complete", "538873472") in fin.calls and r["left_open"] == []
+    assert r["summary"]["reclosed"] == 1
+
+
+def test_an_order_left_open_that_still_will_not_close_stays_on_the_list_and_counts_as_failed():
+    fin = FlakyFinale(order_status="ORDER_LOCKED", fail_complete=True)
+    r = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, left_open=["538873472"])
+    assert r["left_open"] == ["538873472"] and r["summary"]["failed"] == 1
+
+
+def test_a_dry_run_leaves_the_left_open_list_alone():
+    fin = FlakyFinale(order_status="ORDER_LOCKED")
+    r = push_dropship_prefill([], [], live=False, client=fin, backfill_shipped=True, left_open=["538873472"])
+    assert r["left_open"] == ["538873472"] and fin.calls == []
+
+
+def test_the_runner_keeps_the_left_open_list_between_runs(monkeypatch):
+    from app import finale_jobs, tracking
+    fin = FlakyFinale(order_status="ORDER_LOCKED")
+    fin.carrier_index = lambda: {}
+    fin.list_shipments = lambda: []
+    fin.list_sale_orders = lambda: []
+    tracking.set_json("dropship_left_open", ["538873472"])
+    monkeypatch.setattr("app.finale_jobs._dropship_config", lambda: {"enabled": True, "store_id": 1, "backfill_shipped": True})
+    monkeypatch.setattr("app.finale_jobs._finale_config", lambda: {"carriers": {"enabled": False}})
+    with patch("app.finale.FinaleClient", return_value=fin) as FC, patch("app.finale_jobs.ShipStationClient") as SC:
+        FC.configured.return_value = True; SC.configured.return_value = True
+        SC.return_value = type("SS", (), {"list_shipments": lambda self, store, since: []})()
+        finale_jobs._run_dropship_prefill(False, None, None)
+        assert tracking.get_json("dropship_left_open") == ["538873472"]      # a dry run changes nothing
+        r = finale_jobs._run_dropship_prefill(True, None, None)
+    assert r["summary"]["reclosed"] == 1 and tracking.get_json("dropship_left_open") == []
