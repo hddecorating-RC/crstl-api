@@ -41,6 +41,13 @@ ISSUES = {
     },
     # Ritchie, 2026-10-08: 539011943 was shipped in Finale with no tracking -- built,
     # packed and shipped between two pre-fill polls -- and nothing said so for 12 days.
+    # Ritchie / review 2026-10-09: the tracking backfill reopened an invoiced order and
+    # could not complete it again after 8 tries. Repeats in "still open" until closed.
+    "order_left_open": {
+        "title": "Invoiced order left open in Finale",
+        "detail": "the tracking backfill reopened it and could not complete it again",
+        "fix": "complete the order in Finale",
+    },
     "shipped_no_tracking": {
         "title": "Shipped without tracking",
         "detail": "shipped in Finale over {untracked_minutes} min ago with no tracking number",
@@ -254,6 +261,18 @@ def find_shipped_no_tracking(shipments: list[dict], po_ids: dict, dropship_pos: 
     return out
 
 
+def find_order_left_open(left_open: dict, po_ids: dict) -> list[dict]:
+    """Rows for issue 'order_left_open', from tracking 'dropship_needs_person' {po: since}."""
+    return [{"issue": "order_left_open", "key": f"order_left_open:{po}", "po_number": po,
+             "url": crstl_po_url(po_ids.get(po)), "note": f"since {_et(since).strftime('%d %b %H:%M ET') if _et(since) else since}"}
+            for po, since in sorted((left_open or {}).items())]
+
+
+def resolved_order_left_open(open_receipts: list[dict], left_open: dict) -> list[dict]:
+    return [r for r in open_receipts if r.get("issue") == "order_left_open"
+            and str(r.get("po_number")) not in (left_open or {})]
+
+
 def resolved_shipped_no_tracking(open_receipts: list[dict], still_untracked: set) -> list[dict]:
     """Earlier 'shipped_no_tracking' receipts whose shipment now has tracking (or is gone)."""
     return [r for r in open_receipts if r.get("issue") == "shipped_no_tracking" and r.get("key") not in still_untracked]
@@ -416,6 +435,8 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
         found += find_shipped_no_tracking(finale_shipments, po_ids, dropship_pos or set(),
                                           after_minutes=int(config.get("shipped_no_tracking_after_minutes") or 45),
                                           shipped_after=str(config["shipped_no_tracking_go_live_after"]), now=now)
+    left_open = tracking.get_json("dropship_needs_person", {}) or {}
+    found += find_order_left_open(left_open, po_ids)
     rejected_rows = find_edi_rejected(rejections or [], doc_sources,
                                       go_live_after=(str(config.get("edi_reject_go_live_after") or "") or None))
     found += rejected_rows
@@ -431,6 +452,7 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
     hd_rejected_pos = {str(r["po_number"]) for r in rejected_rows if r["issue"] == "asn_rejected"}
     resolved = resolved_asn_missing(open_all, asn_pos, voided_keys, hd_rejected_pos)
     resolved += resolved_packed_unshipped(open_all, packed_keys)
+    resolved += resolved_order_left_open(open_all, left_open)
     resolved += resolved_shipped_no_tracking(open_all, untracked_keys(finale_shipments, dropship_pos or set()))
     resolved += resolved_catalogue(open_all, product_count, warn_at)
     still_open = [{**r, "url": crstl_po_url(po_ids.get(str(r.get("po_number")))),

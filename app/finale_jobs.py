@@ -431,17 +431,20 @@ def _run_dropship_prefill(live: bool, ids: Optional[list[str]], limit: Optional[
                                        max_per_run=cfg.get("max_per_run") if automated else None,
                                        order_status=order_status, marks=tracking.get_dropship_marks(),
                                        backfill_shipped=bool(cfg.get("backfill_shipped")),
-                                       left_open=tracking.get_json("dropship_left_open", {}) or {})
+                                       left_open=tracking.get_json("dropship_left_open", {}) or {},
+                                       needs_person=tracking.get_json("dropship_needs_person", {}) or {})
     if live:
         tracking.record_dropship_marks([r["mark"] for r in result["results"] if r.get("mark")])
         # Invoiced orders a backfill reopened and could not close: every run retries them.
         tracking.set_json("dropship_left_open", result.get("left_open") or {})
+        # Read by the order watch, which emails order.alerts@ until each is closed.
+        tracking.set_json("dropship_needs_person", result.get("needs_person") or {})
     result["carrier"] = {"wanted": carrier["name"], "enabled": carrier["enabled"], "note": carrier["reason"] or None}
     blocked = result.get("blocked")
     _save_state("dropship", {"last_run": datetime.now(timezone.utc).isoformat(), **result})
     c = result["summary"]
     needs_note = (f"NEEDS A PERSON -- invoiced orders left open in Finale, complete by hand: "
-                  f"{', '.join(result['needs_person'])}; " if result.get("needs_person") else "")
+                  f"{', '.join(result['needs_person'])} (order.alerts@ is told); " if result.get("needs_person") else "")
     tracking.record_job_run("dropship_prefill", "blocked" if blocked else ("ok" if not c.get("failed") else "partial"),
                             (f"{blocked} -- refusing; run manually" if blocked else
                              f"{c['candidates']} label(s): {c.get('prefilled', 0)} prefilled, {c.get('would_prefill', 0)} would, "

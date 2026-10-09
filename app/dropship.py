@@ -48,6 +48,8 @@ so the order ends where it was. Its date is untouched (frozen at ship). A shippe
 shipment that already carries a tracking number is never overwritten, whoever typed it;
 either way it is remembered (dropship_marks) and not read again.
 """
+from datetime import datetime, timezone
+
 COMPLETED = "ORDER_COMPLETED"
 OPEN = ("SHIPMENT_INPUT", "SHIPMENT_PACKED")
 SHIPPED = "SHIPMENT_SHIPPED"
@@ -102,7 +104,8 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
                           carrier_url: str | None = None, created_after: str | None = None,
                           max_per_run: int | None = None, reopen: bool = True,
                           order_status: dict | None = None, marks: dict | None = None,
-                          backfill_shipped: bool = False, left_open: dict | list | None = None) -> dict:
+                          backfill_shipped: bool = False, left_open: dict | list | None = None,
+                          needs_person: dict | None = None) -> dict:
     """Write carrier + tracking onto the packed Finale shipment of each dropship
     label (live), or report what would be written (dry). One row per PO:
       status: prefilled | would_prefill | backfilled | would_backfill | skipped_equal |
@@ -149,9 +152,16 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
     # stays open. A cancelled order is dropped (nothing to close). After MAX_RECLOSE_TRIES
     # it is handed to a person once (needs_person) and left alone, so a deliberate reopen
     # is not fought forever and the job does not read "partial" for good.
-    still_open = ({str(k): int(v) for k, v in left_open.items()} if isinstance(left_open, dict)
+    def _tries(v) -> int:
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+    still_open = ({str(k): _tries(v) for k, v in left_open.items()} if isinstance(left_open, dict)
                   else {str(p): 0 for p in (left_open or [])})
-    needs_person: list[str] = []
+    # Handed to a person: {po: first flagged (UTC ISO)}. Kept -- and alerted by the order
+    # watch -- until the order reads completed (or is gone/cancelled); never written to.
+    persons: dict[str, str] = {str(k): str(v) for k, v in (needs_person or {}).items()}
 
     def is_closed(po: str) -> bool:
         try:
@@ -161,9 +171,19 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
         return o is None or str(o.get("statusId") or "") == COMPLETED
 
     def reclose_left_open() -> None:
+        for po in list(persons):
+            try:
+                o = client.get_order(po)
+            except Exception:  # noqa: BLE001 -- unknown: keep it
+                continue
+            if o is None or str(o.get("statusId") or "") in (COMPLETED, CANCELLED_ORDER):
+                del persons[po]
         for po in list(still_open):
             try:
                 o = client.get_order(po)
+            except Exception:  # noqa: BLE001 -- Finale down: try again later, no try used
+                continue
+            try:
                 state = str((o or {}).get("statusId") or "")
                 if o is None or state == CANCELLED_ORDER:
                     del still_open[po]; continue
@@ -179,7 +199,8 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
             counts["failed"] += 1
             still_open[po] += 1
             if still_open[po] >= MAX_RECLOSE_TRIES:
-                del still_open[po]; needs_person.append(po)
+                del still_open[po]
+                persons[po] = datetime.now(timezone.utc).isoformat()
     results: list[dict] = []
     writers: list[tuple[dict, dict, dict]] = []
 
@@ -211,6 +232,8 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
                 finish(row, "skipped_shipped",
                        error=f"already {str(listed.get('statusId')).replace('SHIPMENT_', '').lower()}"); continue
             url = str(listed.get("shipmentUrl"))
+            if po in persons:
+                finish(row, "skipped_shipped", error="invoiced order left open in Finale: needs a person"); continue
             if marks and url in marks:
                 finish(row, "skipped_shipped", error="shipped; its tracking was checked earlier"); continue
             # The listing carries trackingCode (all 856 shipments, 2026-10-08): a tracked one needs no read.
@@ -322,7 +345,7 @@ def push_dropship_prefill(shipment_rows: list[dict], labels: list[dict], *, live
                                     f"(it is open in Finale){why}").lstrip("; ")
 
     out = {"mode": "live" if live else "dry", "results": results,
-           "left_open": dict(sorted(still_open.items())), "needs_person": needs_person,
+           "left_open": dict(sorted(still_open.items())), "needs_person": dict(sorted(persons.items())),
            "summary": {"candidates": len(pos), **counts}}
     if blocked:
         out["blocked"] = blocked

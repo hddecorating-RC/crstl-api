@@ -398,3 +398,16 @@ def test_shipped_no_tracking_is_off_until_its_floor_is_set_then_alerts_once_and_
     fixed = run_alerts([], set(), {}, config=on, live=True, recipients=["g@x"], send=send,
                        finale_shipments=[sship(tracking="520770166533")], dropship_pos=SDROP, now=AN_HOUR_ON)
     assert fixed["resolved"] == ["shipped_no_tracking:100714"] and send.call_count == 1
+
+
+def test_an_invoiced_order_left_open_is_alerted_until_closed(tmp_path, monkeypatch):
+    from app import tracking
+    monkeypatch.setenv("TRACKING_DB", str(tmp_path / "t.db")); tracking.init_db()
+    send = MagicMock()
+    tracking.set_json("dropship_needs_person", {"538873472": "2026-10-09T15:00:00+00:00"})
+    r = run_alerts([], set(), {}, config=CFG, live=True, recipients=["g@x"], send=send, now=NOW)
+    assert [x["key"] for x in r["new"]] == ["order_left_open:538873472"]
+    assert "left open in Finale" in send.call_args.kwargs["body_html"]
+    tracking.set_json("dropship_needs_person", {})
+    r2 = run_alerts([], set(), {}, config=CFG, live=True, recipients=["g@x"], send=send, now=NOW)
+    assert r2["resolved"] == ["order_left_open:538873472"]

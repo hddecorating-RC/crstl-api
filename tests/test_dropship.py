@@ -432,7 +432,7 @@ def test_a_half_reopened_order_is_locked_then_completed():
 def test_after_eight_tries_it_stops_and_asks_for_a_person_once():
     fin = StatusFinale(order_status="ORDER_LOCKED", fail_complete=True)
     r = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, left_open={"538873472": 7})
-    assert r["left_open"] == {} and r["needs_person"] == ["538873472"] and r["summary"]["failed"] == 1
+    assert r["left_open"] == {} and list(r["needs_person"]) == ["538873472"] and r["summary"]["failed"] == 1
 
 
 def test_a_refused_or_targeted_run_leaves_the_list_alone():
@@ -443,3 +443,36 @@ def test_a_refused_or_targeted_run_leaves_the_list_alone():
     targeted = push_dropship_prefill([], [], live=True, client=fin, backfill_shipped=True, only=["X"], left_open={"538873472": 0})
     assert targeted["left_open"] == {"538873472": 0}
     assert not [c for c in fin.calls if c[0] in ("lock", "complete")]
+
+
+# --- Fourth review 2026-10-09: "needs a person" is kept and alerted until it is closed.
+
+def test_needs_person_is_kept_until_the_order_reads_completed():
+    still = StatusFinale(order_status="ORDER_LOCKED")
+    r = push_dropship_prefill([], [], live=True, client=still, backfill_shipped=True,
+                              needs_person={"538873472": "2026-10-09T15:00:00Z"})
+    assert r["needs_person"] == {"538873472": "2026-10-09T15:00:00Z"}
+    assert not [c for c in still.calls if c[0] in ("lock", "complete")]          # read only: a person does it
+    done = StatusFinale(order_status="ORDER_COMPLETED")
+    r2 = push_dropship_prefill([], [], live=True, client=done, backfill_shipped=True,
+                               needs_person={"538873472": "2026-10-09T15:00:00Z"})
+    assert r2["needs_person"] == {}
+
+
+def test_a_finale_outage_does_not_use_up_tries():
+    class Down(StatusFinale):
+        def get_order(self, po): raise RuntimeError("503")
+    r = push_dropship_prefill([], [], live=True, client=Down(), backfill_shipped=True, left_open={"538873472": 7})
+    assert r["left_open"] == {"538873472": 7} and r["needs_person"] == {}
+
+
+def test_a_needs_person_order_is_not_backfilled_again():
+    fin = StatusFinale(order_status="ORDER_LOCKED")
+    r = push_dropship_prefill([fship(status="SHIPMENT_SHIPPED")], [label()], live=True, client=fin, backfill_shipped=True,
+                              carrier_url=PUROLATOR, needs_person={"538873472": "t"})
+    assert r["results"][0]["status"] == "skipped_shipped" and not [c for c in fin.calls if c[0] in ("reopen", "update")]
+
+
+def test_a_bad_stored_try_count_does_not_stop_the_job():
+    r = push_dropship_prefill([], [], live=False, client=StatusFinale(), backfill_shipped=True, left_open={"538873472": None})
+    assert r["left_open"] == {"538873472": 0}
