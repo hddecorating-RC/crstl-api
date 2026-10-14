@@ -1213,6 +1213,74 @@ def test_push_job_sends_one_email_only_when_there_is_something_to_say(monkeypatc
     assert "error" in problem and "503" not in problem                                   # no raw error text in the email
 
 
+def _push_job_attempts(monkeypatch, outcomes):
+    """Run the 5:00 job where each push attempt takes the next outcome (an exception
+    to raise, or the problem to return); return (attempts, email args or None)."""
+    from app.accounting import _run_netsuite_push_job
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setattr("app.automation._job_enabled", lambda *a, **k: True)
+    monkeypatch.setattr("app.accounting._auto_digest_enabled", lambda: True)
+    monkeypatch.setattr("app.accounting.PUSH_NETWORK_RETRY_SECONDS", [0, 0, 0])
+    outcomes = list(outcomes)
+    calls = []
+
+    def fake_push():
+        calls.append(1)
+        o = outcomes.pop(0)
+        if isinstance(o, BaseException):
+            raise o
+        return o
+    with patch("app.accounting._netsuite_push_scheduled", side_effect=fake_push), \
+         patch("app.accounting._so_digest_data", return_value={"new_sos": [], "gaps": []}), \
+         patch("app.accounting._send_digest_safe") as send:
+        _run_netsuite_push_job()
+    return len(calls), (send.call_args.args if send.called else None)
+
+
+def test_push_retries_when_netsuite_cannot_be_reached(monkeypatch):
+    """2026-10-14: CT 203's DNS was down at 5:00 and the whole push was lost. A network
+    failure is retried (5:10, 5:20, 5:30); a retry that gets through is a normal day."""
+    import requests
+    dns = requests.exceptions.ConnectionError("Failed to resolve '734463.suitetalk.api.netsuite.com'")
+    attempts, email = _push_job_attempts(monkeypatch, [dns, dns, None])
+    assert attempts == 3
+    assert email is None                                   # it went through: quiet day
+
+
+def test_push_that_never_reaches_netsuite_says_so_plainly(monkeypatch):
+    import requests
+    dns = requests.exceptions.ConnectionError("Failed to resolve")
+    attempts, (reason, problem) = _push_job_attempts(monkeypatch, [dns, dns, dns, dns])
+    assert attempts == 4                                   # the first try + 3 retries
+    assert "couldn't reach NetSuite" in problem and "resolve" not in problem
+
+
+def test_push_does_not_retry_an_error_that_is_not_the_network(monkeypatch):
+    attempts, (reason, problem) = _push_job_attempts(monkeypatch, [RuntimeError("NetSuite 400")])
+    assert attempts == 1
+    assert "error" in problem and "400" not in problem
+
+
+def test_unpushed_invoices_read_as_waiting_when_the_push_did_not_complete(client, monkeypatch):
+    """With a push problem the invoices are not missing from NetSuite by mistake; they
+    are waiting for a push that did not happen."""
+    from app.accounting import _send_daily_digest
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    gap = {"transaction_id": "t1", "invoice_number": "INV1", "po_number": "1", "province": "ON",
+           "product": "Blind", "total_amount": 10.0}
+    data = {"new_sos": [], "gaps": [gap], "gaps_waiting": [], "row_by_tx": {}, "eids": {}, "ns_ids": {}}
+    with patch("app.accounting._so_digest_data", return_value=data), patch("app.accounting.send_mail") as mail:
+        _send_daily_digest(push_problem="It couldn't reach NetSuite.")
+    body = mail.call_args.kwargs["body_html"]
+    assert "Not pushed yet" in body and "No SO in NetSuite" not in body
+    with patch("app.accounting._so_digest_data", return_value=data), patch("app.accounting.send_mail") as mail:
+        _send_daily_digest()
+    assert "No SO in NetSuite" in mail.call_args.kwargs["body_html"]
+
+
 def test_digest_send_retries_once(monkeypatch, client):
     from app.accounting import _send_digest_safe
     monkeypatch.setattr("app.accounting.DIGEST_RETRY_SECONDS", 0)

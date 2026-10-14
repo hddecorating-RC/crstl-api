@@ -341,7 +341,7 @@ def _so_digest_rows(data: dict) -> list[dict]:
     return rows
 
 
-def _so_digest_html(data: dict, rows: list[dict]) -> str:
+def _so_digest_html(data: dict, rows: list[dict], push_incomplete: bool = False) -> str:
     """The accounting email: a headline, the Blinds-vs-Drapes summary table, and --
     only when there is something accounting must act on -- ONE 'Needs attention'
     table: an 810 with no SO in NetSuite after the push has had its chance, or an
@@ -381,7 +381,10 @@ def _so_digest_html(data: dict, rows: list[dict]) -> str:
     issues = []
     for g in data["gaps"]:
         issues.append((g.get("invoice_number"), g.get("po_number"), g.get("province"), g.get("product"),
-                       g.get("total_amount"), "No SO in NetSuite"))
+                       g.get("total_amount"),
+                       # A push that did not complete never had its chance at these: they
+                       # are waiting for it, not missing from NetSuite (2026-10-14).
+                       "Not pushed yet" if push_incomplete else "No SO in NetSuite"))
     for r in rows:
         if r["reconcile_flag"]:
             issues.append((r["invoice_number"], r.get("po_number"), r.get("province"), r.get("product"),
@@ -757,7 +760,7 @@ def _send_daily_digest(selected_ids: list[str] | None = None, push_problem: str 
         subject += f" · {n_issues} issue(s)"
     if push_problem:
         subject += " · NetSuite push did not complete"
-    body_html = _so_digest_html(data, rows)
+    body_html = _so_digest_html(data, rows, push_incomplete=bool(push_problem))
     if push_problem:   # first thing they read: why today's SOs may be missing
         body_html = (f'<p style="padding:8px 10px;background:#fff4e5;border-left:4px solid #e08a00">'
                      f'<strong>Today\'s NetSuite push did not complete.</strong> {html.escape(push_problem)}</p>'
@@ -898,6 +901,18 @@ def _run_ns_export_job() -> None:
         tracking.record_job_run("netsuite_export", "error", str(exc)[:200])
 
 
+# A push that cannot reach NetSuite at all (DNS, connection refused, timeout) is
+# retried after each of these waits -- 5:10, 5:20, 5:30 -- before the day's email says
+# it did not complete (2026-10-14: CT 203's DNS was down at 5:00 and 34 SOs were lost).
+# Any other error is not retried: trying the same thing again would fail the same way.
+PUSH_NETWORK_RETRY_SECONDS = [600, 600, 600]
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    import requests
+    return isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+
+
 def _run_netsuite_push_job() -> None:
     """Scheduled live push (default OFF). Pushes only acknowledged, non-zero
     invoices not yet pushed (tracking dedup) so it never re-posts a manual push;
@@ -914,12 +929,26 @@ def _run_netsuite_push_job() -> None:
     if not automation._job_enabled(AUTO_NS_PUSH_SETTING, default="false"):
         tracking.record_job_run("netsuite_push", "skipped", "disabled"); return
     started_at = datetime.now(timezone.utc).isoformat()
-    try:
-        problem = _netsuite_push_scheduled()
-    except Exception as exc:
-        print(f"ERROR: scheduled NetSuite push failed: {exc}")
-        tracking.record_job_run("netsuite_push", "error", str(exc)[:200])
-        problem = "It stopped with an error, so some or all of today's SOs may not have been created. Details are in the server log."
+    waits = list(PUSH_NETWORK_RETRY_SECONDS)
+    while True:
+        try:
+            problem = _netsuite_push_scheduled()
+        except Exception as exc:
+            if _is_network_error(exc) and waits:
+                wait = waits.pop(0)
+                print(f"WARNING: scheduled NetSuite push could not reach NetSuite, retrying in {wait}s: {exc}")
+                tracking.record_job_run("netsuite_push", "retrying", f"network: {str(exc)[:160]}")
+                time.sleep(wait)
+                continue
+            print(f"ERROR: scheduled NetSuite push failed: {exc}")
+            tracking.record_job_run("netsuite_push", "error", str(exc)[:200])
+            if _is_network_error(exc):
+                problem = ("It couldn't reach NetSuite (a network problem on our side, still failing after "
+                           "three retries), so no SOs were created. The invoices below are waiting to be "
+                           "pushed and will be pushed from the dashboard.")
+            else:
+                problem = "It stopped with an error, so some or all of today's SOs may not have been created. Details are in the server log."
+        break
     _digest_after_scheduled_push(started_at, problem)
 
 
