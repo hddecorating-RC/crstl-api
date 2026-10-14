@@ -760,7 +760,8 @@ def _send_daily_digest(selected_ids: list[str] | None = None, push_problem: str 
         subject += f" · {n_issues} issue(s)"
     if push_problem:
         subject += " · NetSuite push did not complete"
-    body_html = _so_digest_html(data, rows, push_incomplete=bool(push_problem))
+    waiting = _not_attempted(push_problem)
+    body_html = _so_digest_html(data, rows, push_incomplete=waiting)
     if push_problem:   # first thing they read: why today's SOs may be missing
         body_html = (f'<p style="padding:8px 10px;background:#fff4e5;border-left:4px solid #e08a00">'
                      f'<strong>Today\'s NetSuite push did not complete.</strong> {html.escape(push_problem)}</p>'
@@ -791,7 +792,9 @@ def _send_daily_digest(selected_ids: list[str] | None = None, push_problem: str 
     reported_ids = [str(i["transaction_id"]) for i in data["new_sos"]]
     if reported_ids:
         tracking.record_events(reported_ids, "so_digest")
-    gap_ids = [str(i["transaction_id"]) for i in data["gaps"]]
+    # "Not pushed yet" is not the one-time report of a missing SO: an invoice shown as
+    # waiting keeps it, so if it later fails for real accounting is still told once.
+    gap_ids = [] if waiting else [str(i["transaction_id"]) for i in data["gaps"]]
     if gap_ids:
         tracking.record_events(gap_ids, "gap_digest")
     # Only now that the digest showing them is away: today's findings become "noted".
@@ -901,6 +904,27 @@ def _run_ns_export_job() -> None:
         tracking.record_job_run("netsuite_export", "error", str(exc)[:200])
 
 
+class PushProblem(str):
+    """The day's push problem, in plain words for the email. `attempted` is False when
+    no invoice was tried at all (NetSuite unreachable, held back, unresolved ids): the
+    invoices left over are then waiting for a push, not rejected by NetSuite. A plain
+    str (or attempted=True) means invoices were tried and may really have failed."""
+    attempted: bool
+
+    def __new__(cls, text: str, attempted: bool = True):
+        obj = super().__new__(cls, text)
+        obj.attempted = attempted
+        return obj
+
+
+def _not_attempted(push_problem) -> bool:
+    return push_problem is not None and getattr(push_problem, "attempted", True) is False
+
+
+# Set when the app shuts down, so a retry wait ends at once instead of being killed by
+# systemd mid-sleep (which would lose the day's email with no notice).
+_shutdown = threading.Event()
+
 # A push that cannot reach NetSuite at all (DNS, connection refused, timeout) is
 # retried after each of these waits -- 5:10, 5:20, 5:30 -- before the day's email says
 # it did not complete (2026-10-14: CT 203's DNS was down at 5:00 and 34 SOs were lost).
@@ -910,7 +934,21 @@ PUSH_NETWORK_RETRY_SECONDS = [600, 600, 600]
 
 def _is_network_error(exc: BaseException) -> bool:
     import requests
+    if isinstance(exc, requests.exceptions.SSLError):     # a certificate problem, not an outage
+        return False
     return isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+
+
+def _stale_cache_note() -> str | None:
+    """When the invoice list could not be refreshed from CRSTL, say so: pushing an old
+    list must never read as a quiet day."""
+    with _cache_lock:
+        status, synced = str(_cache.get("status") or ""), _cache.get("last_synced")
+    if not status.startswith("error"):
+        return None
+    since = _et(synced) if synced else "the last good refresh"
+    return (f"The invoice list couldn't be refreshed from CRSTL this morning, so invoices accepted "
+            f"since {since} may not have been pushed yet.")
 
 
 def _run_netsuite_push_job() -> None:
@@ -929,6 +967,9 @@ def _run_netsuite_push_job() -> None:
     if not automation._job_enabled(AUTO_NS_PUSH_SETTING, default="false"):
         tracking.record_job_run("netsuite_push", "skipped", "disabled"); return
     started_at = datetime.now(timezone.utc).isoformat()
+    # The 4:45 refresh may have failed in the same outage: try once more for a fresh list.
+    if _stale_cache_note():
+        crstl_cache._refresh_cache()
     waits = list(PUSH_NETWORK_RETRY_SECONDS)
     while True:
         try:
@@ -938,17 +979,26 @@ def _run_netsuite_push_job() -> None:
                 wait = waits.pop(0)
                 print(f"WARNING: scheduled NetSuite push could not reach NetSuite, retrying in {wait}s: {exc}")
                 tracking.record_job_run("netsuite_push", "retrying", f"network: {str(exc)[:160]}")
-                time.sleep(wait)
+                if _shutdown.wait(wait):
+                    tracking.record_job_run("netsuite_push", "error", "interrupted by a restart while retrying")
+                    problem = PushProblem(
+                        "It couldn't reach NetSuite, and a restart interrupted its retries, so no SOs were "
+                        "created. The invoices below are waiting to be pushed.", attempted=False)
+                    break
+                crstl_cache._refresh_cache()          # retry with today's list, not the stale one
                 continue
             print(f"ERROR: scheduled NetSuite push failed: {exc}")
             tracking.record_job_run("netsuite_push", "error", str(exc)[:200])
             if _is_network_error(exc):
-                problem = ("It couldn't reach NetSuite (a network problem on our side, still failing after "
-                           "three retries), so no SOs were created. The invoices below are waiting to be "
-                           "pushed and will be pushed from the dashboard.")
+                problem = PushProblem(
+                    "It couldn't reach NetSuite (a network problem on our side, still failing after three "
+                    "retries), so no SOs were created. The invoices below are waiting to be pushed.",
+                    attempted=False)
             else:
                 problem = "It stopped with an error, so some or all of today's SOs may not have been created. Details are in the server log."
         break
+    if problem is None:
+        problem = _stale_cache_note()
     _digest_after_scheduled_push(started_at, problem)
 
 
@@ -971,7 +1021,7 @@ def _netsuite_push_scheduled() -> str | None:
     if blocked:
         tracking.record_job_run("netsuite_push", "blocked",
                                 f"{blocked} -- refusing; run manually from the app to override")
-        return f"It was held back because {blocked}, so no SOs were created. Someone needs to review it and push from the dashboard."
+        return PushProblem(f"It was held back because {blocked}, so no SOs were created. Someone needs to review it and push from the dashboard.", attempted=False)
     if not to_push:
         window = f" (created on/after {cutoff}" if cutoff else ""
         if within is not None:
@@ -985,7 +1035,7 @@ def _netsuite_push_scheduled() -> str | None:
     s = result["summary"]
     if result.get("blocked"):
         tracking.record_job_run("netsuite_push", "blocked", "unresolved ids: " + ", ".join(result["unresolved"]))
-        return "It stopped before sending because some invoices could not be found. No SOs were created."
+        return PushProblem("It stopped before sending because some invoices could not be found. No SOs were created.", attempted=False)
     else:
         status = "ok" if s["failed"] == 0 else "partial"
         tracking.record_job_run("netsuite_push", status,

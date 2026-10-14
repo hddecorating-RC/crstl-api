@@ -1213,7 +1213,7 @@ def test_push_job_sends_one_email_only_when_there_is_something_to_say(monkeypatc
     assert "error" in problem and "503" not in problem                                   # no raw error text in the email
 
 
-def _push_job_attempts(monkeypatch, outcomes):
+def _push_job_attempts(monkeypatch, outcomes, cache_status="ok", refresh=None):
     """Run the 5:00 job where each push attempt takes the next outcome (an exception
     to raise, or the problem to return); return (attempts, email args or None)."""
     from app.accounting import _run_netsuite_push_job
@@ -1222,6 +1222,8 @@ def _push_job_attempts(monkeypatch, outcomes):
     monkeypatch.setattr("app.automation._job_enabled", lambda *a, **k: True)
     monkeypatch.setattr("app.accounting._auto_digest_enabled", lambda: True)
     monkeypatch.setattr("app.accounting.PUSH_NETWORK_RETRY_SECONDS", [0, 0, 0])
+    from app import accounting
+    accounting._shutdown.clear()        # an earlier test's app shutdown leaves it set
     outcomes = list(outcomes)
     calls = []
 
@@ -1231,8 +1233,11 @@ def _push_job_attempts(monkeypatch, outcomes):
         if isinstance(o, BaseException):
             raise o
         return o
+    from app.crstl_cache import _cache
     with patch("app.accounting._netsuite_push_scheduled", side_effect=fake_push), \
          patch("app.accounting._so_digest_data", return_value={"new_sos": [], "gaps": []}), \
+         patch.dict(_cache, {"status": cache_status, "last_synced": "2026-10-13T09:00:00+00:00"}), \
+         patch("app.crstl_cache._refresh_cache", refresh or MagicMock()), \
          patch("app.accounting._send_digest_safe") as send:
         _run_netsuite_push_job()
     return len(calls), (send.call_args.args if send.called else None)
@@ -1262,6 +1267,82 @@ def test_push_does_not_retry_an_error_that_is_not_the_network(monkeypatch):
     assert "error" in problem and "400" not in problem
 
 
+def test_retries_refresh_the_invoice_list_first(monkeypatch):
+    """The outage that breaks 5:00 likely broke the 4:45 refresh too: each retry reads
+    CRSTL again rather than pushing yesterday's list."""
+    import requests
+    dns = requests.exceptions.ConnectionError("Failed to resolve")
+    refresh = MagicMock()
+    attempts, email = _push_job_attempts(monkeypatch, [dns, dns, None], refresh=refresh)
+    assert attempts == 3 and refresh.call_count == 2
+
+
+def test_a_stale_invoice_list_is_refreshed_and_never_reported_as_a_quiet_day(monkeypatch):
+    refresh = MagicMock()
+    attempts, (reason, problem) = _push_job_attempts(monkeypatch, [None], cache_status="error: Failed to resolve",
+                                                     refresh=refresh)
+    assert refresh.call_count == 1                         # tried to get a fresh list first
+    assert "couldn't be refreshed" in problem
+
+
+def test_a_restart_during_the_retry_wait_still_sends_the_email(monkeypatch):
+    """systemd kills a long sleep on restart; the wait ends on shutdown and the day's
+    email still goes out."""
+    import requests
+    from app import accounting
+    monkeypatch.setattr("app.accounting.PUSH_NETWORK_RETRY_SECONDS", [600, 600, 600])
+    accounting._shutdown.set()
+    try:
+        dns = requests.exceptions.ConnectionError("Failed to resolve")
+        from app.accounting import _run_netsuite_push_job
+        from app import tracking
+        tracking.init_db()
+        monkeypatch.setattr("app.automation._job_enabled", lambda *a, **k: True)
+        monkeypatch.setattr("app.accounting._auto_digest_enabled", lambda: True)
+        with patch("app.accounting._netsuite_push_scheduled", side_effect=[dns]) as push, \
+             patch("app.accounting._so_digest_data", return_value={"new_sos": [], "gaps": []}), \
+             patch("app.crstl_cache._refresh_cache"), patch("app.accounting._send_digest_safe") as send:
+            _run_netsuite_push_job()
+        assert push.call_count == 1
+        assert "restart" in send.call_args.args[1]
+    finally:
+        accounting._shutdown.clear()
+
+
+def test_a_certificate_error_is_not_retried_as_a_network_outage(monkeypatch):
+    import requests
+    attempts, (reason, problem) = _push_job_attempts(monkeypatch, [requests.exceptions.SSLError("cert")])
+    assert attempts == 1 and "couldn't reach" not in problem
+
+
+def _digest_with_gap(monkeypatch, push_problem):
+    from app.accounting import _send_daily_digest
+    from app import tracking
+    tracking.init_db()
+    monkeypatch.setenv("MAIL_RECIPIENTS", "accounting@example.com")
+    gap = {"transaction_id": "t1", "invoice_number": "INV1", "po_number": "1", "province": "ON",
+           "product": "Blind", "total_amount": 10.0}
+    data = {"new_sos": [], "gaps": [gap], "gaps_waiting": [], "row_by_tx": {}, "eids": {}, "ns_ids": {}}
+    with patch("app.accounting._so_digest_data", return_value=data), patch("app.accounting.send_mail") as mail, \
+         patch("app.tracking.record_events") as rec:
+        _send_daily_digest(push_problem=push_problem)
+    marked = [c.args[0] for c in rec.call_args_list if c.args[1] == "gap_digest"]
+    return mail.call_args.kwargs["body_html"], marked
+
+
+def test_a_waiting_invoice_keeps_its_one_time_report(monkeypatch, client):
+    """Listed as "Not pushed yet" is not the report of a missing SO: if it later fails
+    for real, accounting must still be told once."""
+    from app.accounting import PushProblem
+    body, marked = _digest_with_gap(monkeypatch, PushProblem("It couldn't reach NetSuite.", attempted=False))
+    assert "Not pushed yet" in body and marked == []
+
+
+def test_invoices_netsuite_rejected_are_still_no_so_and_reported_once(monkeypatch, client):
+    body, marked = _digest_with_gap(monkeypatch, "All 3 invoice(s) failed to go through, so no SOs were created.")
+    assert "No SO in NetSuite" in body and marked == [["t1"]]
+
+
 def test_unpushed_invoices_read_as_waiting_when_the_push_did_not_complete(client, monkeypatch):
     """With a push problem the invoices are not missing from NetSuite by mistake; they
     are waiting for a push that did not happen."""
@@ -1273,7 +1354,8 @@ def test_unpushed_invoices_read_as_waiting_when_the_push_did_not_complete(client
            "product": "Blind", "total_amount": 10.0}
     data = {"new_sos": [], "gaps": [gap], "gaps_waiting": [], "row_by_tx": {}, "eids": {}, "ns_ids": {}}
     with patch("app.accounting._so_digest_data", return_value=data), patch("app.accounting.send_mail") as mail:
-        _send_daily_digest(push_problem="It couldn't reach NetSuite.")
+        from app.accounting import PushProblem
+        _send_daily_digest(push_problem=PushProblem("It couldn't reach NetSuite.", attempted=False))
     body = mail.call_args.kwargs["body_html"]
     assert "Not pushed yet" in body and "No SO in NetSuite" not in body
     with patch("app.accounting._so_digest_data", return_value=data), patch("app.accounting.send_mail") as mail:

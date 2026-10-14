@@ -51,12 +51,14 @@ async def lifespan(app: FastAPI):
     held, refused = schedule.claim(schedule.web_jobs(), "crstl-api")
     for jid in refused:
         print(f"WARNING: {jid} is scheduled by another process ({schedule.claim_holder(jid)}) -- not here")
+    accounting._shutdown.clear()    # a fresh start: no retry wait is being cut short
     _scheduler = AsyncIOScheduler()
     schedule.register(_scheduler, list(held))
     _scheduler.start()
     automation.track_next_runs(_scheduler)
     print(f"Scheduler: running {', '.join(held) or 'no jobs'}")
     yield
+    accounting._shutdown.set()      # end a NetSuite retry wait now, so its email still goes out
     _scheduler.shutdown()
     schedule.release(held)
 
