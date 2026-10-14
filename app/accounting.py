@@ -842,6 +842,8 @@ def _send_digest_safe(reason: str, push_problem: str | None = None) -> bool:
         except MailConfigError:
             raise
         except Exception as exc:   # one retry: a mail blip must not cost the day's only email
+            if _shutdown.is_set():  # stopping: systemd allows ~90 s, no time for a wait and a second try
+                raise
             print(f"WARNING: digest send failed ({reason}), retrying in {DIGEST_RETRY_SECONDS}s: {exc}")
             time.sleep(DIGEST_RETRY_SECONDS)
             result = _send_daily_digest(push_problem=push_problem)
@@ -939,16 +941,9 @@ def _is_network_error(exc: BaseException) -> bool:
     return isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout))
 
 
-def _stale_cache_note() -> str | None:
-    """When the invoice list could not be refreshed from CRSTL, say so: pushing an old
-    list must never read as a quiet day."""
+def _cache_refresh_failed() -> bool:
     with _cache_lock:
-        status, synced = str(_cache.get("status") or ""), _cache.get("last_synced")
-    if not status.startswith("error"):
-        return None
-    since = _et(synced) if synced else "the last good refresh"
-    return (f"The invoice list couldn't be refreshed from CRSTL this morning, so invoices accepted "
-            f"since {since} may not have been pushed yet.")
+        return str(_cache.get("status") or "").startswith("error")
 
 
 def _run_netsuite_push_job() -> None:
@@ -968,7 +963,7 @@ def _run_netsuite_push_job() -> None:
         tracking.record_job_run("netsuite_push", "skipped", "disabled"); return
     started_at = datetime.now(timezone.utc).isoformat()
     # The 4:45 refresh may have failed in the same outage: try once more for a fresh list.
-    if _stale_cache_note():
+    if _cache_refresh_failed():
         crstl_cache._refresh_cache()
     waits = list(PUSH_NETWORK_RETRY_SECONDS)
     while True:
@@ -997,8 +992,6 @@ def _run_netsuite_push_job() -> None:
             else:
                 problem = "It stopped with an error, so some or all of today's SOs may not have been created. Details are in the server log."
         break
-    if problem is None:
-        problem = _stale_cache_note()
     _digest_after_scheduled_push(started_at, problem)
 
 

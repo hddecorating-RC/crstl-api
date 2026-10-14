@@ -1277,12 +1277,28 @@ def test_retries_refresh_the_invoice_list_first(monkeypatch):
     assert attempts == 3 and refresh.call_count == 2
 
 
-def test_a_stale_invoice_list_is_refreshed_and_never_reported_as_a_quiet_day(monkeypatch):
+def test_a_failed_4_45_refresh_is_retried_before_the_push(monkeypatch):
     refresh = MagicMock()
-    attempts, (reason, problem) = _push_job_attempts(monkeypatch, [None], cache_status="error: Failed to resolve",
-                                                     refresh=refresh)
-    assert refresh.call_count == 1                         # tried to get a fresh list first
-    assert "couldn't be refreshed" in problem
+    attempts, email = _push_job_attempts(monkeypatch, [None], cache_status="error: Failed to resolve",
+                                         refresh=refresh)
+    assert refresh.call_count == 1 and attempts == 1       # a fresh list first, then the push
+    assert email is None                                   # no invented problem on a day that went through
+
+
+def test_the_mail_retry_is_skipped_while_shutting_down(monkeypatch):
+    """systemd allows a stop only so long: on shutdown the email gets one try, not a
+    60 s wait and a second."""
+    from app import accounting
+    from app.accounting import _send_digest_safe
+    monkeypatch.setattr("app.accounting.DIGEST_RETRY_SECONDS", 60)
+    accounting._shutdown.set()
+    try:
+        with patch("app.accounting._send_daily_digest", side_effect=OSError("graph down")) as send, \
+             patch("app.accounting.time.sleep") as sleep:
+            assert _send_digest_safe("after push") is False
+        assert send.call_count == 1 and not sleep.called
+    finally:
+        accounting._shutdown.clear()
 
 
 def test_a_restart_during_the_retry_wait_still_sends_the_email(monkeypatch):

@@ -30,6 +30,9 @@ Environment="SCHEDULER_JOBS=daily_refresh,netsuite_push"
 ExecStart=/opt/crstl-api/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 Restart=on-failure
 RestartSec=10s
+# Room for a 5:00 NetSuite push interrupted mid-retry to record its run and send the
+# day's email before systemd kills it (the default is 90 s).
+TimeoutStopSec=180s
 StandardOutput=journal
 StandardError=journal
 
