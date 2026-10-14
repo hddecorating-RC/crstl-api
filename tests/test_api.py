@@ -1320,9 +1320,22 @@ def test_a_restart_during_the_retry_wait_still_sends_the_email(monkeypatch):
              patch("app.crstl_cache._refresh_cache"), patch("app.accounting._send_digest_safe") as send:
             _run_netsuite_push_job()
         assert push.call_count == 1
-        assert "restart" in send.call_args.args[1]
+        assert "restart" in send.call_args.args[1] and "dashboard" in send.call_args.args[1]
     finally:
         accounting._shutdown.clear()
+
+
+def test_a_restart_during_the_retry_re_read_does_not_start_another_push(monkeypatch):
+    import requests
+    from app import accounting
+    dns = requests.exceptions.ConnectionError("Failed to resolve")
+    refresh = MagicMock(side_effect=lambda: accounting._shutdown.set())   # the stop lands mid re-read
+    try:
+        attempts, (reason, problem) = _push_job_attempts(monkeypatch, [dns, None], refresh=refresh)
+    finally:
+        accounting._shutdown.clear()
+    assert attempts == 1
+    assert "restart" in problem and "dashboard" in problem
 
 
 def test_a_certificate_error_is_not_retried_as_a_network_outage(monkeypatch):

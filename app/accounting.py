@@ -974,13 +974,17 @@ def _run_netsuite_push_job() -> None:
                 wait = waits.pop(0)
                 print(f"WARNING: scheduled NetSuite push could not reach NetSuite, retrying in {wait}s: {exc}")
                 tracking.record_job_run("netsuite_push", "retrying", f"network: {str(exc)[:160]}")
-                if _shutdown.wait(wait):
+                if not _shutdown.wait(wait):
+                    crstl_cache._refresh_cache()      # retry with today's list, not the stale one
+                # Checked again after the re-read: a stop that lands during it must not
+                # start another push that systemd would kill halfway.
+                if _shutdown.is_set():
                     tracking.record_job_run("netsuite_push", "error", "interrupted by a restart while retrying")
                     problem = PushProblem(
                         "It couldn't reach NetSuite, and a restart interrupted its retries, so no SOs were "
-                        "created. The invoices below are waiting to be pushed.", attempted=False)
+                        "created. The invoices below need to be pushed from the dashboard today.",
+                        attempted=False)
                     break
-                crstl_cache._refresh_cache()          # retry with today's list, not the stale one
                 continue
             print(f"ERROR: scheduled NetSuite push failed: {exc}")
             tracking.record_job_run("netsuite_push", "error", str(exc)[:200])
