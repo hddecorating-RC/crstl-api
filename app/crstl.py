@@ -23,9 +23,9 @@ EXACT_LOOKUP_MAX = 20
 
 
 class CrstlClient:
-    # Server enforces a 20-row page cap regardless of the `limit` param;
-    # pagination is offset-based (no cursor). Keep PAGE_SIZE aligned with
-    # the server's actual page size so the "short page = last page" heuristic works.
+    # Server enforces a 20-row page cap regardless of the `limit` param. Pages are walked by
+    # next_cursor: CRSTL rejects offset > 0 from 2026-11-10 00:00 UTC
+    # (https://support.crstl.ai/articles/3909867422-api-cursor-pagination).
     PAGE_SIZE = 20
     MAX_WORKERS = 8  # empirically optimal — more workers get rate-limited by the server
     RETRY_TOTAL = 4        # up to 4 retries per request on a transient failure
@@ -284,24 +284,28 @@ class CrstlClient:
         source_document_ids (an 856's / 810's 850 id). Unfiltered it is ALL history,
         which grows forever -- the 15-min jobs pass a recent window instead."""
         results = []
-        offset = 0
-        base = {"transaction_type": transaction_type}
+        base = {"transaction_type": transaction_type, "limit": self.PAGE_SIZE, "include_count": "false"}
         if created_after:
             base["created_after"] = created_after
         base.update({k: v for k, v in filters.items() if v})
+        cursor = None
         while True:
+            # Same filters on every page, plus the cursor exactly as CRSTL gave it; stop when there is none.
+            # (Verified 2026-10-29 on 45 days of 850s: the same 560 rows as the old offset walk, no duplicates.)
             resp = self.session.get(
                 f"{self.base_url}/transaction",
-                params={**base, "limit": self.PAGE_SIZE, "offset": offset},
+                params={**base, **({"cursor": cursor} if cursor else {})},
                 timeout=30,
             )
             resp.raise_for_status()
             inner = resp.json().get("data", {})
-            records = inner.get("transactions") or []
-            results.extend(records)
-            if len(records) < self.PAGE_SIZE:
+            results.extend(inner.get("transactions") or [])
+            nxt = inner.get("next_cursor")
+            if not nxt:
                 break
-            offset += self.PAGE_SIZE
+            if nxt == cursor:
+                raise RuntimeError(f"CRSTL returned a repeated cursor listing {transaction_type}; stopping rather than looping")
+            cursor = nxt
         return results
 
     def _fetch_transaction_detail(self, transaction_id: str) -> dict:

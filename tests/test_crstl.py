@@ -378,3 +378,38 @@ def test_quebec_splits_into_gst_and_qst():
     result = CrstlClient(base_url="https://api.crstl.so/v2", api_key="ct_live_test")._extract_invoice_fields(detail)
     assert result["tax_breakdown"] == {"GST": 5.0, "QST": 9.98}
     assert result["tax_amount"] == 14.98
+
+
+# CRSTL rejects offset > 0 from 2026-11-10 00:00 UTC (https://support.crstl.ai/articles/3909867422-api-cursor-pagination):
+# the listing pages by next_cursor, never by offset.
+def _page(rows, next_cursor=None):
+    r = MagicMock()
+    r.json.return_value = {"data": {"transactions": rows, **({"next_cursor": next_cursor} if next_cursor else {})}}
+    return r
+
+
+def test_listing_pages_by_cursor_and_never_sends_offset():
+    client = CrstlClient(base_url="https://api.crstl.so/v2", api_key="ct_live_test")
+    pages = [_page([{"id": i} for i in range(20)], "c1"), _page([{"id": i} for i in range(20, 40)], "c2"), _page([{"id": 40}])]
+    with patch.object(client.session, "get", side_effect=pages) as get:
+        rows = client._fetch_all_transactions("850", created_after="2026-09-14T00:00:00Z")
+    assert [r["id"] for r in rows] == list(range(41))
+    sent = [c.kwargs["params"] for c in get.call_args_list]
+    assert all("offset" not in p for p in sent)
+    assert [p.get("cursor") for p in sent] == [None, "c1", "c2"]
+    # same filters on every page; no count needed
+    assert all(p["transaction_type"] == "850" and p["created_after"] == "2026-09-14T00:00:00Z" and p["include_count"] == "false" for p in sent)
+
+
+def test_listing_stops_when_next_cursor_is_missing_even_on_a_full_page():
+    client = CrstlClient(base_url="https://api.crstl.so/v2", api_key="ct_live_test")
+    with patch.object(client.session, "get", side_effect=[_page([{"id": i} for i in range(20)])]) as get:
+        assert len(client._fetch_all_transactions("810")) == 20
+    assert get.call_count == 1
+
+
+def test_listing_refuses_a_repeated_cursor_rather_than_loop_forever():
+    client = CrstlClient(base_url="https://api.crstl.so/v2", api_key="ct_live_test")
+    with patch.object(client.session, "get", side_effect=[_page([{"id": 1}], "same"), _page([{"id": 2}], "same")]):
+        with pytest.raises(RuntimeError, match="repeated"):
+            client._fetch_all_transactions("810")

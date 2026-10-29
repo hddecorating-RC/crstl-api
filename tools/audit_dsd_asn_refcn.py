@@ -49,21 +49,8 @@ DSD_FLAVOR = "Direct Store Delivery (DSD)"
 
 
 def fetch_list(client: CrstlClient) -> list[dict]:
-    """Page through every outgoing 856. The server caps pages at 20 rows."""
-    results, offset = [], 0
-    while True:
-        resp = client.session.get(
-            f"{client.base_url}/transaction",
-            params={"transaction_type": "856", "limit": client.PAGE_SIZE, "offset": offset},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        records = resp.json().get("data", {}).get("transactions") or []
-        results.extend(records)
-        if len(records) < client.PAGE_SIZE:
-            break
-        offset += client.PAGE_SIZE
-    return results
+    """Every outgoing 856 (the client pages by cursor; offset is gone from 2026-11-10)."""
+    return client._fetch_all_transactions(transaction_type="856")
 
 
 def classify(ref: str) -> str:
