@@ -69,6 +69,7 @@ def fetch_all_transactions(transaction_type="810"):
     params = {
         "transaction_type": transaction_type,
         "limit": PAGE_SIZE,
+        "include_count": "false",
     }
     cursor = None
 
@@ -89,7 +90,9 @@ def fetch_all_transactions(transaction_type="810"):
         results.extend(records)
         cursor = inner.get("next_cursor") or inner.get("cursor")
 
-        if not cursor or len(records) < PAGE_SIZE:
+        # Stop only when CRSTL gives no next cursor: the server caps pages at 20 whatever `limit` says, so a
+        # "short page" is not the last page.
+        if not cursor:
             break
 
     return results

@@ -288,7 +288,7 @@ class CrstlClient:
         if created_after:
             base["created_after"] = created_after
         base.update({k: v for k, v in filters.items() if v})
-        cursor = None
+        cursor, seen = None, set()
         while True:
             # Same filters on every page, plus the cursor exactly as CRSTL gave it; stop when there is none.
             # (Verified 2026-10-29 on 45 days of 850s: the same 560 rows as the old offset walk, no duplicates.)
@@ -303,8 +303,9 @@ class CrstlClient:
             nxt = inner.get("next_cursor")
             if not nxt:
                 break
-            if nxt == cursor:
+            if nxt in seen:
                 raise RuntimeError(f"CRSTL returned a repeated cursor listing {transaction_type}; stopping rather than looping")
+            seen.add(nxt)
             cursor = nxt
         return results
 

@@ -413,3 +413,7 @@ def test_listing_refuses_a_repeated_cursor_rather_than_loop_forever():
     with patch.object(client.session, "get", side_effect=[_page([{"id": 1}], "same"), _page([{"id": 2}], "same")]):
         with pytest.raises(RuntimeError, match="repeated"):
             client._fetch_all_transactions("810")
+    # a longer loop (A -> B -> A) is caught too
+    with patch.object(client.session, "get", side_effect=[_page([{"id": 1}], "A"), _page([{"id": 2}], "B"), _page([{"id": 3}], "A")]):
+        with pytest.raises(RuntimeError, match="repeated"):
+            client._fetch_all_transactions("810")
