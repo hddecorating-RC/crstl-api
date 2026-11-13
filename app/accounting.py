@@ -1,6 +1,7 @@
 """Accounting: the CRSTL invoice export workbook, the NetSuite CSV + REST push, and
 the accounting digest email. Runs in the web app (crstl-api)."""
 import html
+import json
 import os
 import pathlib
 import threading
@@ -309,7 +310,8 @@ def _et(iso: str | None) -> str:
 
 def _last_digest_sent_at() -> str | None:
     """When the last digest email actually went out (job_runs), or None."""
-    for run in tracking.recent_job_runs(limit=20, job="daily_digest"):
+    # 200, not 20: failed retries add up to 3 error rows a day and must not push the last good send out of view.
+    for run in tracking.recent_job_runs(limit=200, job="daily_digest"):
         if run.get("status") == "ok" and not str(run.get("detail") or "").startswith("nothing to report"):
             return run.get("ran_at")
     return None
@@ -883,19 +885,53 @@ def send_digest_manual() -> dict:
         _release_digest_send()
 
 
-def _send_digest_safe(reason: str, push_problem: str | None = None) -> bool:
+PUSH_PROBLEM_SETTING = "digest_failed_push_problem"
+RETRIES_PER_DAY = 3
+
+
+def _et_today(now: datetime | None = None):
+    from zoneinfo import ZoneInfo
+    return (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/Toronto")).date()
+
+
+def _remember_push_problem(push_problem) -> None:
+    """Keep the morning's push problem for the retries (pre-deploy review 2026-11-13: a retry without it drops the
+    "NetSuite push did not complete" banner and files waiting invoices as gaps). Durable: survives a restart."""
+    if push_problem is None:
+        return
+    tracking.set_setting(PUSH_PROBLEM_SETTING, json.dumps({
+        "date": _et_today().isoformat(), "text": str(push_problem),
+        "attempted": getattr(push_problem, "attempted", True)}))
+
+
+def _todays_push_problem():
+    try:
+        saved = json.loads(tracking.get_setting(PUSH_PROBLEM_SETTING, "") or "null")
+    except ValueError:
+        return None
+    if not saved or saved.get("date") != _et_today().isoformat():
+        return None
+    return PushProblem(saved["text"], attempted=bool(saved.get("attempted", True)))
+
+
+def _send_digest_safe(reason: str, push_problem: str | None = None, *, inner_retry: bool = True,
+                      still_due=None) -> bool:
     """Send the accounting digest and update digest state; never raises (best-effort).
     Returns True if it sent. `reason` is logged so the run history shows what
-    triggered each digest (post-push, after push, retry)."""
+    triggered each digest (post-push, after push, retry). `inner_retry` = one more try
+    after DIGEST_RETRY_SECONDS (off for the hourly retry: one attempt each). `still_due`
+    is re-checked once the send is claimed, so a send that finished meanwhile stops it."""
     if not _claim_digest_send():
         return False
     try:
+        if still_due is not None and not still_due():
+            return False
         try:
             result = _send_daily_digest(push_problem=push_problem)
         except MailConfigError:
             raise
         except Exception as exc:   # one retry: a mail blip must not cost the day's only email
-            if _shutdown.is_set():  # stopping: systemd allows ~90 s, no time for a wait and a second try
+            if not inner_retry or _shutdown.is_set():  # stopping: systemd allows ~90 s, no time for a wait
                 raise
             print(f"WARNING: digest send failed ({reason}), retrying in {DIGEST_RETRY_SECONDS}s: {exc}")
             time.sleep(DIGEST_RETRY_SECONDS)
@@ -903,6 +939,7 @@ def _send_digest_safe(reason: str, push_problem: str | None = None) -> bool:
         _digest_sent(result, reason)
         return True
     except Exception as exc:
+        _remember_push_problem(push_problem)
         _digest_failed(exc, reason)
         return False
     finally:
@@ -910,26 +947,31 @@ def _send_digest_safe(reason: str, push_problem: str | None = None) -> bool:
 
 
 def _digest_retry_due(now: datetime | None = None) -> bool:
-    """True when today's (ET) latest digest attempt FAILED and nothing has gone out since -- the only case the
-    hourly retry acts on. A failure from an earlier day is carried by the next 05:00 digest (SOs are marked
-    reported only after the mail is away), so it is not retried."""
+    """True when today's (ET) latest digest attempt FAILED, nothing has gone out since, and fewer than
+    RETRIES_PER_DAY retries have run today -- the only case the hourly retry acts on. A failure from an earlier day
+    is carried by the next 05:00 digest (SOs are marked reported only after the mail is away), so it is not retried.
+    The cap matters because a Graph 502/timeout does not prove the mail was NOT delivered."""
     from zoneinfo import ZoneInfo
-    runs = tracking.recent_job_runs(limit=1, job="daily_digest")
+    et = ZoneInfo("America/Toronto")
+    today = _et_today(now)
+    runs = tracking.recent_job_runs(limit=50, job="daily_digest")
     if not runs or runs[0].get("status") != "error":
         return False
-    et = ZoneInfo("America/Toronto")
-    ran = _parse_iso(runs[0].get("ran_at"))
-    now = now or datetime.now(timezone.utc)
-    return bool(ran) and ran.astimezone(et).date() == now.astimezone(et).date()
+    on_today = [r for r in runs if (t := _parse_iso(r.get("ran_at"))) and t.astimezone(et).date() == today]
+    if not on_today or on_today[0] is not runs[0]:
+        return False
+    retries = sum(1 for r in on_today if str(r.get("detail") or "").endswith("[retry]"))
+    return retries < RETRIES_PER_DAY
 
 
 def _run_digest_retry_job() -> None:
     """Weekdays, every hour 06:00-17:00 ET (app.schedule digest_retry): resend the accounting digest if this
-    morning's failed (Microsoft 365 down, 2026-11-13). Email only -- never touches NetSuite. Stops as soon as any
-    send succeeds (a retry or the manual button). Records nothing when there is nothing to retry."""
+    morning's failed (Microsoft 365 down, 2026-11-13). Email only -- never touches NetSuite. At most
+    RETRIES_PER_DAY, one attempt each; carries the morning's push problem; stops as soon as any send succeeds
+    (a retry or the manual button). Records nothing when there is nothing to retry."""
     if not _auto_digest_enabled() or not _digest_retry_due():
         return
-    _send_digest_safe("retry")
+    _send_digest_safe("retry", _todays_push_problem(), inner_retry=False, still_due=_digest_retry_due)
 
 
 def _digest_after_scheduled_push(started_at: str, push_problem: str | None) -> None:

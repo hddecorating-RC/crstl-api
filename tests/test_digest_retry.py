@@ -101,7 +101,8 @@ def test_retry_job_sends_only_when_due_and_enabled(monkeypatch):
     with patch("app.accounting._digest_retry_due", return_value=True), \
          patch("app.accounting._send_digest_safe") as send:
         accounting._run_digest_retry_job()
-    send.assert_called_once_with("retry")
+    send.assert_called_once()
+    assert send.call_args.args[0] == "retry" and send.call_args.kwargs["inner_retry"] is False
     with patch("app.accounting._digest_retry_due", return_value=False), \
          patch("app.accounting._send_digest_safe") as send:
         accounting._run_digest_retry_job()
@@ -128,3 +129,62 @@ def test_retry_is_scheduled_weekdays_every_hour_6_to_17_et():
     assert target == "app.accounting:_run_digest_retry_job" and trigger == "cron"
     assert (opts["day_of_week"], opts["hour"], opts["minute"], opts["timezone"]) == ("mon-fri", "6-17", 0, "America/Toronto")
     assert "digest_retry" in schedule.WEB_DEFAULT
+
+
+# ── pre-deploy review fixes (2026-11-13) ───────────────────────────────────
+
+def test_retry_capped_at_three_a_day():
+    _run("error", "Graph sendMail failed (502) [after push]", NOW - timedelta(minutes=300))
+    for m in (240, 180, 120):
+        _run("error", "Graph sendMail failed (502) [retry]", NOW - timedelta(minutes=m))
+    assert accounting._digest_retry_due(NOW) is False
+    tracking_rows = [r for r in tracking.recent_job_runs(job="daily_digest") if r["detail"].endswith("[retry]")]
+    assert len(tracking_rows) == 3
+
+
+def test_retry_is_one_attempt_no_inner_60s_retry(monkeypatch):
+    monkeypatch.setattr("app.accounting._auto_digest_enabled", lambda: True)
+    monkeypatch.setattr("app.accounting._digest_retry_due", lambda now=None: True)
+    calls = []
+    def fail(**kw):
+        calls.append(kw)
+        raise RuntimeError("Graph sendMail failed (502)")
+    with patch("app.accounting._send_daily_digest", side_effect=fail), patch("app.accounting.time.sleep") as sleep:
+        accounting._run_digest_retry_job()
+    assert len(calls) == 1
+    sleep.assert_not_called()
+    assert tracking.recent_job_runs(job="daily_digest")[0]["detail"].endswith("[retry]")
+
+
+def test_retry_rechecks_after_claiming_the_send(monkeypatch):
+    """A manual send that finished between the check and the claim must stop the retry (no duplicate)."""
+    monkeypatch.setattr("app.accounting._auto_digest_enabled", lambda: True)
+    answers = iter([True, False])
+    monkeypatch.setattr("app.accounting._digest_retry_due", lambda now=None: next(answers))
+    with patch("app.accounting._send_daily_digest") as send:
+        accounting._run_digest_retry_job()
+    send.assert_not_called()
+
+
+def test_retry_carries_this_mornings_push_problem(monkeypatch):
+    """Push not attempted AND the 05:00 mail failed: the retry must still say so (and not file the invoices as gaps)."""
+    problem = accounting.PushProblem("It couldn't reach NetSuite …", attempted=False)
+    with patch("app.accounting._send_daily_digest", side_effect=RuntimeError("Graph 502")), \
+         patch("app.accounting.time.sleep"):
+        assert accounting._send_digest_safe("after push", problem) is False
+    monkeypatch.setattr("app.accounting._auto_digest_enabled", lambda: True)
+    seen = {}
+    def ok(push_problem=None):
+        seen["p"] = push_problem
+        return RESULT
+    with patch("app.accounting._send_daily_digest", side_effect=ok):
+        accounting._run_digest_retry_job()
+    assert str(seen["p"]) == str(problem)
+    assert accounting._not_attempted(seen["p"]) is True
+
+
+def test_last_sent_found_even_after_many_failed_retries():
+    _run("ok", "2 SO(s), 0 issue(s) [post-push]", NOW - timedelta(days=2))
+    for _ in range(30):
+        _run("error", "Graph sendMail failed (502) [retry]", NOW - timedelta(days=1))
+    assert accounting._last_digest_sent_at() is not None

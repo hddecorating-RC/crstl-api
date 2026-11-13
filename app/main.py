@@ -356,8 +356,8 @@ class EmailRequest(BaseModel):
 
 @app.post("/api/email/send-digest")
 async def send_digest_now(body: EmailRequest = EmailRequest()) -> JSONResponse:
-    """Send an email of invoices. Without `ids`: unemailed digest (same as
-    scheduled job). With `ids`: send exactly those invoices."""
+    """Send the accounting digest now (the same digest and bookkeeping as the scheduled send; it is
+    receipt-driven, so `ids` is ignored). 409 while another digest send is running."""
     if body.ids is not None and not body.ids:
         return JSONResponse(status_code=400, content={"message": "ids is empty"})
     try:
