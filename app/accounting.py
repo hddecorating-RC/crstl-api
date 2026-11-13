@@ -827,15 +827,68 @@ def _auto_digest_enabled() -> bool:
 DIGEST_RETRY_SECONDS = 60
 
 
-def _send_digest_safe(reason: str, push_problem: str | None = None) -> bool:
-    """Send the accounting digest and update digest state; never raises (best-effort).
-    Returns True if it sent. The _digest_lock guard stops a post-push send and the
-    scheduled run from overlapping. `reason` is logged so the run history shows what
-    triggered each digest (post-push vs scheduled)."""
+def _digest_sent(result: dict, reason: str) -> None:
+    """Bookkeeping after a digest went out (scheduled, retry or manual): state for the dashboard, and the job run
+    that _last_digest_sent_at reads (the next digest's 'since')."""
+    with _digest_lock:
+        _digest_state["last_sent"] = datetime.now(timezone.utc).isoformat()
+        _digest_state["count"] = result["count"]
+        _digest_state["error"] = None
+    print(f"Digest ({reason}): {result['count']} SO(s) to {result['sent_to']}")
+    tracking.record_job_run("daily_digest", "ok", f"{result['count']} SO(s), {result.get('gaps', 0)} issue(s) [{reason}]")
+
+
+def _digest_failed(exc: Exception, reason: str) -> None:
+    with _digest_lock:
+        _digest_state["error"] = str(exc)
+    print(f"WARNING: digest send failed ({reason}): {exc}")
+    tracking.record_job_run("daily_digest", "error", f"{str(exc)[:180]} [{reason}]")
+
+
+def _claim_digest_send() -> bool:
+    """The one-send-at-a-time guard (a post-push send, the scheduled run, a retry and a manual send never overlap)."""
     with _digest_lock:
         if _digest_state.get("sending"):
             return False
         _digest_state["sending"] = True
+    return True
+
+
+def _release_digest_send() -> None:
+    with _digest_lock:
+        _digest_state["sending"] = False
+
+
+class DigestBusy(RuntimeError):
+    """Another digest send is in progress."""
+
+
+def send_digest_manual() -> dict:
+    """The dashboard's Send digest button: the same digest, with the same bookkeeping as a scheduled send, so a
+    manual send after a failure clears the error and moves 'last sent' (2026-11-13: the 05:05 Graph 502 stayed on
+    the dashboard after a successful 09:00 manual send). Raises DigestBusy, MailConfigError or the send error."""
+    if not _claim_digest_send():
+        raise DigestBusy("a digest is being sent right now")
+    try:
+        try:
+            result = _send_daily_digest()
+        except MailConfigError:
+            raise
+        except Exception as exc:
+            _digest_failed(exc, "manual")
+            raise
+        _digest_sent(result, "manual")
+        return result
+    finally:
+        _release_digest_send()
+
+
+def _send_digest_safe(reason: str, push_problem: str | None = None) -> bool:
+    """Send the accounting digest and update digest state; never raises (best-effort).
+    Returns True if it sent. `reason` is logged so the run history shows what
+    triggered each digest (post-push, after push, retry)."""
+    if not _claim_digest_send():
+        return False
     try:
         try:
             result = _send_daily_digest(push_problem=push_problem)
@@ -847,23 +900,36 @@ def _send_digest_safe(reason: str, push_problem: str | None = None) -> bool:
             print(f"WARNING: digest send failed ({reason}), retrying in {DIGEST_RETRY_SECONDS}s: {exc}")
             time.sleep(DIGEST_RETRY_SECONDS)
             result = _send_daily_digest(push_problem=push_problem)
-        with _digest_lock:
-            _digest_state["last_sent"] = datetime.now(timezone.utc).isoformat()
-            _digest_state["count"] = result["count"]
-            _digest_state["error"] = None
-        print(f"Digest ({reason}): {result['count']} SO(s) to {result['sent_to']}")
-        tracking.record_job_run("daily_digest", "ok",
-                                f"{result['count']} SO(s), {result.get('gaps', 0)} issue(s) [{reason}]")
+        _digest_sent(result, reason)
         return True
     except Exception as exc:
-        with _digest_lock:
-            _digest_state["error"] = str(exc)
-        print(f"WARNING: digest send failed ({reason}): {exc}")
-        tracking.record_job_run("daily_digest", "error", f"{str(exc)[:180]} [{reason}]")
+        _digest_failed(exc, reason)
         return False
     finally:
-        with _digest_lock:
-            _digest_state["sending"] = False
+        _release_digest_send()
+
+
+def _digest_retry_due(now: datetime | None = None) -> bool:
+    """True when today's (ET) latest digest attempt FAILED and nothing has gone out since -- the only case the
+    hourly retry acts on. A failure from an earlier day is carried by the next 05:00 digest (SOs are marked
+    reported only after the mail is away), so it is not retried."""
+    from zoneinfo import ZoneInfo
+    runs = tracking.recent_job_runs(limit=1, job="daily_digest")
+    if not runs or runs[0].get("status") != "error":
+        return False
+    et = ZoneInfo("America/Toronto")
+    ran = _parse_iso(runs[0].get("ran_at"))
+    now = now or datetime.now(timezone.utc)
+    return bool(ran) and ran.astimezone(et).date() == now.astimezone(et).date()
+
+
+def _run_digest_retry_job() -> None:
+    """Weekdays, every hour 06:00-17:00 ET (app.schedule digest_retry): resend the accounting digest if this
+    morning's failed (Microsoft 365 down, 2026-11-13). Email only -- never touches NetSuite. Stops as soon as any
+    send succeeds (a retry or the manual button). Records nothing when there is nothing to retry."""
+    if not _auto_digest_enabled() or not _digest_retry_due():
+        return
+    _send_digest_safe("retry")
 
 
 def _digest_after_scheduled_push(started_at: str, push_problem: str | None) -> None:

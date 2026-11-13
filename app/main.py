@@ -361,7 +361,11 @@ async def send_digest_now(body: EmailRequest = EmailRequest()) -> JSONResponse:
     if body.ids is not None and not body.ids:
         return JSONResponse(status_code=400, content={"message": "ids is empty"})
     try:
-        result = await asyncio.to_thread(accounting._send_daily_digest, body.ids)
+        # The digest is receipt-driven (ids are ignored), so every manual send is the full digest, with the same
+        # bookkeeping as a scheduled one (clears a failed send's error, moves "last sent").
+        result = await asyncio.to_thread(accounting.send_digest_manual)
+    except accounting.DigestBusy as exc:
+        return JSONResponse(status_code=409, content={"message": str(exc)})
     except MailConfigError as exc:
         return JSONResponse(status_code=400, content={"message": str(exc)})
     except Exception as exc:

@@ -43,6 +43,12 @@ JOBS: dict[str, tuple[str, str, dict]] = {
     "netsuite_push": ("app.accounting:_run_netsuite_push_job", "cron",
                       dict(day_of_week="mon-fri", hour=5, minute=0, timezone=TORONTO,
                            misfire_grace_time=3600, coalesce=True)),
+    # Digest retry -- weekdays, every hour 06:00-17:00 ET (Ritchie, 2026-11-13, after Microsoft 365 returned 502 to
+    # both 05:00 sends): resends the accounting digest ONLY if today's latest attempt failed and nothing has gone out
+    # since (accounting._digest_retry_due). Email only, never NetSuite. Past 17:00 the next 05:00 digest carries it.
+    "digest_retry": ("app.accounting:_run_digest_retry_job", "cron",
+                     dict(day_of_week="mon-fri", hour="6-17", minute=0, timezone=TORONTO,
+                          misfire_grace_time=600, coalesce=True)),
     # Finale invoicing poll -- every 15 minutes, WAREHOUSE HOURS ONLY (Ritchie,
     # 2026-09-22): Mon-Fri 06:00-18:45 ET. Every pass reacts to warehouse work (a
     # shipment, a label, an 810 minutes after a ship) and the warehouse closes at 5 PM
@@ -69,7 +75,7 @@ JOBS: dict[str, tuple[str, str, dict]] = {
 }
 
 # What the web app runs when SCHEDULER_JOBS is unset: everything, as before the split.
-WEB_DEFAULT = ["daily_refresh", "netsuite_push", "finale_push", "order_alerts"]
+WEB_DEFAULT = ["daily_refresh", "netsuite_push", "digest_retry", "finale_push", "order_alerts"]
 # python -m app.worker <service> -> the jobs that service runs.
 WORKERS = {"finale": ["finale_push", "finale_cache_refresh"], "alerts": ["order_alerts"]}
 
