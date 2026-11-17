@@ -1201,12 +1201,12 @@ def _push_job(monkeypatch, *, problem=None, raises=None, post_push_sent=False, d
     return send.call_args.args if send.called else None
 
 
-def test_push_job_sends_one_email_only_when_there_is_something_to_say(monkeypatch):
-    """The 5:00 job sends the day's ONE email: none when the push already sent it,
-    none on a quiet day; a gap, or a blocked/failed push, sends it."""
+def test_push_job_sends_one_email_every_weekday(monkeypatch):
+    """The 5:00 job sends the day's ONE email: none when the push already sent it;
+    otherwise always -- a quiet day too (Ritchie 2026-11-17); a gap, or a blocked/failed push."""
     assert _push_job(monkeypatch, post_push_sent=True,
                      data={"new_sos": [], "gaps": [{"transaction_id": "g"}]}) is None   # post-push email covered it
-    assert _push_job(monkeypatch) is None                                                # quiet day: no email
+    assert _push_job(monkeypatch) == ("quiet day", None)                                # quiet day: still emailed
     assert _push_job(monkeypatch, data={"new_sos": [], "gaps": [{"transaction_id": "g"}]}) == ("after push", None)
     assert _push_job(monkeypatch, problem="It was held back")[1] == "It was held back"   # blocked: never silent
     reason, problem = _push_job(monkeypatch, raises=RuntimeError("NetSuite 503"))
@@ -1250,7 +1250,7 @@ def test_push_retries_when_netsuite_cannot_be_reached(monkeypatch):
     dns = requests.exceptions.ConnectionError("Failed to resolve '734463.suitetalk.api.netsuite.com'")
     attempts, email = _push_job_attempts(monkeypatch, [dns, dns, None])
     assert attempts == 3
-    assert email is None                                   # it went through: quiet day
+    assert email == ("quiet day", None)                    # it went through: the quiet-day email, no problem
 
 
 def test_push_that_never_reaches_netsuite_says_so_plainly(monkeypatch):
@@ -1282,7 +1282,7 @@ def test_a_failed_4_45_refresh_is_retried_before_the_push(monkeypatch):
     attempts, email = _push_job_attempts(monkeypatch, [None], cache_status="error: Failed to resolve",
                                          refresh=refresh)
     assert refresh.call_count == 1 and attempts == 1       # a fresh list first, then the push
-    assert email is None                                   # no invented problem on a day that went through
+    assert email == ("quiet day", None)                    # no invented problem on a day that went through
 
 
 def test_the_mail_retry_is_skipped_while_shutting_down(monkeypatch):

@@ -343,7 +343,7 @@ def _so_digest_rows(data: dict) -> list[dict]:
     return rows
 
 
-def _so_digest_html(data: dict, rows: list[dict], push_incomplete: bool = False) -> str:
+def _so_digest_html(data: dict, rows: list[dict], push_incomplete: bool = False, quiet: bool = False) -> str:
     """The accounting email: a headline, the Blinds-vs-Drapes summary table, and --
     only when there is something accounting must act on -- ONE 'Needs attention'
     table: an 810 with no SO in NetSuite after the push has had its chance, or an
@@ -378,7 +378,11 @@ def _so_digest_html(data: dict, rows: list[dict], push_incomplete: bool = False)
         + f'<tr style="background:#eef2f7;font-weight:bold"><td>Total</td><td></td>'
           f'<td align="right">{len(rows)}</td><td align="right">${total:,.2f}</td></tr></table>')
 
-    h = f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite.</p>" + product_table
+    # A quiet day (nothing new, nothing wrong) still gets the email (Ritchie, 2026-11-17), in plain words, without
+    # an all-zero table. Not on a day the push failed: there the invoices may be waiting, so the counts stay.
+    # Only the fact (review 2026-11-17): invoices that arrived but aren't ready to push yet do exist on such days.
+    h = ("<p><strong>No new sales orders</strong> to invoice today.</p>"
+         if quiet else f"<p><strong>{len(rows)} sales order(s)</strong> created in NetSuite.</p>" + product_table)
 
     issues = []
     for g in data["gaps"]:
@@ -763,7 +767,8 @@ def _send_daily_digest(selected_ids: list[str] | None = None, push_problem: str 
     if push_problem:
         subject += " · NetSuite push did not complete"
     waiting = _not_attempted(push_problem)
-    body_html = _so_digest_html(data, rows, push_incomplete=waiting)
+    body_html = _so_digest_html(data, rows, push_incomplete=waiting,
+                                quiet=not rows and not data["gaps"] and not push_problem)
     if push_problem:   # first thing they read: why today's SOs may be missing
         body_html = (f'<p style="padding:8px 10px;background:#fff4e5;border-left:4px solid #e08a00">'
                      f'<strong>Today\'s NetSuite push did not complete.</strong> {html.escape(push_problem)}</p>'
@@ -977,10 +982,10 @@ def _run_digest_retry_job() -> None:
 def _digest_after_scheduled_push(started_at: str, push_problem: str | None) -> None:
     """The day's ONE accounting email, decided at the end of the 5:00 push job (the
     7:15 safety-net job was removed 2026-09-25: it re-sent a standing gap every day).
-    A push that created SOs has already sent it (post-push, with a retry). Otherwise
-    send only when there is something to say: SOs a failed send left unreported,
-    invoices with no SO, or a push that was blocked or failed -- that one must never be
-    silent. Nothing to report = no email. Honors the auto-digest toggle."""
+    A push that created SOs has already sent it (post-push, with a retry). Otherwise it
+    is sent here: SOs a failed send left unreported, invoices with no SO, a push that
+    was blocked or failed -- and a quiet day too, as "no new sales orders" (Ritchie,
+    2026-11-17: with no email accounting thinks it's broken). Honors the auto-digest toggle."""
     if not _auto_digest_enabled():
         tracking.record_job_run("daily_digest", "skipped", "disabled")
         return
@@ -993,10 +998,8 @@ def _digest_after_scheduled_push(started_at: str, push_problem: str | None) -> N
         print(f"WARNING: digest data build failed: {exc}")
         tracking.record_job_run("daily_digest", "error", str(exc)[:200])
         return
-    if not push_problem and not data["new_sos"] and not data["gaps"]:
-        tracking.record_job_run("daily_digest", "ok", "nothing to report")
-        return
-    _send_digest_safe("after push", push_problem)
+    quiet = not push_problem and not data["new_sos"] and not data["gaps"]
+    _send_digest_safe("quiet day" if quiet else "after push", push_problem)
 
 
 def _run_ns_export_job() -> None:
@@ -1067,6 +1070,8 @@ def _run_netsuite_push_job() -> None:
     self-scales with volume), and a per-run hard CAP (an oversized set is REFUSED,
     not truncated -- review and run manually to override). Manual pushes from the
     app are NOT subject to any of these."""
+    # With the auto-push toggle OFF there is no 5:00 email at all: the daily digest rides on this job
+    # (review 2026-11-17). The toggle has been ON since go-live; turning it off also stops the digest.
     if not automation._job_enabled(AUTO_NS_PUSH_SETTING, default="false"):
         tracking.record_job_run("netsuite_push", "skipped", "disabled"); return
     started_at = datetime.now(timezone.utc).isoformat()
