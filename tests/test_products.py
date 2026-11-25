@@ -17,6 +17,10 @@ def test_blind_item_numbers():
     assert product_of("138VB7272WHTC") == BLIND       # no fraction letter in the size
     assert product_of("020FW12X48WHT") == BLIND       # faux wood
     assert product_of("138vb48d36whtc") == BLIND      # case is not guaranteed
+    # TDBU cellular shades book as blinds (Ritchie 2026-11-25): the first five, PO 539945706 etc., 2026-11-24
+    for item in ("TDBU2048WHTC", "TDBU57B48WHTC", "TDBU24F48WHTC", "TDBU57F72WHTC", "TDBU4648WHTC", "tdbu1848whtc"):
+        assert product_of(item) == BLIND, item
+    assert product_of("TDBU") == ""                    # the word alone is not an item number
 
 
 def test_drape_style_numbers_of_every_block_count():

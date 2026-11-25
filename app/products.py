@@ -7,6 +7,9 @@ Dropship line, and they separate the two lines cleanly:
     Blinds    a three-digit width code plus a two-letter product code
               138VB48D36WHTC  (1 3/8" vinyl blind)
               020FW...        (faux wood)
+              or TDBU then the size: TDBU2048WHTC, TDBU57B48WHTC
+              (top-down/bottom-up cellular shades, sold from 2026-11-12;
+              booked as blinds, Ritchie 2026-11-25)
 
     Drapery   a five-digit style number in the 7xxxx block, then
               dash-separated colour and size blocks -- three of them, or
@@ -29,7 +32,7 @@ DRAPE = "Drape Panel"
 MIXED = "Mixed"
 UNKNOWN = "Unknown"
 
-BLIND_ITEM = re.compile(r"^\d{3}(VB|FW)", re.I)
+BLIND_ITEM = re.compile(r"^(\d{3}(VB|FW)|TDBU\d)", re.I)
 DRAPE_ITEM = re.compile(r"^7\d{4}(-\d+)+$")
 
 
