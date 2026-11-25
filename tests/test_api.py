@@ -640,9 +640,18 @@ def test_live_push_fires_digest_dry_run_does_not(client, monkeypatch):
             "results": [], "blocked": None}
     with patch.dict(_cache, {"invoices": []}), \
          patch("app.accounting.push_invoices", return_value=fake), \
-         patch("app.accounting._send_digest_safe") as digest:
-        _run_netsuite_push(live=True, ids=["x"], limit=None)
+         patch("app.accounting._send_digest_safe") as digest, \
+         patch.dict("app.accounting._netsuite_push_state", {}):       # its scheduled_live_at must not leak
+        _run_netsuite_push(live=True, ids=["x"], limit=None, scheduled=True)
     digest.assert_called_once()
+
+    # A manual live push still tells accounting (Ritchie 2026-11-25): the digest of the SOs it created.
+    with patch.dict(_cache, {"invoices": []}), \
+         patch("app.accounting.push_invoices", return_value=fake), \
+         patch("app.accounting._send_digest_safe") as manual, \
+         patch.dict("app.accounting._netsuite_push_state", {}):
+        _run_netsuite_push(live=True, ids=["x"], limit=None)
+    manual.assert_called_once()
 
     with patch.dict(_cache, {"invoices": []}), \
          patch("app.accounting.push_invoices", return_value={**fake, "mode": "dry", "summary": {"sent": 0, "failed": 0}}), \
@@ -1586,10 +1595,27 @@ def test_push_gate_counts_skipped_runs_and_the_live_push_in_progress(client, mon
     tracking.record_job_run("netsuite_push", "skipped", "disabled")
     skipped_at = accounting._last_netsuite_push_at()
     assert skipped_at is not None                                              # skipped counts
+    with patch.dict(accounting._netsuite_push_state, {"scheduled_live_at": "2099-01-01T00:00:00+00:00"}):
+        assert accounting._last_netsuite_push_at() == "2099-01-01T00:00:00+00:00"   # in-flight scheduled push wins
+    # A manual live or dry push is not "the push's chance" (2026-11-25: a manual push at 10:23 made three panels
+    # accepted at 8:03 read as missing instead of waiting for the 5:00 push).
     with patch.dict(accounting._netsuite_push_state, {"last_run": "2099-01-01T00:00:00+00:00", "mode": "live"}):
-        assert accounting._last_netsuite_push_at() == "2099-01-01T00:00:00+00:00"   # in-flight live push wins
+        assert accounting._last_netsuite_push_at() == skipped_at
     with patch.dict(accounting._netsuite_push_state, {"last_run": "2099-01-01T00:00:00+00:00", "mode": "dry"}):
-        assert accounting._last_netsuite_push_at() == skipped_at                     # a dry run is not a chance
+        assert accounting._last_netsuite_push_at() == skipped_at
+
+
+def test_only_a_scheduled_live_push_marks_the_push_chance(monkeypatch):
+    from app import accounting
+    from app.crstl_cache import _cache
+    monkeypatch.setattr("app.accounting._auto_digest_enabled", lambda: False)
+    fake = {"mode": "live", "summary": {"sent": 1, "failed": 0}, "unresolved": [], "results": [], "blocked": None}
+    with patch.dict(_cache, {"invoices": []}), patch("app.accounting.push_invoices", return_value=fake), \
+         patch.dict(accounting._netsuite_push_state, {"scheduled_live_at": None}):
+        accounting._run_netsuite_push(live=True, ids=["x"], limit=None)
+        assert accounting._netsuite_push_state.get("scheduled_live_at") is None      # manual: unchanged
+        accounting._run_netsuite_push(live=True, ids=["x"], limit=None, scheduled=True)
+        assert accounting._netsuite_push_state.get("scheduled_live_at")              # scheduled: set
 
 
 

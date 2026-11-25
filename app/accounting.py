@@ -271,13 +271,15 @@ def _last_netsuite_push_at() -> str | None:
     """When the NetSuite push last had its chance, UTC ISO, or None if it never has.
     The LATER of: the last scheduled job run of ANY status (a run that skipped
     because auto-push is off still means every 810 accepted before it is a real
-    gap, not a waiting one), and the start of the last live push in this process
+    gap, not a waiting one), and the last SCHEDULED live push in this process
     (set before the post-push digest fires, so the 810s that push just failed on
-    are not mistaken for 'accepted after the push')."""
+    are not mistaken for 'accepted after the push'). A manual push is not the
+    push's chance (2026-11-25): a manual push at 10:23 made three panels accepted
+    at 8:03 read as missing instead of waiting for the next 5:00 push."""
     runs = tracking.recent_job_runs(limit=1, job="netsuite_push")
     logged = runs[0].get("ran_at") if runs else None
     with _netsuite_push_lock:
-        live = _netsuite_push_state.get("last_run") if _netsuite_push_state.get("mode") == "live" else None
+        live = _netsuite_push_state.get("scheduled_live_at")
     return max(x for x in (logged, live) if x) if (logged or live) else None
 
 
@@ -1141,7 +1143,7 @@ def _netsuite_push_scheduled() -> str | None:
         return None
     # _run_netsuite_push reads the cache, pushes just these ids, sanitizes, and
     # updates _netsuite_push_state (so the dashboard's last-push panel reflects it).
-    result = _run_netsuite_push(True, [str(i["transaction_id"]) for i in to_push], None)
+    result = _run_netsuite_push(True, [str(i["transaction_id"]) for i in to_push], None, scheduled=True)
     s = result["summary"]
     if result.get("blocked"):
         tracking.record_job_run("netsuite_push", "blocked", "unresolved ids: " + ", ".join(result["unresolved"]))
@@ -1178,11 +1180,13 @@ def _sanitize_push_result(result: dict) -> dict:
 
 
 def _run_netsuite_push(live: bool, ids: Optional[list[str]], limit: Optional[int],
-                       confirm_existing: bool = False) -> dict:
+                       confirm_existing: bool = False, scheduled: bool = False) -> dict:
     """Push the cached invoices via the shared engine and record the run. Runs in
     a worker thread (the upsert loop is blocking network I/O). confirm_existing=False
     (default, incl. the scheduled job) skips records already in NetSuite; True updates
-    them (the dashboard's explicit 'confirm to update')."""
+    them (the dashboard's explicit 'confirm to update'). scheduled=True only from the
+    5:00 job: only it counts as the push's chance for the digest's "No SO in NetSuite"
+    check (a manual push still sends the digest of the SOs it created)."""
     with _cache_lock:
         invoices = list(_cache["invoices"])
     # Eligibility (Accepted + latest-per-invoice + non-zero) is enforced INSIDE
@@ -1190,9 +1194,12 @@ def _run_netsuite_push(live: bool, ids: Optional[list[str]], limit: Optional[int
     # the same filter -- no caller can bypass it.
     result = _sanitize_push_result(push_invoices(invoices, live=live, only=ids, limit=limit,
                                                  confirm_existing=confirm_existing))
+    now = datetime.now(timezone.utc).isoformat()
     with _netsuite_push_lock:
+        if live and scheduled:
+            _netsuite_push_state["scheduled_live_at"] = now
         _netsuite_push_state.update({
-            "last_run": datetime.now(timezone.utc).isoformat(),
+            "last_run": now,
             "mode": result["mode"],
             "summary": result["summary"],
             "unresolved": result["unresolved"],
@@ -1206,9 +1213,8 @@ def _run_netsuite_push(live: bool, ids: Optional[list[str]], limit: Optional[int
                     if r.get("status") == "sent"]
         if sent_ids:
             finale_jobs._run_finale_push_safe(sent_ids)
-    # Fire the accounting digest the moment SOs actually land in NetSuite -- no
-    # waiting for the scheduled run. Live pushes only; best-effort so a digest
-    # failure never fails the push (the scheduled safety-net will catch it).
+    # Fire the accounting digest the moment SOs actually land in NetSuite -- scheduled or manual, so accounting
+    # always hears about new SOs. Best-effort so a digest failure never fails the push (the retry job catches it).
     if live and (result.get("summary") or {}).get("sent", 0) > 0 and _auto_digest_enabled():
         _send_digest_safe("post-push")
     return result
