@@ -424,3 +424,53 @@ def test_a_failed_read_of_the_left_open_list_resolves_nothing(tmp_path, monkeypa
     monkeypatch.setattr(tracking, "get_json_strict", boom)
     r = run_alerts([], set(), {}, config=CFG, live=True, recipients=["g@x"], send=send, now=NOW)
     assert r["resolved"] == [] and [x["key"] for x in r["still_open"]] == ["order_left_open:538873472"]
+
+
+def test_daily_issue_is_emailed_once_a_day_with_every_open_order(tmp_path, monkeypatch):
+    """Ritchie 2026-11-25: 'Packed, not shipped' had become 15 emails a day (44 open after two days the warehouse
+    skipped its end-of-day ship). A daily issue is recorded as it is found but emailed once a day, at daily_at (ET),
+    as one list of everything still packed; other issues still email as they appear."""
+    from app import tracking
+    monkeypatch.setenv("TRACKING_DB", str(tmp_path / "t.db")); tracking.init_db()
+    send = MagicMock()
+    cfg = {**CFG, "packed_unshipped_after_hours": 24, "daily_issues": ["packed_unshipped"], "daily_at": "10:00"}
+    two = [fship(), fship(po="538879048", sid=100622)]
+    at = lambda h, m=0, day=19: datetime(2026, 9, day, h, m, tzinfo=ZoneInfo("America/Toronto"))
+    run = lambda when, ships=two, labels=(): run_alerts(list(labels), set(), IDS, config=cfg, live=True, recipients=["g@x"],
+                                                       send=send, finale_shipments=ships, dropship_pos=DROP, now=when)
+    r = run(at(9))                                   # before 10:00: found and recorded, no email
+    assert send.call_count == 0 and not r["sent"] and r["summary"]["new"] == 2
+    assert {x["key"] for x in tracking.open_alert_receipts()} == {"packed_unshipped:100621", "packed_unshipped:100622"}
+    r = run(at(10, 15))                              # first run at/after 10:00: one email, both orders
+    assert send.call_count == 1 and r["daily_sent"]
+    subject, body = send.call_args.kwargs["subject"], send.call_args.kwargs["body_html"]
+    assert subject == "Order alert (daily): Packed, not shipped — 538873472, 538879048"
+    assert "538873472" in body and "538879048" in body and "Still open" not in body
+    run(at(13))                                      # later the same day: nothing
+    assert send.call_count == 1
+    # another issue still emails as it appears, without the daily issue on its still-open line
+    run(at(14), labels=[lab("538871711", 7, "2026-09-19T08:00:00")])
+    assert send.call_count == 2 and "Packed, not shipped" not in send.call_args.kwargs["subject"]
+    assert "538873472" not in send.call_args.kwargs["body_html"]
+    run(at(10, 5, day=20), ships=[fship()])          # next day: the one still packed, once
+    assert send.call_count == 3 and send.call_args.kwargs["subject"].endswith("— 538873472")
+    run(at(10, 20, day=21), ships=[])                # all shipped: nothing to send, receipts resolved
+    assert send.call_count == 3 and not [x for x in tracking.open_alert_receipts() if x["issue"] == "packed_unshipped"]
+
+
+def test_without_daily_issues_packed_still_emails_as_found(tmp_path, monkeypatch):
+    from app import tracking
+    monkeypatch.setenv("TRACKING_DB", str(tmp_path / "t.db")); tracking.init_db()
+    send = MagicMock()
+    run_alerts([], set(), IDS, config={**CFG, "packed_unshipped_after_hours": 24}, live=True, recipients=["g@x"], send=send,
+               finale_shipments=[fship()], dropship_pos=DROP, now=LATER)
+    assert send.call_count == 1
+
+
+def test_daily_at_is_read_as_a_time():
+    from datetime import time
+    from app.alerts import _daily_at
+    assert _daily_at({"daily_at": "9:00"}) == time(9, 0)          # no leading zero: still 9 AM, not never
+    assert _daily_at({"daily_at": "09:30"}) == time(9, 30)
+    assert _daily_at({"daily_at": "ten"}) == time(10, 0)          # unreadable: 10:00, warned
+    assert _daily_at({}) == time(10, 0)

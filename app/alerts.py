@@ -414,6 +414,19 @@ def alert_email(new_rows: list[dict], still_open: list[dict], config: dict) -> t
     return subject, h
 
 
+def _daily_at(config: dict):
+    """daily_at as a time ("10:00", "9:00", "09:30"); an unreadable value falls back to 10:00 with a warning rather
+    than silently never sending (review 2026-11-25)."""
+    from datetime import time as dtime
+    raw = str(config.get("daily_at") or "10:00").strip()
+    try:
+        h, m = raw.split(":")
+        return dtime(int(h), int(m))
+    except (ValueError, TypeError):
+        print(f"WARNING: order alerts: daily_at {raw!r} is not HH:MM; using 10:00")
+        return dtime(10, 0)
+
+
 def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dict, live: bool,
                recipients: list[str], send, finale_shipments: list[dict] | None = None,
                dropship_pos: set | None = None, now: datetime | None = None,
@@ -449,6 +462,12 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
     found += find_catalogue_near_limit(product_count, warn_at=warn_at, limit=product_limit)
     receipts = tracking.get_alert_receipts([r["key"] for r in found])
     new = [r for r in found if r["key"] not in receipts]
+    # Daily issues (Ritchie 2026-11-25: "Packed, not shipped" had become 15 emails a day) are recorded as they are
+    # found but emailed once a day, at daily_at ET, as one list of everything still open; the rest email as found.
+    daily = set(config.get("daily_issues") or [])
+    daily_rows = [r for r in found if r["issue"] in daily]
+    new_daily = [r for r in new if r["issue"] in daily]
+    new = [r for r in new if r["issue"] not in daily]
     open_all = tracking.open_alert_receipts()
     voided_keys = {f"asn_missing:{s.get('shipmentId')}" for s in shipments if s.get("voided")}
     packed_keys = {f"packed_unshipped:{r['shipment_id']}"
@@ -463,12 +482,26 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
     resolved += resolved_catalogue(open_all, product_count, warn_at)
     still_open = [{**r, "url": crstl_po_url(po_ids.get(str(r.get("po_number")))),
                    "sent_et": (datetime.fromisoformat(r["sent_at"]).astimezone(ET).strftime("%d %b %H:%M ET") if r.get("sent_at") else "")}
-                  for r in open_all if r not in resolved and r["key"] not in {n["key"] for n in new}]
+                  for r in open_all if r not in resolved and r["key"] not in {n["key"] for n in new}
+                  and r.get("issue") not in daily]
     subject, body = alert_email(new, still_open, config) if new else ("", "")
+    today = now.astimezone(ET).strftime("%Y-%m-%d")
+    due = (bool(daily_rows) and now.astimezone(ET).time() >= _daily_at(config)
+           and (tracking.get_json("alerts_daily_sent_on") or "") != today)
+    daily_sent = False
     sent = False
     if live:
         for r in resolved:
             tracking.resolve_alert(r["key"])
+        for r in new_daily:
+            tracking.record_alert(r["key"], r["po_number"], r["issue"])
+        if due:
+            if not recipients:
+                raise RuntimeError("ALERT_RECIPIENTS not set")
+            d_subject, d_body = alert_email(daily_rows, [], config)
+            send(subject=d_subject.replace("Order alert:", "Order alert (daily):", 1), body_html=d_body, recipients=recipients)
+            tracking.set_json("alerts_daily_sent_on", today)
+            daily_sent = True
         if new:
             if not recipients:
                 raise RuntimeError("ALERT_RECIPIENTS not set")
@@ -478,9 +511,11 @@ def run_alerts(shipments: list[dict], asn_pos: set, po_ids: dict, *, config: dic
                 if r["issue"] in EVENT_ISSUES:
                     tracking.resolve_alert(r["key"])   # reported once; never "still open"
             sent = True
-    return {"mode": "live" if live else "dry", "found": found, "new": new, "still_open": still_open,
-            "resolved": [r["key"] for r in resolved], "subject": subject, "body_html": body, "sent": sent,
-            "summary": {"found": len(found), "new": len(new), "still_open": len(still_open), "resolved": len(resolved)}}
+    return {"mode": "live" if live else "dry", "found": found, "new": new + new_daily, "still_open": still_open,
+            "resolved": [r["key"] for r in resolved], "subject": subject, "body_html": body, "sent": sent or daily_sent,
+            "daily_sent": daily_sent, "daily_due": due, "daily_open": len(daily_rows),
+            "summary": {"found": len(found), "new": len(new) + len(new_daily), "still_open": len(still_open),
+                        "resolved": len(resolved)}}
 
 
 def alert_recipients() -> list[str]:

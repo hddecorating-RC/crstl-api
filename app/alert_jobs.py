@@ -171,5 +171,6 @@ def _run_alerts(live: bool) -> dict:
     c = result["summary"]
     tracking.record_job_run("order_alerts", "ok",
                             f"{c['found']} outlier(s): {c['new']} new{' (emailed)' if result['sent'] else ''}, "
+                            f"{result.get('daily_open', 0)} daily{' (daily email sent)' if result.get('daily_sent') else ''}, "
                             f"{c['still_open']} still open, {c['resolved']} resolved [{'live' if live else 'dry'}]")
     return result
